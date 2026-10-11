@@ -1,6 +1,9 @@
 node_modules/
 build/
-out/
+out/*
+!out/.gitkeep
+# 抽帧/渲染时 chrome 会往当前目录写 debug.log
+debug.log
 public/audio/*
 public/img/*
 public/fonts/*

@@ -333,11 +333,18 @@ def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
         tail = rest[cut:]
         # 平衡：首行偏长、剩下的字一行还装得下时，把切点挪到中间——
         # 两行差不多长比「满行 + 短尾巴」好看得多（这也是「尊重标点」的另一半）。
-        if len(lines) + 1 == max_lines and tail and _vis_len(tail) <= width and cut > len(rest) / 2:
+        # 判据只用「尾巴一行装得下」：原来的 len(lines) + 1 == max_lines 只有在
+        # 「这一刀切完正好是最后一行」时才成立，maxLines=2 时那一刀落在第二行上，
+        # 于是平衡分支永远进不来（13 字 + 3 字尾巴照样输出）。
+        if tail and _vis_len(tail) <= width and cut > len(rest) / 2:
             mid = len(rest) // 2
             mid_cut, mid_overflow = _wrap(rest, float(mid))
             if 0 < mid_cut < len(rest) and _valid_break(list(rest), mid_cut):
-                cut, overflow, tail = mid_cut, mid_overflow, rest[mid_cut:]
+                mid_tail = rest[mid_cut:]
+                # 平衡后的两行仍然都要 ≤ max_chars（避头尾会把切点撑宽 1~2 个字），
+                # 撑超了就保持原来的切点：宁可「满行 + 短尾巴」也不能破单行字数上限。
+                if _vis_len(rest[:mid_cut]) <= width and _vis_len(mid_tail) <= width:
+                    cut, overflow, tail = mid_cut, mid_overflow, mid_tail
         lines.append(rest[:cut])
         rest = tail
         if overflow:
@@ -999,10 +1006,13 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
     # <Caption> 组件用 bottom: captions.bottom 渲染的位置完全一致。
     # （2026-10-11 实测踩坑：这里曾写成 (1 - bottom) × 画布高，MarginV 变成 1613，
     #   字幕被渲到画面顶部，而 ffmpeg 退出码仍是 0 —— 只能靠抽帧目视发现。）
-    bottom = _num(captions.get("bottom"), 0.16)
+    # 缺省值就是安全区下界（SAFE_BOTTOM）：以前这里写死 0.16，比安全区还低，
+    # 于是「一个字都没填」的 timing.json 必然触发下面的抬升 + WARN，画面字幕
+    # （<Caption> 用 0.16 渲在 307px）与烧入硬字幕（被抬到 346px）差出 39px。
+    bottom = _num(captions.get("bottom"), SAFE_BOTTOM)
     if not 0.0 < bottom < 1.0:
-        warn(f"timing.json 的 captions.bottom={bottom!r} 不是 0~1 之间的小数，按 0.16 处理")
-        bottom = 0.16
+        warn(f"timing.json 的 captions.bottom={bottom!r} 不是 0~1 之间的小数，按 {SAFE_BOTTOM} 处理")
+        bottom = SAFE_BOTTOM
     margin_v = int(round(bottom * play_h))
     v_min = int(round(play_h * SAFE_BOTTOM))          # 离底边至少 18%（不被平台 UI 盖住）
     v_max = int(round(play_h * (1.0 - SAFE_TOP)))     # 离底边最多 90%（不顶到画面上部）
@@ -1200,7 +1210,9 @@ def cmd_burn(args) -> int:
     dst = _resolve_user_path(args.out)
     # 预览默认别覆盖「正式成片」的名字：`--preview 8` 不小心写成默认输出，
     # out/final-1080p-hard.mp4 里就只有 8 秒，很容易被当成成品发出去。
-    if args.preview and not _out_was_given() and not args.soft:
+    # 软字幕也一样：`--soft --preview 3` 不加判据就会把 3 秒的软字幕文件写成
+    # out/final-1080p-hard.mp4（默认输出名），把真正的硬字幕成片覆盖掉。
+    if args.preview and not _out_was_given():
         dst = dst.with_name(dst.stem + "-preview" + dst.suffix)
     if dst == src:
         error(f"输出路径和输入是同一个文件（{dst}），会覆盖原片。请用 -o 指定别的路径")

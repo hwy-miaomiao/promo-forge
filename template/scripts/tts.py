@@ -89,6 +89,11 @@ except ImportError as exc:  # pragma: no cover
 # AGENTS.md 阶段 7：「必要时最多加速 12%」——超过就必须改稿，不许硬压。
 MAX_TEMPO = 1.12
 
+# 复用旧音频的宽松度：实测时长 / 当前窗口 ≤ 这个比值才复用。
+# atempo 与时长的测量精度在毫秒级，2% 的余量（约 50ms，远小于字幕收起留的 0.15s）
+# 避免每跑一次 all 都因为零点几毫秒的误差重新合成。
+REUSE_FIT_TOLERANCE = 1.02
+
 # AGENTS.md 阶段 7 / 校验闸门：尾部低能量拖音 > 250ms 判 ECHO，需人工确认。
 TAIL_ECHO_MS = 250.0
 # 判定「低能量」的参考线：低于（峰值帧 - TAIL_REF_DB）即视为拖音。
@@ -383,6 +388,21 @@ def _status_of(base: str, tail_ms: float) -> str:
     return "ECHO" if tail_ms > TAIL_ECHO_MS else "OK"
 
 
+def _needed_ratio(duration: float, window: float) -> float:
+    """实测时长 / 当前窗口：> 1 表示这一版音频塞不进窗口。"""
+    return duration / window if window > 0 else 1.0
+
+
+def _window_status(needed: float) -> str:
+    """按「实测时长 / 当前窗口」判是否塞得进：超过最大加速比就是 TOO_LONG。
+
+    生成、缓存复用、audit 三条路径共用同一个判据。report.json / cache.json 里的
+    status 只是「上次生成时」窗口下的结论，timing.json 的 at / 场景边界改过之后
+    窗口会变窄，再信旧结论就会把超长句静默放行（AGENTS.md 第 7 节禁止静默通过）。
+    """
+    return "TOO_LONG" if needed > MAX_TEMPO else "OK"
+
+
 def _read_json(path: Path, default):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -646,18 +666,28 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
 
     if reusable:
         duration = _duration_of(out_path)
-        tail_ms = _tail_ms(out_path)
-        base_status = str(cached.get("status", "OK"))
-        entry["duration"] = round(duration, 3)
-        entry["tail_ms"] = round(tail_ms, 1)
-        entry["took_speedup"] = bool(cached.get("took_speedup", False))
-        entry["status"] = _status_of(base_status, tail_ms)
-        entry["skipped"] = True
-        log(
-            "  第 %s 句 跳过（文本/音色未变） %.3fs / 窗口 %.3fs  %s"
-            % (_pad(line_id, 4), duration, window, entry["status"])
-        )
-        return entry
+        needed = _needed_ratio(duration, window)
+        if needed > REUSE_FIT_TOLERANCE and str(cached.get("status", "OK")) != "TOO_LONG":
+            # 缓存只保证「文本/音色/语速没变」，不保证「还塞得进当前窗口」：改了 at /
+            # 场景边界 / 下一句之后窗口会变窄，这一版音频必须按新窗口重做（重新生成时
+            # 会自己加速到 ≤12%）。本来就是 TOO_LONG 的句子重新生成也救不回来，照旧复用。
+            log(
+                "  第 %s 句 旧音频 %.3fs 塞不进当前窗口 %.3fs，重新生成"
+                % (_pad(line_id, 4), duration, window)
+            )
+        else:
+            tail_ms = _tail_ms(out_path)
+            entry["duration"] = round(duration, 3)
+            entry["tail_ms"] = round(tail_ms, 1)
+            entry["took_speedup"] = bool(cached.get("took_speedup", False))
+            entry["status"] = _status_of(_window_status(needed), tail_ms)
+            entry["needed_speedup"] = round(needed, 4)
+            entry["skipped"] = True
+            log(
+                "  第 %s 句 跳过（文本/音色未变） %.3fs / 窗口 %.3fs  %s"
+                % (_pad(line_id, 4), duration, window, entry["status"])
+            )
+            return entry
 
     # ---- 真正生成 ----
     tmp_dir = vo_dir / ".tmp"
@@ -668,14 +698,14 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
         _trim_silence(raw_path, out_path)
         duration = _duration_of(out_path)
         took_speedup = False
-        needed = duration / window if window > 0 else 1.0
+        needed = _needed_ratio(duration, window)
         if needed > 1.001:
             factor = min(needed, MAX_TEMPO)
             _apply_tempo(out_path, factor)
             duration = _duration_of(out_path)
             took_speedup = True
         tail_ms = _tail_ms(out_path)
-        base_status = "TOO_LONG" if needed > MAX_TEMPO else "OK"
+        base_status = _window_status(needed)
         if base_status == "TOO_LONG":
             cut = max(1, int(math.ceil(len(text) - CHARS_PER_SEC * window)))
             warn(
@@ -856,16 +886,11 @@ def cmd_audit(args) -> int:
     if not lines:
         error("timing.json 的 voice.lines 是空的，没有可审核的句子")
 
-    report, report_path = _read_report()
-    reported = {}
-    if report:
-        for item in report["lines"]:
-            reported[str(item.get("id"))] = item
-
     vo_dir = PROJECT_ROOT / VO_DIRNAME
     rows = []
     errors = 0
     echoes = 0
+    stale = 0
     for line in lines:
         line_id = str(line.get("id", "")).strip()
         text = str(line.get("text", "") or "")
@@ -884,13 +909,20 @@ def cmd_audit(args) -> int:
         duration = _duration_of(path)
         tail_ms = _tail_ms(path)
         margin = window - duration
-        old = reported.get(line_id, {})
-        base = str(old.get("status", "OK")) if old else "OK"
-        if base == "ERROR":
-            base = "OK"  # 文件在磁盘上、能测出时长，就按实测重新判
-        status = _status_of(base if base != "MISSING" else "OK", tail_ms)
+        needed = _needed_ratio(duration, window)
+        # 一律按实测判：report.json 里的 status 只是「上次生成时那个窗口」下的结论，
+        # 改了 at / 场景边界 / 下一句之后它已经过期，信它就会把超长句静默放行。
+        status = _status_of(_window_status(needed), tail_ms)
         if status == "TOO_LONG":
             errors += 1
+        elif needed > REUSE_FIT_TOLERANCE:
+            # 塞不进当前窗口，但加速 ≤12% 就能救：不用改稿，是磁盘上这版音频过期了。
+            stale += 1
+            warn(
+                f"第 {line_id} 句音频 {duration:.2f}s 比当前窗口 {window:.2f}s 长"
+                f"（要加速 {(needed - 1) * 100:.1f}% 才塞得进）：这一版是按旧窗口生成的，"
+                "请重跑 `python scripts/tts.py all`（会自动加速重做），不用删字"
+            )
         elif status == "ECHO":
             echoes += 1
         rows.append((line_id, text, window, duration, margin, status))
@@ -929,7 +961,14 @@ def cmd_audit(args) -> int:
         )
     if echoes:
         warn(f"{echoes} 句疑似尾部拖音（ECHO），请人工试听确认：这是 AI 听不出来的项")
-    log(f"审核通过：{len(rows)} 句全部落在窗口内" + (f"（{echoes} 句 ECHO 待人工确认）" if echoes else ""))
+    if stale:
+        warn(f"{stale} 句音频是按旧窗口生成的（塞不进当前窗口），请重跑 `python scripts/tts.py all` 重做")
+    notes = []
+    if echoes:
+        notes.append(f"{echoes} 句 ECHO 待人工确认")
+    if stale:
+        notes.append(f"{stale} 句需重跑 tts.py all")
+    log(f"审核通过：{len(rows)} 句没有 TOO_LONG/MISSING" + (f"（{'；'.join(notes)}）" if notes else ""))
     return 0
 
 

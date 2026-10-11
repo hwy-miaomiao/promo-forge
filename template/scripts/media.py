@@ -589,6 +589,15 @@ def _render_sheet(files: Sequence[Path], out_path: Path, cols: int, width: int,
 
 
 def cmd_sheet(args: argparse.Namespace) -> int:
+    # 单位参数先校验：--cols 0 会直接撞 ZeroDivisionError，--width 0 会让每张图都缩不出缩略图、
+    # 最后报成「没有一张能读出来的图」，把真正的原因藏起来（AGENTS.md 第 7 节：要给 ERROR: 行）。
+    for flag, value in (("--cols", args.cols), ("--width", args.width)):
+        if value < 1:
+            C.error(f"{flag} 必须 ≥ 1（现在给的是 {value}）。"
+                    f"例：python scripts/media.py sheet out/stills --cols 4 --width 480")
+    if args.minw and args.minw < 0:
+        C.error(f"--minw 不能是负数（现在给的是 {args.minw}）；0 = 不过滤")
+
     files = _collect_images(args.paths)
     if not files:
         C.error("没找到图片。用法：python scripts/media.py sheet out/stills --cols 4")
@@ -669,11 +678,19 @@ def cmd_crop(args: argparse.Namespace) -> int:
     Image, ImageDraw, _, _ = _pil()
     resample = _lanczos(Image)
     rw, rh = _parse_ratio(args.ratio)
+    # 同上：--cols 0 撞 ZeroDivisionError，--cell 0 撞 PIL 里的 division by zero。
+    for flag, value in (("--cols", args.cols), ("--cell", args.cell)):
+        if value < 1:
+            C.error(f"{flag} 必须 ≥ 1（现在给的是 {value}）。"
+                    f"例：python scripts/media.py crop out/check-crop.jpg public/img/*.png --cols 3 --cell 360")
+
     files = _collect_images(args.images, recursive=False)
     if not files:
         C.error("没找到图片。用法：python scripts/media.py crop out/check-crop.jpg public/img/*.png --ratio 9:16")
 
     out_path = Path(args.out)
+    if out_path.is_dir():
+        C.error(f"输出图 {C.rel(out_path)} 是个目录，请给文件名，例如 {C.rel(out_path)}/check-crop.jpg")
     cell_w = args.cell
     fs = max(13, int(cell_w * 0.05))
     font = _load_font(fs)

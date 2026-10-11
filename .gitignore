@@ -10,7 +10,12 @@ outputs/*
 .env
 
 # 每个项目的工程产物（如果项目直接放在本仓库里）
-template/out/
+# 目录本身不入库，但要留 .gitkeep：render 脚本会 `> out/render.log`，
+# 目录不存在时 cmd/sh 的重定向会直接失败（渲染根本没跑）
+template/out/*
+!template/out/.gitkeep
+# 抽帧/渲染时 chrome 会往当前目录写 debug.log
+template/debug.log
 template/public/audio/*
 template/public/img/*
 template/public/fonts/*

@@ -591,15 +591,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 first_strong = i
                 break
         if first_strong is None:
-            C.warn("整首曲子没有明显能量峰值：建议换一首鼓点更清晰的曲子（AGENTS.md 阶段 5）")
+            # rc=1 会让脚本以非零码退出，AGENTS.md 第 7 节要求这种时候必须有一行
+            # `ERROR: ...`（code=0 只打印不退出，报告照旧打完）。
+            C.error("整首曲子没有明显能量峰值：建议换一首鼓点更清晰的曲子（AGENTS.md 阶段 5）", code=0)
             rc = 1
         else:
             C.log("")
             C.log(f"第一次能量爆发（≥最强值一半）出现在第 {first_strong} 秒。")
             if first_strong > FIRST_DROP_MAX_SEC:
-                C.warn(f"AGENTS.md 阶段 5 要求最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发，"
-                       f"这首要等到 {first_strong} 秒：要么从爆发的部分剪起（music.py cut），"
-                       f"要么换一首前奏更短的曲子。")
+                C.error(f"AGENTS.md 阶段 5 要求最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发，"
+                        f"这首要等到 {first_strong} 秒：要么从爆发的部分剪起（music.py cut），"
+                        f"要么换一首前奏更短的曲子。", code=0)
                 rc = 1
             else:
                 C.log(f"OK: 符合「最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发」")

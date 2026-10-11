@@ -747,7 +747,12 @@ def check_fonts(report: Report, timing: dict) -> None:
     candidates = list(check_cfg.get("systemCandidates", []) or [])
     chosen = None
     for candidate in candidates:
-        path = Path(str(candidate))
+        path = Path(str(candidate)).expanduser()
+        if not path.is_absolute():
+            # fonts.json 里的候选是相对项目根的（如 public/fonts/promo-subset-display.ttf），
+            # 必须按 PROJECT_ROOT 解析：按进程 CWD 解析时，从项目根之外调用脚本会悄悄退到
+            # 系统字体（msyh.ttc），内嵌子集缺字就被静默放过（会渲染成方块）。
+            path = PROJECT_ROOT / path
         try:
             if path.is_file():
                 chosen = path

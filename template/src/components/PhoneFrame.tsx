@@ -72,6 +72,13 @@ export const PhoneFrame: React.FC<PhoneFrameProps> = ({
         boxShadow: `0 2.4% 6% ${alpha("#000000", 0.55)}, inset 0 0 0 0.5% ${alpha(PALETTE.fg, 0.12)}`,
         padding: "2.2%",
         boxSizing: "border-box",
+        // ❗机身高度由 aspect-ratio 决定，**不许被父级 flex 压扁**。
+        // 默认 flex-shrink:1 时，只要父容器（Stage 的纵向 flex）高度不够，浏览器就会
+        // 把机身从 aspect-ratio 算出的 903px 压到约 630px（14.0s 抽帧实测，机身宽 417px
+        // 却只有 630px 高，比例 1.51 而不是 2.17）。内屏里的假界面是按**机身宽度**换算
+        // 缩放的（Demo 的 mockScale），所以内容不会被压扁，而是被 overflow:hidden 切掉
+        // 下半截、机身底部露出大片空白（20.0s 抽帧实测：五条账目下方的分类条只剩空槽）。
+        flexShrink: 0,
         ...style,
       }}
     >

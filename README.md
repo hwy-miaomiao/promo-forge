@@ -128,7 +128,7 @@ promo-forge/
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口 |
 | `scripts/check_video.py` | 成片闸门：规格、音轨、响度、空档、渲染日志报错 + 逐场景抽帧联系表 |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
-| `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`） |
+| `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖） |
 
 `timing.json` 是整支片子的唯一事实来源：帧率、画幅、时长、场景窗口、beat/bar/drop、旁白逐句配置、品牌配色全在里面，TypeScript 与 Python 两侧共读它，改一处全链路生效。
 

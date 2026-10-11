@@ -154,6 +154,17 @@ def _resolve(path_text: str) -> Path:
     return path if path.is_absolute() else (PROJECT_ROOT / path)
 
 
+def _cfg_num(cfg: dict, key: str, default: float) -> float:
+    """读 timing.json 里的数字配置：**只在缺键或显式 null 时**才用默认值。
+
+    原来写的是 `float(cfg.get(key, DEFAULT) or DEFAULT)`，`or` 会把合法的 0 也
+    当成「没填」：music.gain=0（不要配乐）、voice.duckDb=0（不压音乐）、
+    voice.rmsDb=0 都会被静默换成默认值，日志里看不出用户填过 0。
+    """
+    value = cfg.get(key, default)
+    return float(default if value is None else value)
+
+
 def _db_to_gain(db: float) -> float:
     return float(10.0 ** (db / 20.0))
 
@@ -509,7 +520,7 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
                 "请换更长的曲子，或用 `python scripts/music.py cut` 剪一段循环填满"
             )
 
-    gain = float(music_cfg.get("gain", DEFAULT_MUSIC_GAIN) or DEFAULT_MUSIC_GAIN)
+    gain = _cfg_num(music_cfg, "gain", DEFAULT_MUSIC_GAIN)
     if abs(gain - 1.0) > 1e-6:
         out *= gain
         log(f"配乐增益：music.gain={gain}")
@@ -529,7 +540,7 @@ def _build_voice(np, timing: dict, total_samples: int):
       stats     逐句统计，供人声余量检查与总结打印
     """
     voice_cfg = timing.get("voice", {}) or {}
-    target_rms_db = float(voice_cfg.get("rmsDb", DEFAULT_RMS_DB) or DEFAULT_RMS_DB)
+    target_rms_db = _cfg_num(voice_cfg, "rmsDb", DEFAULT_RMS_DB)
     lines = [line for line in (voice_cfg.get("lines") or []) if isinstance(line, dict)]
     vo_dir = PROJECT_ROOT / "audio-src" / "vo"
 
@@ -914,7 +925,7 @@ def main(argv=None) -> int:
     music = _build_music(np, timing, total_samples, music_path)
 
     voice_cfg = timing.get("voice", {}) or {}
-    duck_db = float(voice_cfg.get("duckDb", DEFAULT_DUCK_DB) or DEFAULT_DUCK_DB)
+    duck_db = _cfg_num(voice_cfg, "duckDb", DEFAULT_DUCK_DB)
 
     if args.no_vo:
         vo_bus = np.zeros((total_samples, CHANNELS), dtype=np.float32)
@@ -926,7 +937,7 @@ def main(argv=None) -> int:
         vo_bus, intervals, stats = _build_voice(np, timing, total_samples)
         duck_gain = _duck_curve(np, total_samples, intervals, duck_db)
         log(
-            f"人声：{len(intervals)} 句，RMS 归一化到 {float(voice_cfg.get('rmsDb', DEFAULT_RMS_DB) or DEFAULT_RMS_DB):.1f} dBFS，"
+            f"人声：{len(intervals)} 句，RMS 归一化到 {_cfg_num(voice_cfg, 'rmsDb', DEFAULT_RMS_DB):.1f} dBFS，"
             f"ducking {duck_db:+.1f} dB（羽化 {DUCK_FEATHER_S*1000:.0f}ms）"
         )
 

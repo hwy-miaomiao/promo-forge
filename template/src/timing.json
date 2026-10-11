@@ -96,7 +96,7 @@
     "enabled": true,
     "maxChars": 13,
     "maxLines": 2,
-    "bottom": 0.16
+    "bottom": 0.18
   },
   "brand": {
     "name": "小账本",

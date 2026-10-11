@@ -316,7 +316,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
       { "id": "01", "scene": "hook", "at": 0.6, "text": "每天记账要花十分钟？" }
     ]
   },
-  "captions": { "enabled": true, "maxChars": 13, "maxLines": 2, "bottom": 0.16 },
+  "captions": { "enabled": true, "maxChars": 13, "maxLines": 2, "bottom": 0.18 },
   "brand": { "name": "Acme", "url": "acme.com", "logo": "img/logo.png",
              "colors": { "bg": "#0B0B12", "fg": "#FFFFFF", "accent": "#33E1A1" } }
 }
@@ -331,18 +331,18 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。模板依赖：Remoti
 | 脚本 | 用途 | 关键参数 |
 | --- | --- | --- |
 | `scripts/doctor.py` | 环境体检，只查不装 | 无 |
-| `scripts/capture.py` | Playwright 真实网页截图（默认 2 倍图） | `<url> <name> [--factor 2] [--at 0,900,1800] [--full 3600] [--device iphone] [--hide 选择器] [--login] [--out out/shots]` |
+| `scripts/capture.py` | Playwright 真实网页截图（默认 2 倍图） | `<url> <name> [--factor 2] [--at 0,900,1800] [--full 3600] [--device iphone] [--hide 选择器] [--eval JS] [--wait 1.5] [--quality 92] [--keep-avatar] [--login] [--out out/shots]` |
 | `scripts/media.py` | 素材整理：抓 Markdown 里全部图片、拼联系表、按实际裁切预览、限宽、列尺寸 | `grab <md...> -o <dir>` / `sheet <dir> [--cols 4]` / `crop <out> <file...> [--ratio 9:16]` / `prepare <src> <dst> [--max 2800]` / `info <dir>` |
 | `scripts/music.py` | 配乐：下载/分析/找节拍/逐小节能量/剪段 | `analyze <file...>` / `grid <file> [--from --to]` / `bars <file> --beat --downbeat --offset` / `cut <in> <out> --start --dur` |
 | `scripts/tts.py` | 配音：生成、多音色试听、时长与拖音审核 | `all` / `one <id>` / `audit` / `voices [--lang zh]` / `preview --text "..."` / `stt <file>`（需可选依赖） |
 | `scripts/mix.py` | 混音：放人声、ducking、音效、母带 | `[--no-vo]` / `--env` |
 | `scripts/subtitles.py` | 字幕：导出 SRT / ASS，烧成硬字幕或软字幕 | `srt [--out out/subtitles/zh.srt]` / `ass [--out out/subtitles/zh.ass]` / `burn [<mp4>] [-o out/final-1080p-hard.mp4] [--soft] [--preview <秒>]` |
-| `scripts/fonts.py` | 字体子集化与内嵌（换机器不缺字） | `subset [--role all\|display\|body\|mono] [--out public/fonts] [--name promo-subset] [--weight 700] [--flavor auto\|woff2\|ttf]` / `check` |
+| `scripts/fonts.py` | 字体子集化与内嵌（换机器不缺字） | `subset [--role all\|display\|body\|mono] [--out public/fonts] [--name promo-subset] [--weight 700] [--flavor auto\|woff2\|ttf\|otf]` / `check` |
 | `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` |
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` |
 | `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log]` |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
-| `scripts/sync_template.py` | 用新版模板更新已有项目 | `[--diff] [--apply]` |
+| `scripts/sync_template.py` | 用新版模板更新已有项目 | `[--diff] [--apply] [--force]` |
 
 ## 7. 校验闸门与退出码
 

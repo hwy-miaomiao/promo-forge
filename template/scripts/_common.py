@@ -485,6 +485,10 @@ def first_existing_font(candidates: Optional[Iterable[str]] = None) -> Optional[
             p = Path(str(item)).expanduser()
         except (OSError, ValueError):
             continue
+        if not p.is_absolute():
+            # fonts.json 里的相对候选（如 public/fonts/promo-subset-display.ttf）相对项目根，
+            # 不能按进程 CWD 解析，否则换一个工作目录调用就会匹配到别的字体（或匹配不到）。
+            p = PROJECT_ROOT / p
         try:
             if p.is_file():
                 return p

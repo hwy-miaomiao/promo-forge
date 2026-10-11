@@ -89,6 +89,12 @@ DEFAULT_LUFS_MAX = -12.0
 # AGENTS.md 阶段 8：真峰值 -1 dBFS；超过 -0.5 dBTP 有削波风险，给 WARN。
 TRUE_PEAK_WARN_DBTP = -0.5
 
+# 响度测量的两个滤镜：首选 EBU R128 官方的 ebur128；精简版 ffmpeg（Remotion 自带的
+# compositor 构建就是）没编 ebur128，退到 loudnorm 的 JSON 测量 —— input_i / input_tp
+# 与 ebur128 用的是同一套 EBU R128 门控算法，可直接当 Integrated / True peak 用。
+LOUDNESS_FILTER = "ebur128=peak=true"
+LOUDNORM_MEASURE_FILTER = "loudnorm=print_format=json"
+
 # AGENTS.md 阶段 8：除转场瞬间外不允许 ≥1.0 秒空档；片头 0.3s 淡入、片尾 0.6s 淡出不算。
 DEFAULT_SILENCE_S = 1.0
 FADE_IN_S = 0.3
@@ -246,18 +252,55 @@ def _ffprobe(path: Path) -> dict:
         error(f"ffprobe 返回的 JSON 解析失败（{exc}）。请确认 ffprobe 版本正常。")
 
 
-def _ffmpeg_af(path: Path, audio_filter: str) -> str:
-    """跑一次只做音频分析的 ffmpeg（-f null -），返回合并后的 stderr 文本。"""
-    proc = _run_binary(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-af", audio_filter, "-f", "null", "-"],
-        f"ffmpeg -af {audio_filter.split('=')[0]}",
-        FFMPEG_TIMEOUT_S,
-    )
+def _decode_output(proc) -> str:
+    """ffmpeg 的输出混在 stderr 与 stdout 两边，合并成一段文本再解析。"""
     return (
         proc.stderr.decode("utf-8", errors="replace")
         + "\n"
         + proc.stdout.decode("utf-8", errors="replace")
     )
+
+
+def _filter_unavailable(text: str) -> bool:
+    """ffmpeg 报「没有这个滤镜」（不同版本措辞不同）。"""
+    return "No such filter" in text or "Filter not found" in text
+
+
+def _analyze_audio(path: Path, audio_filter: str):
+    """跑一次只做音频分析的 ffmpeg（-f null -），返回 (returncode, stderr+stdout 文本)。
+
+    ⚠️ 坑一（实测踩过）：命令必须带 `-vn`。`-f null -` 的默认视频编码器是
+    wrapped_avframe，精简版 ffmpeg（Remotion 自带的 compositor 构建把它从
+    `--disable-encoders` 白名单里去掉了）会在**打开输出文件**时就失败：
+    `Error opening output files: Encoder not found` —— 滤镜一行都没跑，输出里既没有
+    Summary 块也没有 silence_start。老写法没带 -vn，于是「空档」被读成「全片没有静音」、
+    「响度」被读成「解析不出」，两条硬闸门一起静默失效。音频侧不需要额外挑编码器
+    （pcm_s16le 是各种构建都保留的默认值）。
+    ⚠️ 坑二：同样因为精简构建，有些 ffmpeg 根本没编 `ebur128` 滤镜
+    （`No such filter: 'ebur128'`）。这种情况下自动改跑 loudnorm 量一次响度。
+    """
+    proc = _run_binary(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-vn",
+         "-af", audio_filter, "-f", "null", "-"],
+        f"ffmpeg -af {audio_filter.split('=')[0]}",
+        FFMPEG_TIMEOUT_S,
+    )
+    text = _decode_output(proc)
+    if proc.returncode != 0 and audio_filter.startswith("ebur128") and _filter_unavailable(text):
+        fallback = _run_binary(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-vn",
+             "-af", LOUDNORM_MEASURE_FILTER, "-f", "null", "-"],
+            "ffmpeg -af loudnorm",
+            FFMPEG_TIMEOUT_S,
+        )
+        if fallback.returncode == 0:
+            return fallback.returncode, _decode_output(fallback)
+    return proc.returncode, text
+
+
+def _ffmpeg_af(path: Path, audio_filter: str) -> str:
+    """兼容壳：只返回分析文本（deliver.py 也 import 本模块调它）。"""
+    return _analyze_audio(path, audio_filter)[1]
 
 
 def _parse_fraction(value) -> float:
@@ -488,6 +531,30 @@ def check_render_log(report: Report, log_path: Path) -> None:
 # 3. 响度 / 4. 空档
 # ===========================================================================
 
+def _parse_loudnorm_json(text: str):
+    """从 loudnorm 的 JSON 块里取 (input_i, input_tp)，没有就返回 (None, None)。
+
+    loudnorm 的 JSON 后面还跟着 ffmpeg 自己的统计行，不能整段 json.loads，
+    所以先把 `{ ... "input_i" ... }` 这一小块抠出来。
+    """
+    match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", text, re.DOTALL)
+    if not match:
+        return None, None
+    try:
+        data = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None, None
+    try:
+        integrated = float(data.get("input_i"))
+    except (TypeError, ValueError):
+        integrated = None
+    try:
+        true_peak = float(data.get("input_tp"))
+    except (TypeError, ValueError):
+        true_peak = None
+    return integrated, true_peak
+
+
 def _parse_ebur128(text: str):
     """从 ffmpeg 的 ebur128 输出里取 Integrated loudness 与 True peak。
 
@@ -498,26 +565,55 @@ def _parse_ebur128(text: str):
     一条实测 -15.0 LUFS 的成片照样被判成「不在 [-16, -12] 区间内」直接 ERROR，
     闸门等于把每一支合格的片子都拦下来。所以这里只在结尾的 Summary 块里找，
     块内也取**最后一个**匹配（Summary 里 I 只出现一次）。
+
+    行式差异（不同 ffmpeg 版本 / 工具）：除了 `I: -15.6 LUFS`，也认
+    `Integrated loudness: -15.6 LUFS`（只在 `I:` 找不到时才用，避免两处读数打架）；
+    读数是 `-inf` 时按负无穷处理 —— 静音片的 `I: -inf LUFS` 必须落进「不在区间内」
+    报 ERROR，而不是被当成「解析不出」静默放行。
+    本机精简 ffmpeg 没有 ebur128 时，`_analyze_audio` 会用 loudnorm 兜底测量，
+    所以这里也认 loudnorm 的 JSON（`input_i` / `input_tp`）。
     """
     block = text.rsplit("Summary:", 1)[-1] if "Summary:" in text else text
+    number = r"(-?\d+(?:\.\d+)?|-?inf)"
     integrated = None
     true_peak = None
-    for match in re.finditer(r"\bI:\s*(-?\d+(?:\.\d+)?)\s*LUFS", block):
+    for match in re.finditer(r"\bI:\s*" + number + r"\s*LUFS", block, re.IGNORECASE):
         integrated = float(match.group(1))
-    for match in re.finditer(r"Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS", block):
+    if integrated is None:
+        match = re.search(
+            r"Integrated\s+loudness:?\s*" + number + r"\s*LUFS", block, re.IGNORECASE
+        )
+        if match:
+            integrated = float(match.group(1))
+    for match in re.finditer(r"Peak:\s*" + number + r"\s*dBFS", block, re.IGNORECASE):
         true_peak = float(match.group(1))
+    if integrated is None or true_peak is None:
+        fallback_i, fallback_tp = _parse_loudnorm_json(text)
+        if integrated is None:
+            integrated = fallback_i
+        if true_peak is None:
+            true_peak = fallback_tp
     return integrated, true_peak
 
 
 def check_loudness(report: Report, path: Path, lufs_min: float, lufs_max: float):
     item = "响度"
-    text = _ffmpeg_af(path, "ebur128=peak=true")
+    returncode, text = _analyze_audio(path, LOUDNESS_FILTER)
     integrated, true_peak = _parse_ebur128(text)
     if integrated is None:
-        report.warn(
+        # 量不出来 = 这条硬闸门没生效。旧写法在这里只给 WARN，于是「-16~-12 LUFS」在
+        # 任何量不出响度的机器上都是一条不存在的闸门（0 ERROR 放行一支响度超标的片子）；
+        # 按 AGENTS.md「发现问题就非零退出，不要静默通过」，这里必须算 ERROR。
+        detail = "；".join(
+            line.strip() for line in text.strip().splitlines()[-3:] if line.strip()
+        )
+        report.fail(
             item,
-            "解析不出 ebur128 的 Integrated loudness（ffmpeg 版本差异？）。"
-            "请手工跑 `ffmpeg -i <mp4> -af ebur128=peak=true -f null -` 看结尾的 Summary 块",
+            f"量不出 Integrated loudness（ffmpeg 退出码 {returncode}），-16~-12 LUFS 这条硬闸门"
+            "无法验证。本机 ffmpeg 可能既没有 ebur128 滤镜也没有 loudnorm；"
+            "请装完整版 ffmpeg（Windows `winget install Gyan.FFmpeg`）后重跑。"
+            "手工排查：`ffmpeg -i <mp4> -vn -af ebur128=peak=true -f null -` 看结尾 Summary 块，"
+            f"或 `-af loudnorm=print_format=json` 看 input_i。ffmpeg 最后几行：{detail[:300]}",
         )
         return None, None
     if lufs_min <= integrated <= lufs_max:
@@ -565,7 +661,22 @@ def _parse_silence(text: str, total_duration: float):
 
 def check_silence(report: Report, path: Path, threshold_s: float, total_duration: float) -> None:
     item = "空档"
-    text = _ffmpeg_af(path, f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={threshold_s:g}")
+    filter_text = f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={threshold_s:g}"
+    returncode, text = _analyze_audio(path, filter_text)
+    if returncode != 0:
+        # 旧写法不检查退出码：ffmpeg 一条 silence_start 都没打出来时，下面 `not segments`
+        # 会打出「全片没有 ≥1 秒的静音段」—— 那是假通过（实测本机 ffmpeg 因缺
+        # wrapped_avframe 编码器根本没跑滤镜）。跑不起来就必须报 ERROR。
+        detail = "；".join(
+            line.strip() for line in text.strip().splitlines()[-3:] if line.strip()
+        )
+        report.fail(
+            item,
+            f"silencedetect 没跑起来（ffmpeg 退出码 {returncode}），空档闸门无法判定。"
+            "AGENTS.md 阶段 8 不允许 ≥1.0 秒空档，这条检查不能跳过。"
+            f"ffmpeg 最后几行：{detail[:300]}",
+        )
+        return
     segments = _parse_silence(text, total_duration)
     if not segments:
         report.ok(
@@ -625,7 +736,11 @@ def _pick_label_font(size: int):
         return None, "未安装 Pillow"
 
     for candidate in candidates:
-        path = Path(str(candidate))
+        path = Path(str(candidate)).expanduser()
+        if not path.is_absolute():
+            # fonts.json 里的候选是相对项目根的（如 public/fonts/promo-subset-display.ttf），
+            # 按进程 CWD 解析时，从项目根之外调用会找不到字体，联系表标签静默退成 Pillow 位图字体。
+            path = PROJECT_ROOT / path
         try:
             if path.is_file():
                 return ImageFont.truetype(str(path), size, index=0), path.name

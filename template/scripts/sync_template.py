@@ -18,6 +18,7 @@
     python scripts/sync_template.py                 # 只报告差异（安全，默认）
     python scripts/sync_template.py --diff          # 差异 + 文本 diff 摘要
     python scripts/sync_template.py --apply         # 覆盖本地通用文件（会先备份）
+    python scripts/sync_template.py --apply --force # 连「本地比模板新」的文件也覆盖（危险）
     python scripts/sync_template.py --template D:/promo-forge --apply
 
 模板目录的定位顺序
@@ -50,6 +51,7 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List, Tuple
 
 # ---------------------------------------------------------------------------
 # 导入公共库 scripts/_common.py（由另一位维护者提供，本脚本不修改它）
@@ -363,9 +365,9 @@ def print_report(rows, template_dir: Path, project_dir: Path, want_diff: bool) -
 # 应用
 # ===========================================================================
 
-def apply_changes(rows, template_dir: Path, project_dir: Path) -> int:
+def apply_changes(rows, template_dir: Path, project_dir: Path, force: bool = False) -> int:
     pending = [
-        (relative, template_path, project_path)
+        (status, relative, template_path, project_path)
         for status, relative, template_path, project_path in rows
         if status in (STATUS_NEW, STATUS_OLD, STATUS_MISSING) and template_path
     ]
@@ -373,11 +375,21 @@ def apply_changes(rows, template_dir: Path, project_dir: Path) -> int:
         log("本地通用文件与模板一致，没有需要覆盖的文件。")
         return 0
 
+    # [旧版] = 内容不一样、而本地 mtime 比模板晚：多半是你在项目里按需改过它（改脚本、调参数、
+    # 改动画库）。默认不能覆盖（模板会把你的改动冲掉），要覆盖必须显式加 --force。
+    backlog = []
+    if not force:
+        backlog = [item for item in pending if item[0] == STATUS_OLD]
+        pending = [item for item in pending if item[0] != STATUS_OLD]
+    if not pending:
+        log("没有需要覆盖的文件。")
+
     backup_dir = project_dir / BACKUP_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
     copied = 0
     backed_up = 0
     failed = 0
-    for relative, template_path, project_path in pending:
+    backed_up_local: List[Tuple[str, Path]] = []
+    for _status, relative, template_path, project_path in pending:
         destination = project_dir / relative
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +398,7 @@ def apply_changes(rows, template_dir: Path, project_dir: Path) -> int:
                 backup_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(project_path, backup_target)
                 backed_up += 1
+                backed_up_local.append((relative, backup_target))
             shutil.copy2(template_path, destination)
             copied += 1
             log(f"  已同步 {relative}")
@@ -398,7 +411,35 @@ def apply_changes(rows, template_dir: Path, project_dir: Path) -> int:
                                             if backed_up else "（本地没有同名文件，无需备份）"))
     if failed:
         error(f"{failed} 个文件没能覆盖（见上面的 WARN 行）。最常见原因是文件被编辑器或其他程序占用，关掉后重跑。")
-        raise SystemExit(1)
+    if backlog:
+        # 先把这些文件备份好再报错退出：用户加 --force 之前不该有任何东西被丢掉。
+        for _status, relative, _template_path, project_path in backlog:
+            if project_path and project_path.is_file():
+                try:
+                    backup_target = backup_dir / relative
+                    backup_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(project_path, backup_target)
+                    backed_up_local.append((relative, backup_target))
+                except OSError as exc:
+                    warn(f"备份 {relative} 失败：{exc}")
+        log("")
+        warn(
+            f"有 {len(backlog)} 个文件**本地比模板新**，已跳过，没有覆盖：\n"
+            + "\n".join(f"       {relative}" for _s, relative, _t, _p in backlog[:10])
+            + (f"\n       …（还有 {len(backlog) - 10} 个）" if len(backlog) > 10 else "")
+            + "\n    这一栏多半是你自己按需改过的（改脚本、调参数、改动画库），"
+              "直接用模板覆盖会把你的改动冲掉，所以默认不动它们。\n"
+              "    先看差异：python scripts/sync_template.py --diff\n"
+              "    确认可以放弃本地改动，再加 --force 覆盖。"
+        )
+        if backed_up_local:
+            log("")
+            log(f"（本地当前内容已备份 {len(backed_up_local)} 个到 {_rel_to(backup_dir, project_dir)}/，"
+                "真被覆盖了也能从这里回滚）")
+        error(
+            f"{len(backlog)} 个文件本地比模板新，默认不覆盖。"
+            "确认要放弃这些本地改动请加 --force 重跑。"
+        )
     return copied
 
 
@@ -454,6 +495,8 @@ def main(argv=None) -> int:
                         help=f"打印文本差异摘要（每个文件前 {DIFF_MAX_LINES} 行）")
     parser.add_argument("--apply", action="store_true",
                         help=f"用模板覆盖本地通用文件（先备份到 {BACKUP_ROOT}/<时间戳>/）")
+    parser.add_argument("--force", action="store_true",
+                        help="配合 --apply：连「本地比模板新」的文件也覆盖（默认跳过它们，避免冲掉你的改动）")
     args = parser.parse_args(argv)
 
     template_dir, source = locate_template(args.template)
@@ -478,7 +521,7 @@ def main(argv=None) -> int:
     print_report(rows, template_dir, project_dir, want_diff=args.diff)
 
     if args.apply:
-        apply_changes(rows, template_dir, project_dir)
+        apply_changes(rows, template_dir, project_dir, force=args.force)
         log("")
         warn(
             "同步的是**公共**文件，你的项目里可能已经按需改过它们。请务必重跑复核：\n"
@@ -489,7 +532,8 @@ def main(argv=None) -> int:
         )
     else:
         log("")
-        log("这是只读报告，本地文件一个都没改。要真正覆盖请加 --apply（会先备份）。")
+        log("这是只读报告，本地文件一个都没改。要真正覆盖请加 --apply（会先备份；"
+            "「本地比模板新」的文件仍会跳过，除非再加 --force）。")
 
     log("")
     check_index_css(project_dir)

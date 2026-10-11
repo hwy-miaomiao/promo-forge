@@ -335,6 +335,7 @@ CONF_LABEL = {
     "official": "平台硬限制（官方文档）",
     "thirdparty": "推荐值（第三方汇总，非官方）",
     "unknown": "需人工确认（没查到确切数字）",
+    "project": "本项目规范（AGENTS.md，不是平台限制）",
 }
 
 
@@ -472,36 +473,114 @@ def _parse_fraction(value: Any) -> float:
         return 0.0
 
 
-def _ebur128(path: Path) -> Tuple[Optional[float], Optional[float]]:
-    """跑一次 ebur128=peak=true，返回 (Integrated LUFS, True peak dBTP)。
+def _parse_loudnorm(text: str) -> Tuple[Optional[float], Optional[float]]:
+    """从 ``loudnorm=print_format=json`` 的 JSON 块里取 (input_i, input_tp)。
+
+    ``input_i`` 是 gated 的整段 Integrated loudness（与 ebur128 的 ``I`` 同一个量），
+    ``input_tp`` 是真峰值 dBTP。ffmpeg 会把 JSON 打在 stderr 尾部、前后夹着普通日志行，
+    所以按最后一个 ``{`` 起点逐个 ``JSONDecoder.raw_decode``。
+    """
+    decoder = json.JSONDecoder()
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] != "{":
+            continue
+        try:
+            data, _end = decoder.raw_decode(text[index:])
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or "input_i" not in data:
+            continue
+        try:
+            integrated = float(data["input_i"])
+        except (TypeError, ValueError):
+            return None, None
+        try:
+            true_peak = float(data["input_tp"])
+        except (TypeError, ValueError):
+            true_peak = None
+        return integrated, true_peak
+    return None, None
+
+
+def _loudnorm(path: Path) -> Tuple[Optional[float], Optional[float]]:
+    """ebur128 不可用时的兜底：改成跑 loudnorm 量一次响度与真峰值。
+
+    ``-vn`` 是必须的：``-f null -`` 的默认视频编码器 wrapped_avframe 在精简版 ffmpeg
+    （Remotion 自带的 compositor 构建）里被去掉了，不带 ``-vn`` 会在**打开输出文件**时
+    就失败（``Error opening output files: Encoder not found``），滤镜一行都不会跑。
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-vn",
+             "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=FFMPEG_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    text = proc.stderr.decode("utf-8", errors="replace") + "\n" + proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0 and "input_i" not in text:
+        return None, None
+    return _parse_loudnorm(text)
+
+
+def _loudness_filter_of(text: str) -> str:
+    """判断这段 ffmpeg 输出是哪个滤镜量的（"ebur128" / "loudnorm"）。
+
+    ``check_video.py`` 的 ``_analyze_audio`` 在本机没有 ebur128 滤镜时会**自动改跑
+    loudnorm**（返回值看不出区别），所以不能只看「谁调用的」：loudnorm 的 JSON 块带
+    ``normalization_type`` / ``input_i``，ebur128 的 Summary 块带 ``I:`` / ``Peak:``。
+    """
+    if "normalization_type" in text or '"input_i"' in text:
+        return "loudnorm"
+    return "ebur128"
+
+
+def _ebur128(path: Path) -> Tuple[Optional[float], Optional[float], str]:
+    """量一次响度，返回 (Integrated LUFS, True peak dBTP, 数据来源)。
+
+    先试 ``ebur128=peak=true``；有些精简版 ffmpeg 根本没编这个滤镜
+    （``No such filter: 'ebur128'``，Remotion 自带的 compositor 构建就是这样），
+    这时自动回退到 ``loudnorm=print_format=json``，同样能给出 Integrated loudness
+    与真峰值（实测两者相差 < 0.2 dB）。
 
     ⚠️ 坑（check_video.py 里记过，这里直接复用它的解析）：ebur128 会**逐帧**打印读数，
     开头几帧 gating 块没攒够，``I`` 固定是 -70.0 LUFS；必须只在结尾 Summary 块里取。
     """
+    integrated: Optional[float] = None
+    true_peak: Optional[float] = None
     cv = _load_check_video()
     if cv is not None:
         try:
             text = cv._ffmpeg_af(path, "ebur128=peak=true")
-            return cv._parse_ebur128(text)
+            integrated, true_peak = cv._parse_ebur128(text)
+            if integrated is not None:
+                return integrated, true_peak, _loudness_filter_of(text)
         except SystemExit:
             raise
         except Exception:  # noqa: BLE001
-            pass
+            integrated, true_peak = None, None
+
     import subprocess
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-af", "ebur128=peak=true",
+        ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-vn", "-af", "ebur128=peak=true",
          "-f", "null", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=FFMPEG_TIMEOUT_S,
     )
-    text = proc.stderr.decode("utf-8", errors="replace")
+    text = proc.stderr.decode("utf-8", errors="replace") + "\n" + proc.stdout.decode("utf-8", errors="replace")
+    if "input_i" in text:
+        # check_video.py 那条路走不通时这里可能直接拿到 loudnorm 的输出，别再跑一次
+        return *_parse_loudnorm(text), "loudnorm"
     block = text.rsplit("Summary:", 1)[-1] if "Summary:" in text else text
-    integrated = None
-    true_peak = None
     for match in re.finditer(r"\bI:\s*(-?\d+(?:\.\d+)?)\s*LUFS", block):
         integrated = float(match.group(1))
     for match in re.finditer(r"Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS", block):
         true_peak = float(match.group(1))
-    return integrated, true_peak
+    if integrated is not None:
+        return integrated, true_peak, "ebur128"
+
+    integrated, true_peak = _loudnorm(path)
+    return integrated, true_peak, "loudnorm" if integrated is not None else ""
 
 
 def _pick_stream(probe: Dict[str, Any], kind: str) -> Optional[Dict[str, Any]]:
@@ -570,6 +649,7 @@ class Media:
 
         self.lufs: Optional[float] = None
         self.true_peak: Optional[float] = None
+        self.loudness_source: Optional[str] = None   # "ebur128" | "loudnorm"
 
     @staticmethod
     def _int_or_none(value: Any) -> Optional[int]:
@@ -594,7 +674,7 @@ class Media:
         return f"{self.aspect:.3f}"
 
     def measure_loudness(self) -> None:
-        self.lufs, self.true_peak = _ebur128(self.path)
+        self.lufs, self.true_peak, self.loudness_source = _ebur128(self.path)
 
 
 # ===========================================================================
@@ -760,29 +840,34 @@ def _check_audio(m: Media, p: Dict[str, Any]) -> Check:
 
 def _check_loudness(m: Media, p: Dict[str, Any], lufs_min: float, lufs_max: float) -> Check:
     # 响度口径来自本项目自己的母带规范（AGENTS.md 阶段 8 / 第 7 节），不是任何平台的下限，
-    # 所以四个平台共用同一个 conf，不参与「官方 / 第三方」的区分。
-    conf = "official"
+    # 所以四个平台共用同一个 conf，用 "project" 而不是 "official"——它在表格里会显示成
+    # 「本项目规范」，不会被误读成「平台硬限制（官方文档）」。它也不参与「官方 / 第三方」的区分。
+    conf = "project"
     rule = f"{lufs_min:g}~{lufs_max:g} LUFS"
     if m.lufs is None:
-        return _mk("响度", "测不到", rule, "WARN", "official",
-                   "ebur128 解析不出 Integrated loudness（ffmpeg 版本差异？）。"
-                   "手工跑 `ffmpeg -i <mp4> -af ebur128=peak=true -f null -` 看结尾 Summary 块")
+        return _mk("响度", "测不到", rule, "WARN", conf,
+                   "ebur128 与 loudnorm 都解析不出 Integrated loudness：多半是这份 ffmpeg 缺这两个滤镜"
+                   "（Remotion 自带的精简构建就常缺）。手工跑 "
+                   "`ffmpeg -i <mp4> -vn -af loudnorm=print_format=json -f null -` 看结尾的 JSON 块；"
+                   "还是测不到就换一份完整版 ffmpeg 再跑")
     value = f"{m.lufs:.1f} LUFS"
     if m.true_peak is not None:
         value += f" / 峰值 {m.true_peak:.2f} dBTP"
+    if m.loudness_source == "loudnorm":
+        value += "（loudnorm 兜底测的）"
     if m.lufs > lufs_max:
-        return _mk("响度", value, rule, "WARN", "official",
+        return _mk("响度", value, rule, "WARN", conf,
                    f"比 {lufs_max:g} LUFS 响 {m.lufs - lufs_max:.1f} dB。"
                    "母带目标 -14 LUFS（AGENTS.md 阶段 8）；平台会自动压，但压完动态更差。请重跑 python scripts/mix.py")
     if m.lufs < lufs_min:
-        return _mk("响度", value, rule, "WARN", "official",
+        return _mk("响度", value, rule, "WARN", conf,
                    f"比 {lufs_min:g} LUFS 轻 {lufs_min - m.lufs:.1f} dB，"
                    "在手机小音量下会听不清；重跑 python scripts/mix.py（它会把母带拉到 -14 LUFS）")
     if m.true_peak is not None and m.true_peak > TRUE_PEAK_WARN_DBTP:
-        return _mk("响度", value, rule, "WARN", "official",
+        return _mk("响度", value, rule, "WARN", conf,
                    f"真峰值 {m.true_peak:.2f} dBTP 高于安全线 {TRUE_PEAK_WARN_DBTP} dBTP，"
                    "平台转码后容易削波；跑 python scripts/mix.py --env 看是哪一段顶上去的")
-    return _mk("响度", value, rule, "OK", "official")
+    return _mk("响度", value, rule, "OK", conf)
 
 
 def _check_codes(m: Media, p: Dict[str, Any]) -> List[Check]:
@@ -1154,7 +1239,7 @@ def _text_clash_stats(base: Any, box: Sequence[float],
     真有字 亮像素 5.31~15.40%，干净区域 亮像素 0.00% —— 4% 这条线把两类完全分开。
     **这是启发式估计，不是 OCR**，只用来给一句「换个位置」的建议，不作通过/失败判据。
 
-    实际用它解决的问题：成片的字幕按规范就落在距底 16% 处（在安全区内），
+    实际用它解决的问题：成片的字幕按规范就落在距底 18% 处（在安全区内），
     bottom 模式的封面文字正好会压上去，两层字谁也读不清（已实测 out/covers/cover-1.png）。
     """
     import numpy as np

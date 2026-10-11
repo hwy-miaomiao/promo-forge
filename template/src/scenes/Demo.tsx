@@ -102,8 +102,8 @@ const LedgerRow: React.FC<{
 /** 小节 1：拍照记账。取景框 + 假小票 + 扫描线 + 快门白闪 + OCR 结果逐行出现。 */
 const CaptureMock: React.FC<{ type: ReturnType<typeof useType>; t: number; w: number; h: number }> = ({ type, t, w, h }) => {
   const shotAt = 2.0; // 快门（约 1 拍后）
-  const fps = 60;
-  // 快门白闪只亮 0.18 秒，用 "取整帧再比" 保证同一帧的结果永远一样
+  // 快门白闪只亮 0.18 秒：ramp 是 t 的纯函数（窗口外自动取端点），同一帧永远算出同一个值，
+  // 不会因为渲染顺序或机器不同而闪法不同；这里不用取整帧，因为 t 已经是帧时间。
   const flash = ramp(t, [shotAt, shotAt + 0.18], [0.9, 0], EASE.in);
   const gone = t >= shotAt + 0.18;
   const scan = loop(t, 1.2);
@@ -300,7 +300,7 @@ export const Demo: React.FC = () => {
     width - safe.left - safe.right,
     Math.round(width * (isVertical(width, height) ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal)),
   );
-  // 0.46 不是随便定的：标题 + 手机 + 小结要整块待在**字幕带之上**（字幕占底部约 0.16~0.23 屏高，
+  // 0.46 不是随便定的：标题 + 手机 + 小结要整块待在**字幕带之上**（字幕占底部约 0.18~0.25 屏高，
   // 见 Caption.tsx 的 captions.bottom），机身高了就一定会被字幕压住。见下面 Stage 的 paddingBottom。
   const phoneWRatio = 0.46;
   const phoneW = stageW * phoneWRatio;
@@ -325,9 +325,9 @@ export const Demo: React.FC = () => {
         }}
       />
 
-      {/* paddingBottom 特意加大：给底部字幕带让位。字幕底边 = 0.16 屏高、两行约 0.07 屏高，
-          而 Stage 默认只留 0.18 —— 直接用默认值，字幕会盖住手机下半部和最下面那行小结
-          （13.8s / 22.5s 抽帧都拍到了）。这里把内容整块上移，字幕带就空出来了。 */}
+      {/* paddingBottom 特意加大：给底部字幕带让位。字幕底边 = 0.18 屏高、两行约 0.07 屏高，
+          字幕带顶到约 0.25 屏高，而 Stage 默认只留 0.18 —— 直接用默认值，字幕会盖住手机下半部和
+          最下面那行小结（13.8s / 22.5s 抽帧都拍到了）。这里把内容整块上移，字幕带就空出来了。 */}
       <Stage align="center" style={{ gap: height * 0.024, paddingBottom: height * 0.3 }}>
         {/* 标题：随小节换，让"新信息"每 2 秒内必到（AGENTS.md 密度要求） */}
         <div style={{ display: "flex", alignItems: "center", gap: type.tiny.size * 0.8 }}>
