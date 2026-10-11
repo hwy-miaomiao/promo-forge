@@ -93,10 +93,12 @@ export const Promo: React.FC<PromoProps> = ({ withAudio }) => {
       <Caption />
 
       {/* 音频：路径来自 timing.json 的 music.file（相对 public/）。混音脚本会写出这个文件。
-          没有 withAudio、或文件还没混出来时，整条音轨不挂载（见 MUSIC_FILE_EXISTS 的说明）。 */}
-      {withAudio && MUSIC_FILE_EXISTS ? (
-        <Audio src={staticFile(TIMING.music.file)} volume={TIMING.music.gain} />
-      ) : null}
+          没有 withAudio、或文件还没混出来时，整条音轨不挂载（见 MUSIC_FILE_EXISTS 的说明）。
+
+          ⚠️ 这里**不要**再乘 music.gain：这个文件是 mix.py 已经混好、已经母带到 -14 LUFS 的成品轨
+          （音乐床电平在混音阶段就用过了）。再乘一次会让成片整体变小 —— 实测 gain=0.6 时整片从
+          -15.4 LUFS 掉到 -19.9 LUFS，直接被 check_video.py 的响度闸门判 ERROR。 */}
+      {withAudio && MUSIC_FILE_EXISTS ? <Audio src={staticFile(TIMING.music.file)} /> : null}
     </AbsoluteFill>
   );
 };
