@@ -92,7 +92,18 @@ export const App = () => {
   const played = PLAYER.durationInFrames > 0 ? Math.min(1, frame / PLAYER.durationInFrames) : 0;
 
   return (
-    <div className="page" style={{ "--ratio": PLAYER.ratio } as CSSProperties}>
+    <div
+      className="page"
+      style={
+        {
+          "--ratio": PLAYER.ratio,
+          // 品牌色跟着 timing.json 走（style.css 里那几个 :root 变量只是模板默认值的兜底）
+          "--bg": WEB.colors.bg,
+          "--fg": WEB.colors.fg,
+          "--accent": WEB.colors.accent,
+        } as CSSProperties
+      }
+    >
       <header className="head">
         <BrandMark />
         <span className="head-name">{WEB.brand}</span>
@@ -182,10 +193,15 @@ export const App = () => {
   );
 };
 
-/** 品牌标记：有 logo 用 logo，没有就用首字方块 —— 空 logo 不能变成裂图。 */
+/**
+ * 品牌标记：有 logo 用 logo，没有就用首字方块 —— 空 logo 不能变成裂图。
+ * src 必须走 assetUrl()：timing.json 里写的是**相对 public/ 的路径**（如 "img/logo.png"），
+ * 直接用会被当成"相对当前页"解析 —— 部署到子路径（/promo/）时会取成 /promo/img/logo.png，
+ * 和上面预取用的 /img/logo.png 变成两个口径，logo 就 404 了。
+ */
 const BrandMark = () => {
   if (WEB.logo.trim() !== "") {
-    return <img className="head-logo" src={WEB.logo} alt={WEB.brand} />;
+    return <img className="head-logo" src={assetUrl(WEB.logo)} alt={WEB.brand} />;
   }
   return <span className="head-mark">{Array.from(WEB.brand)[0] ?? "P"}</span>;
 };

@@ -61,10 +61,14 @@ PY_PACKAGES: List[Tuple[str, str, str, str]] = [
     ("playwright", "playwright", "真实网页截图", "capture.py"),
     ("edge_tts", "edge-tts", "免费配音", "tts.py（默认引擎）"),
 ]
-#: Playwright 浏览器缓存目录（Windows / 其它平台）
+#: Playwright 浏览器缓存目录。三个平台各查一遍：
+#: Windows 用 %LOCALAPPDATA%\ms-playwright；macOS 是 ~/Library/Caches/ms-playwright
+#: （Playwright 用的是系统 cache 目录，不是 ~/.cache）；Linux 才是 ~/.cache/ms-playwright。
+#: 三个都列进去，跨平台/跨容器（WSL、挂载的 home）少报假 MISSING。
 PW_BROWSER_DIRS = [
     ("Windows", Path.home() / "AppData" / "Local" / "ms-playwright"),
-    ("其它平台", Path.home() / ".cache" / "ms-playwright"),
+    ("macOS", Path.home() / "Library" / "Caches" / "ms-playwright"),
+    ("Linux", Path.home() / ".cache" / "ms-playwright"),
 ]
 #: 素材目录（数量为 0 -> WARN）。来源：AGENTS.md 第 2 节目录约定 + 阶段 4/5
 ASSET_DIRS = [
@@ -267,7 +271,7 @@ def check_playwright_browser(rows: List[Row]) -> None:
                         PW_BROWSER_FIX))
         return
     rows.append(Row("Playwright 浏览器", "MISSING",
-                    f"没找到浏览器缓存目录（{PW_BROWSER_DIRS[0][1]} 或 {PW_BROWSER_DIRS[1][1]}）",
+                    "没找到浏览器缓存目录（" + "、".join(str(d) for _l, d in PW_BROWSER_DIRS) + "）",
                     PW_BROWSER_FIX))
 
 
@@ -406,7 +410,9 @@ def check_elevenlabs(rows: List[Row]) -> None:
     else:
         rows.append(Row("ELEVENLABS_API_KEY", "WARN",
                         "没配置。不填也能做片子，配音走免费 edge-tts（AGENTS.md 阶段 7）",
-                        "需要更自然的音色时：复制 .env.example 为 .env 并填 key，然后 python scripts/tts.py all --engine eleven"))
+                        "需要更自然的音色时：把项目根的 .env.example 复制成 .env，"
+                        "填上 ELEVENLABS_API_KEY=xxx，"
+                        "然后 python scripts/tts.py all --engine eleven"))
 
 
 # ---------------------------------------------------------------------------

@@ -372,7 +372,8 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
         if not candidate.is_file():
             problems.append(
                 f"fonts.json 的 roles.{role}.file=\"{file_value}\" 指向 {_rel(candidate)}，但文件不存在"
-                "（@remotion/fonts 会加载失败并回退系统字体，同一行里可能混出两种字形）"
+                "（@remotion/fonts 会加载失败并回退系统字体，同一行里可能混出两种字形；"
+                "新克隆没有子集字体是正常的，跑 `python scripts/fonts.py subset` 生成）"
             )
 
     if problems:

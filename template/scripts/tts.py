@@ -490,7 +490,7 @@ class ElevenEngine:
         if not key:
             error(
                 "engine=eleven 需要 ELEVENLABS_API_KEY。请设置环境变量，"
-                "或把 `ELEVENLABS_API_KEY=xxx` 写进项目根目录的 .env（参考 .env.example）。"
+                "或把项目根的 .env.example 复制成 .env 并填上 `ELEVENLABS_API_KEY=xxx`。"
                 "不想付费就改用默认的免费引擎：python scripts/tts.py all --engine edge"
             )
         return key

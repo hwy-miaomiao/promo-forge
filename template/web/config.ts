@@ -24,6 +24,12 @@ export type WebConfig = {
   brand: string;
   /** 品牌 logo（相对 public/ 的路径）。空串 = 用代码画的首字方块兜底 */
   logo: string;
+  /**
+   * 品牌三色。**唯一事实来源是 src/timing.json 的 brand.colors** —— 片子里用的就是这三个值，
+   * 网页版必须跟着走：换了品牌色只改 timing.json，不能要求用户再去手改 style.css。
+   * 这里的字面量只是"timing.json 没写这个键"时的兜底（与模板默认配色一致）。
+   */
+  colors: Required<typeof timing.brand.colors>;
   /** 海报态的一句话（点播放之前给人看的"这片子讲什么"） */
   posterNote: string;
   /** 播放结束卡片上的一句话 */
@@ -49,9 +55,16 @@ export const WEB: WebConfig = {
   title: `${timing.title} · 网页版`,
   brand: timing.brand.name,
   logo: timing.brand.logo,
+  colors: {
+    bg: timing.brand.colors?.bg || "#0b0b12",
+    fg: timing.brand.colors?.fg || "#ffffff",
+    accent: timing.brand.colors?.accent || "#33e1a1",
+  },
   posterNote: "一句话做一支竖屏宣传片 —— 这是用 promo-forge 模板渲出来的成品。",
   endNote: "想给自己的产品也做一支？从这里开始。",
-  primary: { label: "免费下载", url: `https://${timing.brand.url.replace(/^https?:\/\//, "")}` },
+  // 没填 brand.url 时保持空串（App.tsx 里 url 为空就不渲染这个按钮），
+  // 而不是拼出一个 "https://" 的死链
+  primary: { label: "免费下载", url: timing.brand.url ? `https://${timing.brand.url.replace(/^https?:\/\//, "")}` : "" },
   secondary: { label: "了解模板", url: "" },
   footer: `© ${timing.brand.name} · 由 promo-forge 生成`,
 };

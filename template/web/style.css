@@ -11,7 +11,11 @@
  */
 
 :root {
-  /* 颜色与 src/timing.json 的 brand.colors 保持一致；改片子时一起改这两处 */
+  /*
+   * 这三个只是"CSS 兜底值"，颜色的事实来源是 src/timing.json 的 brand.colors：
+   * App.tsx 会把 WEB.colors（由 timing.json 推导）写成行内 --bg/--fg/--accent 覆盖这里的值，
+   * 所以换品牌色只需要改 timing.json。这里保留字面量是为了 CSS 单独打开时也不至于没有颜色。
+   */
   --bg: #0b0b12;
   --fg: #ffffff;
   --accent: #33e1a1;
@@ -24,8 +28,12 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
-  color: var(--fg);
+  /*
+   * html/body 是 .page 的祖先，拿不到定义在 .page 上的行内 --bg，这里只能用 :root 兜底值；
+   * 真正跟随 timing.json 的那一份由 main.tsx 设在 document.body 的行内样式上。
+   */
+  background: var(--bg, #0b0b12);
+  color: var(--fg, #ffffff);
   font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
 }

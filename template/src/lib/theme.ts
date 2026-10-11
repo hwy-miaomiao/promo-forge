@@ -114,11 +114,24 @@ export const SAFE_INSET = {
 
 export type SafeInset = { top: number; bottom: number; left: number; right: number };
 
-/** 当前画面该用哪套安全区。竖屏判定优先看 aspect，再退回宽高比，两个都不可信时默认竖屏。 */
+/**
+ * 当前画面该用哪套安全区。
+ *
+ * ❗必须先看**实际渲染的宽高**，不能先看 timing.json 的 aspect：
+ * aspect 只描述"成片按哪个画幅交付"，而 isVertical() 要回答的是"这一帧画布是横是竖"。
+ * 一旦先信 aspect，用 1920×1080 渲染 aspect="9:16" 的项目时这里会判成竖屏 ——
+ * 安全区按竖屏算（上 10% / 下 18%，横版该是 6% / 8%）、字号基准取画面宽度
+ * （1920 而不是横版常量 1280，字号整体放大 1.5 倍），
+ * 于是横版成片里标题字号过大、内容纵向溢出画布上下边缘（实测 1920×1080 抽帧：
+ * 顶部「手工记账 / 第 1 天」贴着画面上沿、副标题被挤到底部五分之一处）。
+ *
+ * 非 16:9 / 9:16 的 aspect（例如 "1:1"）才退回 aspect 字段；宽高相等时按竖屏处理。
+ */
 export const isVertical = (width: number, height: number): boolean => {
+  if (height !== width) return height > width;
   if (TIMING.aspect === "16:9") return false;
   if (TIMING.aspect === "9:16") return true;
-  return height >= width;
+  return true;
 };
 
 export const pickSafeInset = (width: number, height: number): SafeInset =>

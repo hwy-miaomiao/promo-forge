@@ -121,6 +121,11 @@ TOOLING_LABEL_TEXTS: Tuple[str, ...] = (
 ROUTE_SUBSET = "内嵌子集字体"
 ROUTE_SYSTEM = "系统字体栈"
 
+# 不占任何视觉宽度的不可见字符：有些编辑器（或一次 PowerShell 重定向）会往文件头写 UTF-8 BOM，
+# 文案里也可能混进零宽空格。它们一旦留在字符集里，任何字体都缺这个字形 —— 闸门会报
+# 「缺 1 个字符…会渲染成方块」，而用户盯着的却是一个看不见、删不掉的字符。所以收集时直接丢掉。
+INVISIBLE_CHARS = frozenset("\ufeff\u200b\u200c\u200d\u2060")
+
 
 # ===========================================================================
 # fonts.json 读写
@@ -333,6 +338,8 @@ def build_charset(timing: Dict[str, Any], cfg: Dict[str, Any]) -> Charset:
         fresh = 0
         for char in text:
             if char.isspace() or char in origin:
+                continue
+            if char in INVISIBLE_CHARS:      # BOM / 零宽字符：没有字形可查，不该进闸门
                 continue
             origin[char] = label
             counted.append(char)
@@ -757,17 +764,30 @@ def cmd_subset(args: argparse.Namespace) -> int:
             "装上才能用（`pip install brotli`）；不想新增依赖就改用默认的 --flavor auto，"
             "会导出 .ttf —— @remotion/fonts 的 loadFont 两种都能加载"
         )
+    # 交给 fontTools 的 flavor 只认 "woff"/"woff2"/None：'otf' 不是合法 flavor
+    # （save() 里会 AssertionError: Unknown flavor 'otf'），未压缩的 sfnt 必须用 None。
+    # 所以 --flavor otf 等价于「原样导出轮廓」= auto 的输出，后缀交给 _extension_for() 按轮廓类型定。
     flavor = "woff2" if (args.flavor == "woff2" or (args.flavor == "auto" and brotli_ok)) else None
+    #: 用户显式点名某种轮廓（ttf / otf），None 表示随源字体。
+    #: 判据是「有没有 glyf 表」：.ttf = glyf 轮廓（True），.otf = CFF 轮廓（没有 glyf，False）。
+    want_outline = {"ttf": True, "otf": False}.get(args.flavor)
 
     C.log(f"字体子集化：{C.rel(C.TIMING_PATH)} + src/** → {C.rel(out_dir)}")
     if flavor == "woff2":
         C.log("字体格式：woff2（brotli 可用，体积最小；loadFont 同样能加载）")
-    else:
+    elif args.flavor == "auto":
         C.log(
             "字体格式：ttf/otf（按字形类型自动选后缀）"
             f" —— brotli 不可用（{brotli_err}），所以导出不了 .woff2。"
             "装了 brotli 会再小一半，但不装也不影响渲染：@remotion/fonts 两种都能加载"
         )
+    else:
+        C.log(
+            f"字体格式：按 --flavor {args.flavor} 导出未压缩的 sfnt"
+            f"（后缀就是 {args.flavor}；源字体的轮廓类型对不上会直接 ERROR）"
+        )
+        if args.flavor == "otf":
+            C.log("（fontTools 没有 otf 这个 flavor，--flavor otf 就是「原样导出 CFF 轮廓」）")
     if args.font:
         C.log(f"源字体：--font {C.rel(Path(args.font))}")
     if args.font_number is not None:
@@ -837,6 +857,19 @@ def cmd_subset(args: argparse.Namespace) -> int:
         face, _note = picks[role]
         probe = _load_ttfont(face.path, face.index)
         try:
+            if want_outline is not None:
+                has_glyf = "glyf" in probe
+                if has_glyf != want_outline:
+                    outline = ("glyf（TrueType 轮廓，只能出 .ttf）" if has_glyf
+                               else "CFF（PostScript 轮廓，只能出 .otf）")
+                    other = "glyf/.ttf" if want_outline else "CFF/.otf"
+                    C.error(
+                        f"--flavor {args.flavor} 和源字体对不上：{C.rel(face.path)} 是 {outline}。"
+                        "fontTools 不会在 glyf 与 CFF 之间转换轮廓，硬写出来的文件后缀与内容不符"
+                        "（.otf 里塞 glyf / .ttf 里塞 CFF），部分渲染器会拒收。"
+                        "两个办法：去掉 --flavor（用 auto，会按轮廓类型自动选后缀），"
+                        f"或换一个 {other} 的源字体给 --font。"
+                    )
             ext = _extension_for(probe, flavor)
         finally:
             try:
@@ -1154,7 +1187,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_subset.add_argument("--weight", type=int, default=None,
                           help="覆盖所有角色的目标字重（默认用 fonts.json roles.<role>.weight）")
     p_subset.add_argument("--flavor", choices=FLAVORS, default="auto",
-                          help="字体格式：auto（默认，有 brotli 就 woff2，否则 ttf/otf）/ woff2 / ttf / otf")
+                          help="字体格式：auto（默认，有 brotli 就 woff2，否则按轮廓类型出 .ttf/.otf）/ "
+                               "woff2 / ttf（要求源字体是 glyf 轮廓）/ otf（要求源字体是 CFF 轮廓；"
+                               "不支持从 glyf 转换，源字体对不上会 ERROR）")
     p_subset.set_defaults(func=cmd_subset)
 
     p_check = sub.add_parser(

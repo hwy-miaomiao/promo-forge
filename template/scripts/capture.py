@@ -156,37 +156,42 @@ AVATAR_JS = """
 # ---------------------------------------------------------------------------
 
 def _jpeg_size(path: Path) -> Optional[Tuple[int, int]]:
-    """只读文件头解析 JPEG 宽高（不依赖 Pillow）。"""
+    """只读文件头解析 JPEG 宽高（不依赖 Pillow）。
+
+    按段长跳过 APP0/APP1/ICC 等元数据段，只读到 SOF 为止：真实截图一般几百字节就够，
+    而相机/手机导出的图可能把 EXIF + ICC 塞在 SOF 前面上百 KB，所以不能「一口气读 256KB
+    再在缓冲区内扫」——那样 SOF 落在缓冲区外就返回 None，宽度护栏会被静默跳过。
+    """
     try:
         with open(path, "rb") as fh:
-            data = fh.read(262144)
-    except OSError:
+            if fh.read(2) != b"\xff\xd8":
+                return None
+            while True:
+                # 标记可以带 0xFF 填充字节
+                b = fh.read(1)
+                while b == b"\xff":
+                    b = fh.read(1)
+                if not b:
+                    return None
+                marker = b[0]
+                if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                    continue                       # 无参数标记，后面直接跟下一个标记
+                head = fh.read(2)
+                if len(head) < 2:
+                    return None
+                seg_len = int.from_bytes(head, "big")
+                if seg_len < 2:                    # 段长非法：seek 会后退，可能死循环
+                    return None
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    body = fh.read(5)              # 精度(1) + 高(2) + 宽(2)
+                    if len(body) < 5:
+                        return None
+                    return (int.from_bytes(body[3:5], "big"), int.from_bytes(body[1:3], "big"))
+                if marker == 0xDA:                 # SOS：后面是压缩数据，不可能再有 SOF
+                    return None
+                fh.seek(seg_len - 2, 1)
+    except (OSError, ValueError):
         return None
-    if len(data) < 4 or data[0:2] != b"\xff\xd8":
-        return None
-    i = 2
-    while i + 9 < len(data):
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        marker = data[i + 1]
-        if marker == 0xFF:
-            i += 1
-            continue
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            i += 2
-            continue
-        if i + 4 > len(data):
-            break
-        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
-        if seg_len < 2:
-            break
-        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            h = int.from_bytes(data[i + 5:i + 7], "big")
-            w = int.from_bytes(data[i + 7:i + 9], "big")
-            return w, h
-        i += 2 + seg_len
-    return None
 
 
 def _parse_at(raw: Optional[str]) -> List[float]:

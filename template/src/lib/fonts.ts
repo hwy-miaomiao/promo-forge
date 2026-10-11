@@ -221,15 +221,19 @@ const register = (role: FontRole): void => {
     //   没有 fontDisplay 这个键，写错了 TS 会直接报 unknown property。）
     display: "block",
   }).catch((err: unknown) => {
-    // 走到这里说明文件在 public/ 里、但字节层面加载不了（截断 / 不是字体 / 解码失败）。
-    // loadFont 内部已经 cancelRender 了，所以这次渲染多半会报错退出 —— 这是故意的：
-    // 坏字体比缺字体更该被拦下来。这里把家族名也换回系统栈，并留下能对上号的日志。
+    // 两种情况会走到这里：① 文件根本不在 public/ 里（404）——网页播放器里 staticFiles 拿不到
+    // 清单时会按"存在"处理，所以新克隆没跑 fonts.py subset 时就是这个分支；② 文件在、但字节
+    // 层面加载不了（截断 / 不是字体 / 解码失败）。loadFont 内部已经 cancelRender 了，所以这次
+    // 渲染多半会报错退出 —— 这是故意的：坏字体比缺字体更该被拦下来。
+    // 这里把家族名换回系统栈、把 HAS_LOCAL_FONT 改回 false（否则这个对外标志会说"注册了本地
+    // 字体"而实际用的是系统字体），并留下能对上号的日志。
     console.warn(
       `[fonts] ${role} 内嵌字体加载失败（${route.file}），回退系统字体栈：`,
       err,
       "\n        重新生成：python scripts/fonts.py subset",
     );
     FONT[role] = systemFamily(role);
+    HAS_LOCAL_FONT[role] = false;
   });
 };
 
