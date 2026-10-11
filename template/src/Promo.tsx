@@ -21,6 +21,17 @@ import "./lib/fonts"; // 副作用导入：注册本地字体（file 为空时�
 export type PromoProps = {
   /** 是否带上配乐。预览渲染可以传 false，成片必须 true。 */
   withAudio: boolean;
+  /**
+   * 是否渲染画面里的字幕层（默认 true）。只有准备**烧硬字幕**时才关掉它。
+   *
+   * 为什么要有这个开关：`subtitles.py burn` 把 ASS 烧在画面底部，位置与 <Caption>
+   * 完全一致（都由 `captions.bottom` 决定）。如果成片里已经有 <Caption> 渲染的字幕，
+   * 烧完就是两行字叠在一起（实测过：两行糊在一起，看不出任何一行）。
+   * 正确流程是"渲染一版没有字幕的画面，再烧字幕"：
+   *     1) npm run render:1080:nosubs      # 带 --props=props-nosubs.json
+   *     2) python scripts/subtitles.py burn out/final-1080p-nosubs.mp4 -o out/final-1080p-hard.mp4
+   */
+  withCaptions?: boolean;
 };
 
 /**
@@ -65,7 +76,7 @@ const MUSIC_FILE_EXISTS: boolean = (() => {
  */
 const CROSSFADE = 0.25;
 
-export const Promo: React.FC<PromoProps> = ({ withAudio }) => {
+export const Promo: React.FC<PromoProps> = ({ withAudio, withCaptions = true }) => {
   const { fps } = useVideoConfig();
 
   return (
@@ -89,8 +100,9 @@ export const Promo: React.FC<PromoProps> = ({ withAudio }) => {
         );
       })}
 
-      {/* 字幕层压在场景之上：它不属于任何单个场景，跨场景连续（旁白是连续的） */}
-      <Caption />
+      {/* 字幕层压在场景之上：它不属于任何单个场景，跨场景连续（旁白是连续的）。
+          烧硬字幕的版本要把这一层关掉（withCaptions=false），否则两行字会叠在一起。 */}
+      {withCaptions ? <Caption /> : null}
 
       {/* 音频：路径来自 timing.json 的 music.file（相对 public/）。混音脚本会写出这个文件。
           没有 withAudio、或文件还没混出来时，整条音轨不挂载（见 MUSIC_FILE_EXISTS 的说明）。

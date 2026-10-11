@@ -1,0 +1,6 @@
+{
+  "_comment": "渲染「不带画面字幕」的版本，给 scripts/subtitles.py burn 烧硬字幕用。用法：npm run render:1080:nosubs（等价于 --props=props-nosubs.json）。",
+  "_why": "subtitles.py 烧出来的 ASS 与 <Caption> 组件渲染的字幕位置完全一致（都取 timing.json 的 captions.bottom），所以成片里必须先没有字幕，否则两行字会叠在一起。",
+  "withAudio": true,
+  "withCaptions": false
+}

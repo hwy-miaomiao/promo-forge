@@ -1,0 +1,1418 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""promo-forge · 阶段 7「配音与字幕」的字幕生成与烧录。
+
+用途
+----
+把 ``src/timing.json`` 的旁白稿 + **真实配音时长** 变成可直接交付的字幕，并提供硬字幕成片：
+
+1. ``srt`` —— 生成 SRT。时间轴优先用 ffprobe 量 ``audio-src/vo/<id>.mp3`` 的**实测时长**：
+   起点取 ``voice.lines[].at``，终点 = 起点 + 实测时长，同时不短于 AGENTS.md 阶段 7 的
+   ``字数 / 6 + 0.35`` 秒（两者取较大），且**不得越过该句所属场景的窗口末端**
+   （``scene_window()``：字幕活到下一场景开始就是「串场」，是审图时最容易被抓的错）。
+2. ``ass`` —— 生成 ASS（Advanced SubStation）。``PlayResX/PlayResY`` 取 timing.json 的
+   width/height，字体取 ``fonts.json`` 的 ``roles.body``，字号按画布高度换算，
+   ``MarginV`` 由 ``captions.bottom`` 换算并压进竖屏安全区（上 10% / 下 18% / 左 6% / 右 14%）。
+3. ``burn`` —— 用 ffmpeg 把 ASS 烧成硬字幕（``-vf ass=...``），或 ``--soft`` 封装成软字幕
+   （``-c:s mov_text``）。``--preview N`` 只处理前 N 秒，方便先看 8 秒再决定要不要整片跑。
+
+AI 看不到画面，所以这里把「字幕读得完、不串场、不出安全区」全部变成可计算的秒数与像素值。
+**烧完仍然要人工审图**：脚本会把抽帧存到 ``out/verify-subs/``，再跑 ``check_video.py`` 复查。
+
+典型调用
+--------
+    python scripts/subtitles.py srt                       # -> out/subtitles/zh.srt
+    python scripts/subtitles.py srt --out out/subtitles/zh.srt
+    python scripts/subtitles.py ass --fontsize 76          # 覆盖字号
+    python scripts/subtitles.py burn --preview 8           # 8 秒快速验证
+    python scripts/subtitles.py burn out/final-1080p.mp4 -o out/final-1080p-hard.mp4
+    python scripts/subtitles.py burn --soft                # 软字幕封装（播放器可关）
+
+依赖
+----
+必需：ffmpeg / ffprobe（硬依赖，``doctor.py`` 会体检）、``scripts/_common.py``、``src/timing.json``。
+不需要任何 pip 包：本脚本只用标准库 + 已装好的 ffmpeg。
+配音缺失（``report.json`` 或某条 mp3 不见了）**不会崩**：回退到按字数估算并打 WARN。
+
+退出码
+------
+0 成功（含「按字数估算」这类 WARN）；
+1 有 ERROR：缺 ffmpeg、timing.json 非法、没写旁白稿、字幕写不出去、烧录失败、``--preview`` 用错等。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# 导入公共库 scripts/_common.py（由另一位维护者提供，本脚本不修改它）
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:  # pragma: no cover - 只在 _common.py 缺失时走到
+    from _common import (  # type: ignore
+        FONTS_PATH,
+        PROJECT_ROOT,
+        error,
+        fmt_sec,
+        fonts_config,
+        has_cmd,
+        human,
+        line_window,
+        load_json,
+        load_timing,
+        log,
+        scene_window,
+        warn,
+    )
+except ImportError as exc:  # pragma: no cover
+    sys.stderr.write(
+        "ERROR: 无法导入 scripts/_common.py（%s）。请确认 scripts 目录完整，"
+        "并在项目根目录下运行本脚本。\n" % (exc,)
+    )
+    raise SystemExit(1)
+
+
+# ===========================================================================
+# 阈值常量（每条都对应 AGENTS.md 的一处硬性要求，改这里前先改文档）
+# ===========================================================================
+
+# AGENTS.md 阶段 7：「停留时长 ≥ 字数 / 6 + 0.35 秒」。分母 6 = 语速 5.5~6.5 字/秒的乐观端。
+CHARS_PER_SEC = 6.0
+#: 上式的固定尾巴（秒）。0.35 是给标点停顿留的余量。
+MIN_HOLD_PAD_S = 0.35
+#: 收尾提前量（秒）。与 AGENTS.md 阶段 7 模板组件的「场景结束前 0.15 秒收掉」一致，
+#: 避免上一句字幕和下一场景的字幕同时在屏上。
+TAIL_OFF_S = 0.15
+
+# 安全区（AGENTS.md 第 4 节，相对画面高宽）。
+#: 底部安全区下沿——字幕的 MarginV 必须落在这条线以上。
+SAFE_BOTTOM = 0.18
+#: 顶部安全区下沿——MarginV 太大（字幕顶到画面上三分之三）同样算破版。
+SAFE_TOP = 0.10
+#: 左右安全区。ASS 的 MarginL/MarginR 要留够，否则长行会顶到平台互动按钮。
+SAFE_LEFT = 0.06
+SAFE_RIGHT = 0.14
+
+# ASS 字号 = 画布高度 × 这个系数。1080×1920 竖屏 -> 约 73（约合屏高的 3.8%），
+# 13 个字大约占屏宽 86%，正好卡在左右安全区内。
+FONT_SCALE = 0.038
+FONT_SIZE_MIN = 12
+
+# ASS 描边/阴影（竖屏手机上看，描边是「任何底色都读得清」的保险）。
+DEFAULT_OUTLINE = 3.0
+DEFAULT_SHADOW = 1.2
+
+#: 允许「为避免行首标点」而超出 maxChars 的宽容度。实测到过 13 字的句子切出
+#: 「已经有六万人在用它管理开支 / 。」—— 一个孤零零的句号占一行，比多出 1 个字难看得多。
+#: 超过这个宽容度就宁可让标点留在行首（并打 WARN），也不再撑宽行。
+FOLD_OVERFLOW_GRACE = 2.0
+
+# 中文避头尾（禁则处理）：
+#: 收尾标点不能出现在行首，否则会切出「……管理开支 / 。」这种断法；
+CLOSING_PUNCT = "。，、！？；：…—,.!?;:）〕」』》〉】”’%"
+#: 起始标点不能出现在行尾（左括号/左引号后面必须还有字）。
+OPENING_PUNCT = "（〔「『《〈【“‘("
+# 归一化空白时统一替换成的字符（字幕里换行由 \N 控制，正文不能自带换行）。
+SPACE_CHARS = " \t\u3000\u00a0"
+
+VO_DIRNAME = "audio-src/vo"
+REPORT_NAME = "report.json"
+SUBTITLE_DIRNAME = "out/subtitles"
+DEFAULT_SRT = SUBTITLE_DIRNAME + "/zh.srt"
+DEFAULT_ASS = SUBTITLE_DIRNAME + "/zh.ass"
+DEFAULT_VIDEO = "out/final-1080p.mp4"
+DEFAULT_OUT_VIDEO = "out/final-1080p-hard.mp4"
+VERIFY_DIRNAME = "out/verify-subs"
+
+#: 烧录时抽帧存 PNG 的时刻（相对预览区间的比例）——避开 0.0s 的淡入黑帧。
+FRAME_AT_RATIO = 0.5
+#: 默认 ASS 字体（Windows 简体中文环境的通用选择；fonts.json 的 roles.body 优先）。
+DEFAULT_FONT_FAMILY = "Microsoft YaHei"
+
+FFMPEG_TIMEOUT_S = 1800.0
+FFPROBE_TIMEOUT_S = 120.0
+
+
+# ===========================================================================
+# 小工具
+# ===========================================================================
+
+def _force_utf8() -> None:
+    """Windows 控制台默认 GBK，中文/emoji 会炸；这里兜底成 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _rel(path: Any) -> str:
+    """相对项目根的展示路径（不在项目内则原样返回）。"""
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except Exception:
+        return p.as_posix()
+
+
+def _resolve_user_path(value: Any, cwd_first: bool = True) -> Path:
+    """把用户给的路径变成绝对路径。
+
+    先按当前工作目录解析（脚本在项目根跑时二者一致），再退回项目根，
+    免得用户 ``cd`` 到别处后 ``out/subtitles/zh.srt`` 落错地方。
+    """
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    if cwd_first and p.exists():
+        return p.resolve()
+    return (PROJECT_ROOT / p).resolve()
+
+
+def _disp_width(text: str) -> int:
+    """终端显示宽度（中日韩全角算 2 列），只用于打印对齐。"""
+    width = 0
+    for ch in text:
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _disp_width(text))
+
+
+def _num(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+# --- 时间戳 ---------------------------------------------------------------
+
+def _split_ms(seconds: float) -> Tuple[int, int, int, int]:
+    """把秒拆成 (时, 分, 秒, 毫秒)；四舍五入到毫秒，负数夹到 0。"""
+    total_ms = int(round(max(0.0, float(seconds)) * 1000.0))
+    hours, rest = divmod(total_ms, 3600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, millis = divmod(rest, 1000)
+    return hours, minutes, secs, millis
+
+
+def fmt_srt_time(seconds: float) -> str:
+    """SRT 时间戳：``HH:MM:SS,mmm``（逗号是 SRT 规范，写成点号部分播放器不认）。"""
+    h, m, s, ms = _split_ms(seconds)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def fmt_ass_time(seconds: float) -> str:
+    """ASS 时间戳：``H:MM:SS.cc``（ASS 只到厘秒，用截断而不是四舍五入以免超出视频时长）。"""
+    total_cs = int(max(0.0, float(seconds)) * 100.0)
+    hours, rest = divmod(total_cs, 360_000)
+    minutes, rest = divmod(rest, 6_000)
+    secs, centis = divmod(rest, 100)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+# --- 文本与折行 -----------------------------------------------------------
+
+def _clean_text(text: Any) -> str:
+    """去掉换行与多余空白（换行由折行逻辑统一生成）。"""
+    raw = str(text or "")
+    for ch in SPACE_CHARS:
+        raw = raw.replace(ch, " ")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _vis_len(text: str) -> int:
+    """字幕的「字数」：东亚洲宽字符算 1 个字，半角算 0.5，凑整进位。
+
+    ``captions.maxChars`` 按 AGENTS.md 阶段 7 的「单行 ≤13 字」理解成**中文正文字数**，
+    所以这里不能直接用 ``len()``（那会把 1 个汉字和 1 个标点、1 个字母算成一样宽）。
+    """
+    total = 0.0
+    for ch in text:
+        total += 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5
+    return int(round(total))
+
+
+def _char_w(ch: str) -> float:
+    """单字宽度：东亚洲宽字符算 1 个字，半角算 0.5。"""
+    return 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5
+
+
+def _valid_break(tokens: Sequence[str], cut: int) -> bool:
+    """cut 这个切点合法吗：两边都不是标点。
+
+    非法切点只有两种，都是实测踩到的坑：
+
+    * 下一行以收尾标点开头 —— ``已经有六万人在用它管理开支。`` 按 13 字硬切会变成
+      「……管理开支 / 。」，一个孤零零的句号独占一行；
+    * 本行以起始标点结尾 —— ``点击「开始记账」按钮（在右下角）。`` 会切出「点击 / 「」，
+      左引号被甩在行尾。
+    """
+    if cut <= 0 or cut >= len(tokens):
+        return False
+    if tokens[cut] in CLOSING_PUNCT or tokens[cut - 1] in OPENING_PUNCT:
+        return False
+    return True
+
+
+def _wrap(text: str, width: float) -> Tuple[int, float]:
+    """从 text 头部取一行，返回 ``(切点token数, 超宽字数)``。
+
+    先贪心装到 ``width`` 拿到一个**上界**，再在它之前找**最后一个合法切点**；
+    找不到就容许放行 1~2 个收尾标点（``FOLD_OVERFLOW_GRACE``），
+    宁可这行多装一个字，也不要下一行以标点开头。宽限内仍找不到就退回上界，
+    由调用方 WARN。**绝不丢字**：切点永远 ≥1 且 < 长度。
+    """
+    tokens = list(text)
+    consumed = 0.0
+    limit = 0
+    while limit < len(tokens):
+        consumed += _char_w(tokens[limit])
+        if consumed > width:
+            break
+        limit += 1
+    limit = max(1, min(limit, len(tokens) - 1))
+
+    # 主选：上界以内的最后一个合法切点。
+    cut = limit
+    while cut > 0 and not _valid_break(tokens, cut):
+        cut -= 1
+    if cut > 0:
+        return cut, 0.0
+
+    # 退让：上界之后最近的合法切点，只要多装的都是收尾标点、且不超宽容度。
+    over = limit
+    extra = 0.0
+    while over < len(tokens) - 1 and extra < FOLD_OVERFLOW_GRACE:
+        if tokens[over] not in CLOSING_PUNCT:
+            break
+        extra += _char_w(tokens[over])
+        over += 1
+        if _valid_break(tokens, over):
+            return over, extra
+    return limit, 0.0
+
+
+def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
+    """按字数折行：优先在标点后断，其次硬断；总行数不够时只 WARN 不丢字。
+
+    返回的行数可能超过 ``max_lines`` —— 那种情况调用方会打 WARN：
+    丢字会让字幕和配音对不上，比多占一行更严重（改稿才是正解）。
+    """
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return []
+    width = max(1.0, float(max_chars))
+    lines: List[str] = []
+    rest = cleaned
+    while rest:
+        if _vis_len(rest) <= width:
+            lines.append(rest)
+            break
+        cut, overflow = _wrap(rest, width)
+        cut = max(1, min(cut, len(rest) - 1))
+        tail = rest[cut:]
+        # 平衡：首行偏长、剩下的字一行还装得下时，把切点挪到中间——
+        # 两行差不多长比「满行 + 短尾巴」好看得多（这也是「尊重标点」的另一半）。
+        if len(lines) + 1 == max_lines and tail and _vis_len(tail) <= width and cut > len(rest) / 2:
+            mid = len(rest) // 2
+            mid_cut, mid_overflow = _wrap(rest, float(mid))
+            if 0 < mid_cut < len(rest) and _valid_break(list(rest), mid_cut):
+                cut, overflow, tail = mid_cut, mid_overflow, rest[mid_cut:]
+        lines.append(rest[:cut])
+        rest = tail
+        if overflow:
+            # 只为避行首标点才撑宽，且最多 2 个字；说清楚免得看起来像折行失败。
+            warn(
+                f"「{cleaned}」首行多含了 {overflow:g} 个标点（>{max_chars} 字）以避免把标点切到行首："
+                "这是有意的避头尾处理，不是折行失败"
+            )
+    if max_lines > 0 and len(lines) > max_lines:
+        warn(
+            f"「{cleaned}」折成 {len(lines)} 行，超过 captions.maxLines={max_lines}"
+            f"（每行 ≤{max_chars} 字）。这里**不丢字**（丢字=字幕和配音对不上），"
+            "请回 timing.json 改稿删字，或调大 captions.maxChars/maxLines"
+        )
+    return lines
+
+
+# --- 字体 -----------------------------------------------------------------
+
+#: 通用族名，不算「具体字体」，解析时跳过（交给 fontconfig 决定）。
+GENERIC_FAMILIES = {"sans-serif", "serif", "monospace", "system-ui", "cursive", "fantasy"}
+
+#: 「ASS 里该写的字体名」 -> 「本机用来判断它存不存在的字体文件」。
+#: 这是**本机事实**的映射表，不是猜测：``_family_available()`` 会就地检查文件是否存在。
+_FAMILY_FONTS = {
+    "microsoft yahei": (
+        "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyhl.ttc",
+    ),
+    "微软雅黑": ("C:/Windows/Fonts/msyh.ttc",),
+    "simhei": ("C:/Windows/Fonts/simhei.ttf",),
+    "黑体": ("C:/Windows/Fonts/simhei.ttf",),
+    "simsun": ("C:/Windows/Fonts/simsun.ttc",),
+    "dengxian": ("C:/Windows/Fonts/Deng.ttf",),
+    "pingfang sc": ("/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/PingFang.ttf"),
+    "heiti sc": ("/System/Library/Fonts/STHeiti Medium.ttc",),
+    "noto sans cjk sc": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:/Windows/Fonts/NotoSansSC-VF.ttf",
+    ),
+    "noto sans sc": ("C:/Windows/Fonts/NotoSansSC-VF.ttf",),
+    "source han sans sc": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
+    ),
+    "wenquanyi micro hei": ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",),
+}
+
+#: 探针字符：选一个**只有中文字体才有**的汉字。用常见字（如「一」）会让
+#: 「命中了一个不含汉字的拉丁字体」这种坏情况漏过去——微软雅黑和 Cascadia Code
+#: 都「有」U+4E00 吗？不一定，但 U+9F99（龙）才是真正区分得开的探针。
+_PROBE_CHAR = "龙"
+
+#: 系统字体索引缓存（族名 -> 字体文件），首次用到时才构建。
+_FONT_INDEX: Optional[Dict[str, Path]] = None
+
+#: 建索引时调 fc-list 的超时（本机 4426 条，通常 1 秒内返回）。
+FC_LIST_TIMEOUT_S = 30.0
+
+
+def _norm_family(name: str) -> str:
+    """把族名归一化成可比较的 key：小写、去掉空格与连字符。"""
+    return re.sub(r"[\s\-_]+", "", str(name or "").lower())
+
+
+def _system_font_index() -> Dict[str, Path]:
+    """族名（归一化）-> 字体文件，来自 fontconfig 自己，所以必须按原样比对。
+
+    不能拿文件名去猜族名：``msyh.ttc`` 是 ``Microsoft YaHei``，``simhei.ttf`` 是
+    ``SimHei``，没有任何可靠规律。唯一权威的来源是 ``fc-list``（本机 4426 条），
+    加上 ``fonts.json`` 的 ``systemCandidates``（``fc-list`` 不在时它还是有内容的那一份）。
+    """
+    global _FONT_INDEX
+    if _FONT_INDEX is None:
+        index: Dict[str, Path] = {}
+        if has_cmd("fc-list"):
+            try:
+                proc = subprocess.run(
+                    ["fc-list", "-f", "%{family}|%{file}\n"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=FC_LIST_TIMEOUT_S,
+                )
+                for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+                    if "|" not in line:
+                        continue
+                    family_text, file_text = line.rsplit("|", 1)
+                    path = _font_path_file(Path(file_text.strip()))
+                    if path is None:
+                        continue
+                    for family in family_text.split(","):
+                        key = _norm_family(family)
+                        if key:
+                            index.setdefault(key, path)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        # 映射表兜底：fc-list 不在（或它没收录某个字体）时，_FAMILY_FONTS 里的路径仍然算数。
+        for family, paths in _FAMILY_FONTS.items():
+            for item in paths:
+                path = Path(item)
+                try:
+                    if path.is_file():
+                        index.setdefault(_norm_family(family), path)
+                        break
+                except OSError:
+                    continue
+        _FONT_INDEX = index
+    return _FONT_INDEX
+
+
+def _family_available(family: str) -> Optional[Path]:
+    """这个族名在本机有对应的字体文件吗？返回那个文件，没有返回 None。"""
+    return _system_font_index().get(_norm_family(family))
+
+
+def _font_path_file(font_path: Path) -> Optional[Path]:
+    """把 fontconfig 报出来的路径（ttc 里可能是 ``file.ttc:face``）还原成真实文件。"""
+    text = str(font_path).strip()
+    if not text:
+        return None
+    for candidate in (text, text.split(":")[0], text.split("(")[0].strip()):
+        try:
+            path = Path(candidate)
+            if path.is_file():
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _family_covers(font_file: Path, text: str) -> bool:
+    """字体文件里有没有 text 里的字？用来戳穿「名字能解析、但字形其实是拉丁字体」这种静默失败。
+
+    没有 Pillow 就返回 True（不拦，只跳过这层检查——它不是硬依赖）。
+    """
+    if not text:
+        return True
+    try:
+        from PIL import ImageFont  # type: ignore
+    except ImportError:
+        return True
+    try:
+        font = ImageFont.truetype(str(font_file), 32)
+        for ch in dict.fromkeys(text):
+            if ch.isspace():
+                continue
+            if font.getmask(ch).getbbox() is None:
+                return False
+        return True
+    except OSError:
+        return True
+
+
+def _first_generic(cfg: Dict[str, Any]) -> str:
+    """stack 尾部的通用族名（``sans-serif`` 之类），兜底用。"""
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    body = roles.get("body") if isinstance(roles.get("body"), dict) else {}
+    stack = body.get("stack")
+    if isinstance(stack, list):
+        for item in reversed(stack):
+            name = str(item or "").strip()
+            if name.lower() in GENERIC_FAMILIES:
+                return name
+    return "sans-serif"
+
+
+def _body_font_stack(cfg: Dict[str, Any]) -> List[str]:
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    body = roles.get("body") if isinstance(roles.get("body"), dict) else {}
+    stack = body.get("stack")
+    if isinstance(stack, list):
+        return [str(x).strip() for x in stack if str(x or "").strip()]
+    return [DEFAULT_FONT_FAMILY, "sans-serif"]
+
+
+def _resolve_font_family(cfg: Dict[str, Any], text: str = "") -> str:
+    """从 ``roles.body.stack`` 里挑一个**本机真的能用**的字体名。
+
+    这里是本脚本最容易静默出错的地方，所以宁可多做一步：ASS 的 Fontname 是交给
+    libass/fontconfig 解析的**名字**，写了一个本机没有的名字（例如在 Windows 上写
+    ``fonts.json`` stack 首位的 ``PingFang SC``）libass **不会报错**，它只是静默换一个
+    字体——实测本机 ``fc-match "PingFang SC"`` 得到 ``Cascadia Code``，一个不含汉字的
+    拉丁字体，字幕会整行变成豆腐块方框，而烧录命令退出码是 0。
+
+    选择顺序：
+
+    1. 用映射表 / ``systemCandidates`` 找到本机有字体文件的那个族名；
+    2. 都没有就问 fontconfig（``fc-match``，macOS/Linux 上能尊重 fontconfig 别名配置）
+       把名字解析成真实字体；**必须确认返回的族名就是请求的那个**（或以完整词为前缀的
+       别名，如 ``Noto Sans CJK SC`` -> ``Noto Sans SC``），再用 Pillow 确认它真的含汉字。
+       fontconfig 从不失败，不做这一步就会把 ``PingFang SC`` 的「替代字体」
+       ``Cascadia Code`` 当成答案写进 ASS；
+    3. 还没有就退回 stack 里第一个具体名字，并 WARN 说明没法在本机核实。
+    """
+    stack = _body_font_stack(cfg)
+    concrete = [n for n in stack if n.lower() not in GENERIC_FAMILIES]
+
+    for name in concrete:
+        if _family_available(name):
+            return name
+
+    for name in concrete:
+        found = _fc_match(name)
+        if not found:
+            continue
+        family_text, font_file = found
+        families = [f.strip() for f in family_text.split(",") if f.strip()]
+        if not _family_matches_request(name, families):
+            # fontconfig 回落到一个不相干的字体（实测：PingFang SC -> Cascadia Code），
+            # 这不是「替代字体」，是「没找到」。用它会把汉字渲成方框。
+            continue
+        if text and not _family_covers(font_file, text):
+            warn(
+                f"fontconfig 把「{name}」解析到「{families[0]}」（{font_file.name}），"
+                f"但那个字体缺汉字（缺「{_PROBE_CHAR}」这类字），字幕会变成方框；继续往后找"
+            )
+            continue
+        main = families[0]
+        warn(
+            f"「{name}」在本机没有对应字体文件，改用 fontconfig 解析出的「{main}」"
+            f"（{font_file.name}）；它已确认含有本片字幕用到的汉字"
+        )
+        return main
+
+    chosen = concrete[0] if concrete else DEFAULT_FONT_FAMILY
+    warn(
+        f"fonts.json 的字体栈（{'、'.join(stack) or '空'}）在本机一个都核实不到，"
+        f"仍按首选「{chosen}」写入 ASS：libass 可能静默换成别的字体甚至渲成方框。"
+        "烧完**必须**打开 out/verify-subs/ 下的审图帧确认汉字正常显示"
+    )
+    return chosen
+
+
+def _family_matches_request(name: str, families: Sequence[str]) -> bool:
+    """fontconfig 返回的族名里，有没有「就是请求的那个」或它的完整词前缀别名。
+
+    实测 ``fc-match "Noto Sans CJK SC"`` 在装有 Noto Sans SC 的机器上会返回
+    ``Noto Sans SC``——这是同一个字体的不同命名，算命中；而返回 ``Cascadia Code``
+    就是「没找到，随便给了一个」，不算。这里用**完整词**前缀判断（``Noto`` 单独一个词
+    不算），避免 ``sans`` 之类短词误命中。
+    """
+    req = _norm_family(name)
+    for family in families:
+        got = _norm_family(family)
+        if not got:
+            continue
+        if got == req or got.startswith(req) or req.startswith(got):
+            return True
+    return False
+
+
+def _fc_match(name: str) -> Optional[Tuple[str, Path]]:
+    """问 fontconfig 这个族名实际会匹配到哪个字体，返回 ``(族名原文, 字体文件)``。
+
+    关键：fontconfig **从不失败**。本机没有 ``PingFang SC`` 时它会返回
+    ``Cascadia Code``（一个拉丁字体），而不是报错——调用方必须自己用族名比对
+    （见 :func:`_resolve_font_family`）判断「这到底是不是我要的字体」。
+    Windows 上通常没有 ``fc-match`` 这个命令（ffmpeg 内嵌 fontconfig，不提供 CLI），
+    这时返回 None，交给映射表负责。
+    """
+    try:
+        proc = subprocess.run(
+            ["fc-match", "-f", "%{family}|%{file}", name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    if "|" not in out:
+        return None
+    family_text, file_text = out.split("|", 1)
+    font_file = _font_path_file(Path(file_text.strip()))
+    if not family_text.strip() or font_file is None:
+        return None
+    return family_text.strip(), font_file
+
+
+# --- 颜色 -----------------------------------------------------------------
+
+def _hex_to_ass_color(value: Any, alpha: int = 0) -> str:
+    """``#RRGGBB`` -> ASS 的 ``&HAABBGGRR``（**ASS 是 BGR 顺序**，写反了就是红蓝互换）。"""
+    text = str(value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6 or not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        return f"&H{alpha:02X}FFFFFF"
+    r, g, b = text[0:2], text[2:4], text[4:6]
+    return f"&H{alpha:02X}{b}{g}{r}".upper()
+
+
+# --- ffmpeg ---------------------------------------------------------------
+
+def _ensure_ffmpeg() -> None:
+    missing = [name for name in ("ffmpeg", "ffprobe") if not has_cmd(name)]
+    if missing:
+        error(
+            "找不到 %s。ffmpeg/ffprobe 是本脚本的硬依赖（AGENTS.md 第 6 节），"
+            "装好后重跑：Windows `winget install Gyan.FFmpeg`（或把解压出的 bin 目录加进 PATH）、"
+            "macOS `brew install ffmpeg`、Ubuntu `sudo apt install ffmpeg`；"
+            "装完跑 `python scripts/doctor.py` 确认。" % ("、".join(missing),)
+        )
+
+
+def _run_ffmpeg(args: Sequence[Any], what: str, timeout: float = FFMPEG_TIMEOUT_S):
+    """跑一条 ffmpeg；失败时回显 stderr 尾部（过滤器报错全在 stderr 里）。"""
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", *[str(a) for a in args]]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
+        )
+    except FileNotFoundError:
+        error(f"执行 {what} 时找不到 ffmpeg。请确认它已安装并在 PATH 里（跑 doctor.py 体检）。")
+    except subprocess.TimeoutExpired:
+        error(
+            f"{what} 超过 {timeout:.0f} 秒还没结束，已放弃。"
+            "整片烧字幕本来就慢，先用 `--preview 8` 验证，或换更快的机器/降低 --preset。"
+        )
+    except OSError as exc:
+        error(f"执行 {what} 失败：{exc}")
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        tail = "\n".join(detail[-12:]) if detail else "（ffmpeg 没有输出错误信息）"
+        error(f"{what} 失败（退出码 {proc.returncode}）：\n{tail}")
+    return proc
+
+
+def _ffprobe(path: Path) -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-print_format", "json",
+                "-show_format", "-show_streams", str(path),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=FFPROBE_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        error("找不到 ffprobe。它随 ffmpeg 一起安装，请确认 PATH 里有它（跑 doctor.py 体检）。")
+    except subprocess.TimeoutExpired:
+        error(f"ffprobe 读 {path.name} 超过 {FFPROBE_TIMEOUT_S:.0f} 秒还没返回。")
+    except OSError as exc:
+        error(f"执行 ffprobe 失败：{exc}")
+    text = proc.stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        error(f"ffprobe 读不出 {path.name}（退出码 {proc.returncode}）：文件可能不是有效媒体或已损坏")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        error(f"ffprobe 返回的 JSON 解析失败（{exc}）")
+    return data if isinstance(data, dict) else {}
+
+
+def _audio_duration(path: Path) -> Optional[float]:
+    """ffprobe 量音频时长；测不到返回 None（调用方回退到字数估算）。"""
+    try:
+        info = _ffprobe(path)
+    except SystemExit:
+        return None
+    fmt = info.get("format") or {}
+    for candidate in (fmt.get("duration"),):
+        value = _num(candidate, -1.0)
+        if value > 0:
+            return value
+    for stream in info.get("streams") or []:
+        if stream.get("codec_type") == "audio":
+            value = _num(stream.get("duration"), -1.0)
+            if value > 0:
+                return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Windows 下 ass= 滤镜的路径转义（**实测过的坑，见文件头注释**）
+# ---------------------------------------------------------------------------
+
+def _escape_filter_path(path: Path) -> str:
+    r"""把文件路径转成能塞进 ffmpeg 滤镜图的字符串（**实测过的规则，别改**）。
+
+    Windows 上 ``ass=`` 的路径是这块最著名的坑，实测（本机 ffmpeg 7.1，见
+    out/verify-subs/_esc3.py / _esc4.py）得到三条硬规则：
+
+    1. **反斜杠必须换成正斜杠**。ffmpeg 的滤镜参数把 ``\`` 当转义引导符吃掉：
+       ``F:\DeepSeek Harness\...`` 会被解析成 ``F:DeepSeek Harness...``（空格都没了），
+       于是报 ``Unable to parse option value "DeepSeek Harness..." as image size`` ——
+       它把后半截当成 ``original_size`` 的值了。
+    2. **盘符的 ``:`` 必须转义成 ``\:``**。``:`` 是滤镜参数的 key:value 分隔符，
+       不转义的话 ``F:/x/y.ass`` 会被拆成 ``filename=F`` + ``original_size=/x/y.ass``。
+    3. **整个文件名必须用单引号包起来**。注意：只做第 2 条、不加引号**照样失败**
+       （实测 `F\:/x/y.ass` 仍然被拆成 original_size），引号是把 ``:`` 挡在
+       key:value 解析之外的真正原因，``\:`` 只负责让 ``:`` 活到引号里。
+
+    能安全处理的字符（全部实测通过）：空格、中文、``,`` ``;`` ``[`` ``]`` ``(`` ``)``
+    ``%`` ``#``。**唯一处理不了的是单引号 ``'``**：ffmpeg 的解析器先做「引号翻转」再做
+    转义，``'\''`` / ``\'`` / ``\\'`` / ``'"'"'`` 四种写法实测全部被解析成 ``quotes.ass``
+    （撇号连同反斜杠一起消失），这是解析器的固有行为，无解。真遇到这种路径，
+    调用方应该改用 ``_write_filter_script()`` 那条路（把滤镜图写进文件），别在这里硬凑。
+    """
+    text = str(path).replace("\\", "/").replace(":", "\\:")
+    return "'" + text + "'"
+
+
+def _filter_script_text(ass_path: Path) -> str:
+    """生成滤镜图脚本文本：``ass='F\\:/x/y.ass',format=yuv420p``。"""
+    return "ass=" + _escape_filter_path(ass_path) + ",format=yuv420p"
+
+
+def _write_filter_script(dst: Path, ass_path: Path) -> Path:
+    r"""把滤镜图写进文件，用 ``-/filter_complex`` 交给 ffmpeg。
+
+    **为什么不用 `-vf "ass=..."` 直接在命令行里塞路径**：路径要先过滤镜图解析器，
+    反斜杠会被当转义符吃掉、盘符的 ``:`` 会被当 key:value 分隔符，而引号又只能解决
+    后者。实测（out/verify-subs/_esc3.py、_esc4.py）：命令行里唯一能用的写法是
+    ``ass='F\:/x/y.ass'``（单引号 + 正斜杠 + 转义冒号），一共三层规则，很容易写错；
+    而写进文件后路径是**原样的普通文本**，只有正斜杠这一条要求，简单得多。
+
+    注意 ffmpeg 7.1 已把 ``-filter_complex_script`` 标记为 deprecated，会打印
+    ``-filter_complex_script is deprecated, use -/filter_complex <file> instead`` 并
+    直接失败；``-/filter_complex`` 是它的替代写法（斜杠开头的选项 = 从文件读该选项的值）。
+    """
+    path = dst.parent / f".subtitles-{dst.stem}.filter"
+    # 内容照样要按滤镜图语法转义（从文件读并不跳过滤镜解析器，实测如此）：
+    # 复用 _escape_filter_path 那三条规则，文件里就不必再写第二套转义逻辑。
+    path.write_text(_filter_script_text(ass_path) + "\n", encoding="utf-8")
+    return path
+
+
+# ===========================================================================
+# 读配音产物（audio-src/vo/report.json + ffprobe 实测时长）
+# ===========================================================================
+
+def _load_vo_report() -> Tuple[Dict[str, Dict[str, Any]], Path]:
+    """把 report.json 的 lines 变成 ``{id: entry}``；缺失/损坏返回空表（调用方 WARN）。"""
+    path = PROJECT_ROOT / VO_DIRNAME / REPORT_NAME
+    if not path.is_file():
+        return {}, path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, path
+    if not isinstance(data, dict) or not isinstance(data.get("lines"), list):
+        return {}, path
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in data["lines"]:
+        if isinstance(item, dict):
+            out[str(item.get("id", "")).strip()] = item
+    return out, path
+
+
+class Cue:
+    """一条字幕：真的只是「一行字 + 起止秒」，时间轴已按 AGENTS.md 的口径算好。"""
+
+    __slots__ = ("line_id", "scene", "text", "lines", "start", "end", "vo_s", "min_s", "source")
+
+    def __init__(self, line_id, scene, text, lines, start, end, vo_s, min_s, source):
+        self.line_id = line_id
+        self.scene = scene
+        self.text = text
+        self.lines = lines
+        self.start = start
+        self.end = end
+        self.vo_s = vo_s        #: 真实配音时长（秒）；估算时为 None
+        self.min_s = min_s      #: 字数 / 6 + 0.35
+        self.source = source    #: "ffprobe" | "report" | "estimate"
+
+    @property
+    def dur(self) -> float:
+        return self.end - self.start
+
+
+def _estimate_duration(text: str) -> float:
+    """没量到 mp3 时的兜底时长：按 AGENTS.md 的语速口径（5.5~6.5 字/秒）取中间值。"""
+    return max(MIN_HOLD_PAD_S, _vis_len(text) / CHARS_PER_SEC + MIN_HOLD_PAD_S)
+
+
+def build_cues(timing: Dict[str, Any]) -> List[Cue]:
+    """把 timing.json 的旁白稿 + 真实配音时长算成字幕条目。"""
+    captions = timing.get("captions") if isinstance(timing.get("captions"), dict) else {}
+    max_chars = _int(captions.get("maxChars"), 13)
+    max_lines = _int(captions.get("maxLines"), 2)
+
+    voice = timing.get("voice") if isinstance(timing.get("voice"), dict) else {}
+    raw_lines = voice.get("lines")
+    if not isinstance(raw_lines, list) or not raw_lines:
+        error(
+            "timing.json 的 voice.lines 是空的，没有可做字幕的内容。"
+            "请先写旁白稿：每句带 id/scene/at/text（AGENTS.md 阶段 7）"
+        )
+
+    entries, report_path = _load_vo_report()
+    vo_dir = PROJECT_ROOT / VO_DIRNAME
+    if not entries:
+        warn(
+            f"没有读到 {_rel(report_path)}（或格式不对），无法核对真实配音时长："
+            "字幕时长回退到按字数估算。先跑 `python scripts/tts.py all` 生成配音，再重跑本脚本。"
+        )
+
+    cues: List[Cue] = []
+    for order, item in enumerate(raw_lines, start=1):
+        if not isinstance(item, dict):
+            continue
+        line_id = str(item.get("id", "")).strip() or f"#{order}"
+        text = _clean_text(item.get("text"))
+        if not text:
+            error(f"第 {line_id} 句没有 text 字段，无法生成字幕（AGENTS.md 阶段 7：每句要有 id/scene/at/text）")
+        scene = str(item.get("scene", "") or "")
+        at = _num(item.get("at"), 0.0)
+
+        # 起点取 timing.json 的 at（字幕可以比人声略早出现，但不早于这句的 at）。
+        start = at
+
+        # 字数目测下限：AGENTS.md 阶段 7「停留时长 ≥ 字数 / 6 + 0.35 秒」。
+        min_s = _vis_len(text) / CHARS_PER_SEC + MIN_HOLD_PAD_S
+
+        # 真实配音时长：以 ffprobe 实测为准（report.json 里的 duration 是 tts.py 当时的测量，
+        # 换过音色/重新生成过就会过期，所以只当兜底）。
+        mp3 = vo_dir / f"{line_id}.mp3"
+        vo_s: Optional[float] = None
+        source = "estimate"
+        if mp3.is_file() and mp3.stat().st_size > 0:
+            measured = _audio_duration(mp3)
+            if measured:
+                vo_s = measured
+                source = "ffprobe"
+            else:
+                warn(f"第 {line_id} 句的 {_rel(mp3)} 量不出时长（文件坏了？），回退到按字数估算")
+        elif line_id in entries:
+            recorded = _num(entries[line_id].get("duration"), 0.0)
+            if recorded > 0:
+                vo_s = recorded
+                source = "report"
+        if vo_s is None:
+            warn(
+                f"第 {line_id} 句找不到 {_rel(mp3)}，按字数估算时长"
+                f"（{_vis_len(text)} 字 -> {_estimate_duration(text):.2f}s）。"
+                "配音还没生成时这是正常的，但交付前必须跑 tts.py all 后重做字幕"
+            )
+
+        # 终点 = 起点 + max(实测时长, 字数目测下限)，但不得越过该句所属场景的窗口末端。
+        hold = max(vo_s if vo_s else _estimate_duration(text), min_s)
+        end = start + hold
+
+        if scene:
+            try:
+                scene_start, scene_end = scene_window(timing, scene)
+            except ValueError as exc:
+                warn(f"第 {line_id} 句的 scene={scene!r} 在 timing.json 里找不到（{exc}），按全片时长收边")
+                scene_start, scene_end = 0.0, _num(timing.get("duration"), end)
+            limit = scene_end - TAIL_OFF_S
+            if end > limit:
+                # 只提示、不报错：量出来的配音确实可能比场景还长，那是 tts.py audit 该拦的事
+                # （TOO_LONG 要改稿），本脚本的职责是别让字幕串场。
+                warn(
+                    f"第 {line_id} 句按实测时长要走到 {fmt_sec(end)}，越过场景「{scene}」末端"
+                    f"（{fmt_sec(scene_end)}）减 {TAIL_OFF_S}s 的收边线：字幕已压到 {fmt_sec(limit)}，"
+                    "避免和下一场景的字幕叠在一起。请跑 `python scripts/tts.py audit` 确认这句是不是 TOO_LONG"
+                )
+                end = limit
+            if end <= start:
+                warn(
+                    f"第 {line_id} 句在场景「{scene}」里几乎没有位置（at={fmt_sec(start)}，"
+                    f"场景 {fmt_sec(scene_start)}~{fmt_sec(scene_end)}）：把终点顺延到 {fmt_sec(scene_end)}"
+                )
+                end = max(start + 0.2, scene_end)
+
+        lines = _fold_text(text, max_chars, max_lines)
+        cues.append(Cue(line_id, scene, text, lines, start, end, vo_s, min_s, source))
+
+    if not cues:
+        error("timing.json 的 voice.lines 里没有一个能用的句子，无法生成字幕")
+
+    # 叠字检查：后一句比前一句早开就算叠字，玩家会把两句同时压在屏上（人工审图最容易漏的项）。
+    ordered = sorted(cues, key=lambda c: c.start)
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur.start < prev.end - 1e-6:
+            warn(
+                f"第 {prev.line_id} 句（{fmt_sec(prev.start)}~{fmt_sec(prev.end)}）与第 {cur.line_id} 句"
+                f"（{fmt_sec(cur.start)}~{fmt_sec(cur.end)}）在屏上重叠 {fmt_sec(prev.end - cur.start)}："
+                "同屏两句字幕会互相盖住，请调整 timing.json 的 at 或缩短前一句"
+            )
+    return cues
+
+
+# ===========================================================================
+# 写出 SRT / ASS
+# ===========================================================================
+
+def _write_srt(cues: List[Cue], path: Path) -> None:
+    blocks = []
+    for index, cue in enumerate(cues, start=1):
+        body = "\r\n".join(cue.lines)
+        blocks.append(
+            f"{index}\r\n{fmt_srt_time(cue.start)} --> {fmt_srt_time(cue.end)}\r\n{body}\r\n"
+        )
+    # SRT 用 CRLF（Windows 播放器与 Premiere/达芬奇都最省事），末尾留一个空行。
+    text = "\r\n".join(blocks)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="")
+    except OSError as exc:
+        error(f"字幕写不进 {path}：{exc}")
+
+
+ASS_HEADER = """[Script Info]
+; promo-forge 生成的字幕（scripts/subtitles.py ass）
+; 时间轴 = timing.json 的 voice.lines[].at + audio-src/vo/<id>.mp3 的实测时长，
+; 停留下限 = 字数 / {cps:g} + {pad:g} 秒，终点不越过所属场景的窗口末端。
+Title: {title}
+ScriptType: v4.00+
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+PlayResX: {play_w}
+PlayResY: {play_h}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: {style}
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def _warn_about_project_font(cfg: Dict[str, Any], family: str) -> None:
+    """用了自带字体就提示一句：字幕走的是系统字体，字形可能和画面不完全一致。
+
+    为什么是 WARN 而不是「干脆用自带字体」：``roles.<role>.file`` 指向的往往是
+    ``scripts/fonts.py subset`` 生成的**用字子集**（只含当时片中用到的字）。字幕是
+    按旁白稿生成的，改一句文案就可能引入子集外的字，那时渲染出来的还是豆腐块，
+    而且同样**不会报错**。宁可字形略有差异，也不能悄悄变成方框。
+    """
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    body = roles.get("body") if isinstance(roles.get("body"), dict) else {}
+    rel_file = str(body.get("file") or "").strip()
+    if not rel_file:
+        return
+    # file 是相对 public/ 的路径（见 fonts.json 的 _note）。
+    font_file = PROJECT_ROOT / "public" / rel_file
+    if font_file.is_file():
+        warn(
+            f"fonts.json 的 roles.body.file 指向自带字体 {rel_file}，但本脚本的字幕走系统字体 "
+            f"「{family}」（libass 只认系统族名）。字形可能与画面字幕略有差异；"
+            "要让字幕也用这个字体，需要给 ass 滤镜加 fontsdir，当前未实现"
+        )
+
+
+def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Optional[float]) -> str:
+    captions = timing.get("captions") if isinstance(timing.get("captions"), dict) else {}
+    brand = timing.get("brand") if isinstance(timing.get("brand"), dict) else {}
+    colors = brand.get("colors") if isinstance(brand.get("colors"), dict) else {}
+
+    play_w = max(1, _int(timing.get("width"), 1080))
+    play_h = max(1, _int(timing.get("height"), 1920))
+
+    # 字号按画布高度换算，保证 9:16 与 16:9 用同一套 timing.json 都不破版。
+    size = float(fontsize) if fontsize else max(FONT_SIZE_MIN, round(play_h * FONT_SCALE))
+
+    # MarginV 由 captions.bottom（相对高度）换算：ASS 里 Alignment=2 的 MarginV 是
+    # 「文字底边离画面底边的距离」，所以直接乘画布高；这样烧出来的字幕与画面里
+    # <Caption> 组件用 bottom: captions.bottom 渲染的位置完全一致。
+    # （2026-10-11 实测踩坑：这里曾写成 (1 - bottom) × 画布高，MarginV 变成 1613，
+    #   字幕被渲到画面顶部，而 ffmpeg 退出码仍是 0 —— 只能靠抽帧目视发现。）
+    bottom = _num(captions.get("bottom"), 0.16)
+    if not 0.0 < bottom < 1.0:
+        warn(f"timing.json 的 captions.bottom={bottom!r} 不是 0~1 之间的小数，按 0.16 处理")
+        bottom = 0.16
+    margin_v = int(round(bottom * play_h))
+    v_min = int(round(play_h * SAFE_BOTTOM))          # 离底边至少 18%（不被平台 UI 盖住）
+    v_max = int(round(play_h * (1.0 - SAFE_TOP)))     # 离底边最多 90%（不顶到画面上部）
+    if margin_v < v_min:
+        warn(
+            f"captions.bottom={bottom:g} 换算出的 MarginV={margin_v} 落在底部安全区（下 {SAFE_BOTTOM:.0%}）里，"
+            f"已抬到 {v_min}（约屏高 {SAFE_BOTTOM:.0%}）"
+        )
+        margin_v = v_min
+    if margin_v > v_max:
+        warn(
+            f"captions.bottom={bottom:g} 换算出的 MarginV={margin_v} 顶到上部安全区，已降到 {v_max}"
+            f"（上 {SAFE_TOP:.0%} 以下）"
+        )
+        margin_v = v_max
+
+    # 字体要走「本机真能用」的解析，不能直接取 stack 首位——在 Windows 上取到
+    # macOS 专属的 PingFang SC 时 libass 会静默换字体、把汉字渲成方框（本节注释有实测记录）。
+    all_text = "".join(cue.text for cue in cues)
+    cfg = fonts_config()
+    family = _resolve_font_family(cfg, all_text)
+    # fonts.json 的 roles.body.file 指向项目自带字体时，**我们没有用它**：libass 只认
+    # 系统里装了的族名，要让它用项目字体得给 ass 滤镜加 fontsdir（本脚本当前没做）。
+    # 项目字体通常是「只含片中用字」的子集（scripts/fonts.py subset 的产物），而字幕文案
+    # 改一句就可能引入子集外的字，所以这里照旧走系统字体更稳；但要提醒用户：
+    # 若模板画面用的是自带字体，字幕字形可能和画面不完全一致。
+    _warn_about_project_font(cfg, family)
+    primary = _hex_to_ass_color(colors.get("fg", "#FFFFFF"))
+    outline_colour = _hex_to_ass_color(colors.get("bg", "#000000"))
+
+    # BorderStyle=1（描边 + 阴影）比 BackColour 色块更像短视频字幕；Alignment=2 是底部居中。
+    style = ", ".join(
+        [
+            "Default",
+            family,
+            f"{size:g}",
+            primary,
+            _hex_to_ass_color(colors.get("accent", "#FFFFFF")),
+            outline_colour,
+            _hex_to_ass_color(colors.get("bg", "#000000"), alpha=0x80),
+            "0", "0", "0", "0",
+            "100", "100", "0", "0",
+            "1",
+            f"{DEFAULT_OUTLINE:g}",
+            f"{DEFAULT_SHADOW:g}",
+            "2",
+            f"{int(round(play_w * SAFE_LEFT))}",
+            f"{int(round(play_w * SAFE_RIGHT))}",
+            f"{margin_v}",
+            "1",
+        ]
+    )
+
+    header = ASS_HEADER.format(
+        cps=CHARS_PER_SEC,
+        pad=MIN_HOLD_PAD_S,
+        title=str(timing.get("title", "") or timing.get("slug", "") or "promo-forge"),
+        play_w=play_w,
+        play_h=play_h,
+        style=style,
+    )
+
+    events = []
+    for cue in cues:
+        body = r"\N".join(_clean_text(line) for line in cue.lines)
+        start = fmt_ass_time(cue.start)
+        end = fmt_ass_time(cue.end)
+        # ASS 里文本必须放最后，且换行要用字面量 \N，所以这里不做任何再转义。
+        events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{body}")
+    text = header + "\n".join(events) + "\n"
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 用 UTF-8 **不带 BOM** 写：libass 对 BOM 开头的 [Script Info] 会解析失败。
+        path.write_text(text, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        error(f"字幕写不进 {path}：{exc}")
+
+    log(
+        f"ASS 样式：字体 {family}，字号 {size:g}（画布 {play_w}×{play_h} 的 {size / play_h:.1%}），"
+        f"MarginV {margin_v}（离底边，对应 captions.bottom={margin_v / play_h:.3f}），"
+        f"左右留白 {int(round(play_w * SAFE_LEFT))}/{int(round(play_w * SAFE_RIGHT))}"
+    )
+    return text
+
+
+def _describe(cue: Cue) -> str:
+    """一行摘要：句号 / 场景 / 时间轴 / 实测时长 vs 下限 / 折行数。"""
+    vo = f"{cue.vo_s:.2f}s" if cue.vo_s is not None else "—（估算）"
+    return (
+        _pad(f"第 {cue.line_id} 句", 10)
+        + _pad(f"[{cue.scene or '-'}]", 12)
+        + _pad(f"{fmt_srt_time(cue.start)} → {fmt_srt_time(cue.end)}", 34)
+        + _pad(f"停留 {cue.dur:.2f}s", 12)
+        + _pad(f"配音 {vo}", 14)
+        + _pad(f"下限 {cue.min_s:.2f}s", 12)
+        + f"{len(cue.lines)} 行"
+    )
+
+
+def _print_cues(cues: List[Cue]) -> None:
+    log("")
+    for cue in cues:
+        log(_describe(cue))
+        for line in cue.lines:
+            log(f"          │ {line}")
+
+
+def _file_stats(path: Path) -> str:
+    data = path.read_bytes()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return f"{human(len(data))}（{len(data)} 字节） / {len(lines)} 行"
+
+
+# ===========================================================================
+# 子命令
+# ===========================================================================
+
+def _out_was_given() -> bool:
+    """命令行里是否显式给了 ``-o`` / ``--out``。
+
+    用来区分「用户指定了输出名」和「用了默认值」：只有后者才允许在 ``--preview``
+    时自动把名字改成 ``*-preview.mp4``，不能偷偷改用户点名要的路径。
+    """
+    return any(a == "--out" or a == "-o" or a.startswith("--out=") for a in sys.argv[1:])
+
+
+def cmd_srt(args) -> int:
+    timing = load_timing()
+    out = _resolve_user_path(args.out)
+    log(f"生成 SRT：{_rel(out)}")
+    cues = build_cues(timing)
+    _write_srt(cues, out)
+    _print_cues(cues)
+
+    estimated = [c for c in cues if c.vo_s is None]
+    log("")
+    log(f"SRT 完成：{len(cues)} 条 -> {_rel(out)}（{_file_stats(out)}）")
+    if estimated:
+        warn(
+            f"有 {len(estimated)} 条字幕的时长是按字数估算的（缺 audio-src/vo 下的配音）。"
+            "交付前请跑 `python scripts/tts.py all` 生成配音，再重跑本命令让时间轴对上真实人声"
+        )
+    log("下一步：python scripts/subtitles.py ass   # 生成可烧录的 ASS")
+    return 0
+
+
+def cmd_ass(args) -> int:
+    timing = load_timing()
+    out = _resolve_user_path(args.out)
+    if args.fontsize is not None and args.fontsize <= 0:
+        error(f"--fontsize 必须是正数，收到 {args.fontsize}")
+    log(f"生成 ASS：{_rel(out)}")
+    cues = build_cues(timing)
+    _build_ass(cues, timing, out, args.fontsize)
+    _print_cues(cues)
+
+    estimated = [c for c in cues if c.vo_s is None]
+    log("")
+    log(f"ASS 完成：{len(cues)} 条 -> {_rel(out)}（{_file_stats(out)}）")
+    if estimated:
+        warn(f"有 {len(estimated)} 条字幕的时长是按字数估算的（缺 audio-src/vo 下的配音）")
+    log("下一步：python scripts/subtitles.py burn --preview 8   # 先烧 8 秒看效果")
+    return 0
+
+
+def _frame_time(cues: Sequence["Cue"], cover: float) -> float:
+    """挑一个「字幕真的在屏上」的时刻抽帧。
+
+    一开始这里取的是区间中点，结果 ``--preview 8`` 的中点是 4.0s，而第 01 句
+    3.617s 就收掉了、第 02 句 5.0s 才出来 —— 抽出来的审图帧里根本没有字幕，
+    等于白抽。所以改成「落在处理区间内、且开始得最早的那条字幕的中点」；
+    一条都没有时才退回区间中点。下限抬到 0.3s 是为了避开片头淡入。
+    """
+    for cue in cues:
+        if cue.start < cover and cue.end > 0:
+            mid = cue.start + (min(cue.end, cover) - cue.start) * FRAME_AT_RATIO
+            return max(mid, 0.3)
+    return max(cover * FRAME_AT_RATIO, 0.3)
+
+
+def cmd_burn(args) -> int:
+    _ensure_ffmpeg()
+    timing = load_timing()
+
+    src = _resolve_user_path(args.video)
+    if not src.is_file():
+        error(
+            f"找不到要烧字幕的成片 {src}。先跑 `npm run render:1080`"
+            f"（输出 {DEFAULT_VIDEO}），或把正确的 mp4 路径作为第一个参数传进来"
+        )
+    if src.stat().st_size == 0:
+        error(f"{src} 是空文件（0 字节），渲染没有真正完成，先重新渲染")
+
+    dst = _resolve_user_path(args.out)
+    # 预览默认别覆盖「正式成片」的名字：`--preview 8` 不小心写成默认输出，
+    # out/final-1080p-hard.mp4 里就只有 8 秒，很容易被当成成品发出去。
+    if args.preview and not _out_was_given() and not args.soft:
+        dst = dst.with_name(dst.stem + "-preview" + dst.suffix)
+    if dst == src:
+        error(f"输出路径和输入是同一个文件（{dst}），会覆盖原片。请用 -o 指定别的路径")
+
+    if args.preview is not None and args.preview <= 0:
+        error(f"--preview 必须是正数秒数，收到 {args.preview}")
+
+    # ASS 不存在就先自动生成（burn 的语义是「一条命令拿到带字幕的成片」）。
+    ass_path = _resolve_user_path(args.ass)
+    # 时间轴一律现算一遍：抽帧要挑「字幕在屏上」的时刻，不能依赖磁盘上那份 ASS 还新不新。
+    cues = build_cues(timing)
+    if not ass_path.is_file():
+        log(f"没有 {_rel(ass_path)}，先自动生成一份 ASS")
+        _build_ass(cues, timing, ass_path, None)
+        log(f"ASS 已生成：{_rel(ass_path)}（{_file_stats(ass_path)}）")
+
+    # 画面里已经有 <Caption> 渲染的字幕时，再烧一遍硬字幕会变成两行叠字 —— 实测过：
+    # 两行糊在一起，哪一行都看不清（两者位置都由 captions.bottom 决定，必然重合）。
+    captions_cfg = timing.get("captions") if isinstance(timing.get("captions"), dict) else {}
+    if captions_cfg.get("enabled", True) and not args.soft:
+        warn(
+            "timing.json 的 captions.enabled=true：输入成片里已经带画面字幕，烧硬字幕后会两行重叠。"
+            "正确做法是先渲染一版不带字幕的画面（npm run render:1080:nosubs，"
+            "它带 --props=props-nosubs.json 把 withCaptions 关掉），再对那个文件跑 burn；"
+            "或者把 timing.json 的 captions.enabled 临时改成 false 后重新渲染"
+        )
+
+    probe = _ffprobe(src)
+    total = _num((probe.get("format") or {}).get("duration"), 0.0)
+    if total <= 0:
+        for stream in probe.get("streams") or []:
+            total = _num(stream.get("duration"), 0.0)
+            if total > 0:
+                break
+    if total <= 0:
+        warn(f"ffprobe 没报出 {src.name} 的时长，--preview 的区间只能按 0~N 秒算")
+
+    cover = min(total, float(args.preview)) if args.preview else total
+    mode = "软字幕封装" if args.soft else "硬字幕烧录"
+    log(
+        f"{mode}：{_rel(src)} -> {_rel(dst)}"
+        + (f"（--preview 只处理前 {cover:.2f}s / 全片 {total:.2f}s）" if args.preview else f"（全片 {total:.2f}s）")
+    )
+    log(f"字幕：{_rel(ass_path)}")
+
+    # 参数顺序是有讲究的：ffmpeg 把选项绑到**它后面最近的那个文件**上，所以
+    #   - 滤镜选项必须排在**所有** `-i` 之后，否则会被当成 ass 输入文件的选项，
+    #     报 "Option vf ... cannot be applied to input url ...zh.ass"；
+    #   - `-t` 对所有输出生效，放在输出文件之前即可。
+    args_list: List[Any] = ["-i", str(src)]
+    filter_script: Optional[Path] = None
+    if args.soft:
+        # 软字幕要把 ass 当**输入流**读（第 2 个输入），再用 mov_text 编码成字幕轨。
+        # 注意 `-map` 是**输出**选项：它必须排在两个 `-i` **之后**，紧跟 ass 输入写
+        # 会报 "Option map ... cannot be applied to input url ...zh.ass"。
+        args_list += ["-i", str(ass_path)]
+        if args.preview:
+            # -t 放在输出选项区 = 对输出生效；预览时视频必须重编码（copy 不支持截断）。
+            # 音频不用动：`-t` 只截时长，copy 出来的 AAC 包本来就是分段的，播放器按时间轴读，
+            # 没必要为了 8 秒预览把整条音轨重编码一遍（慢且会引入又一次有损编码）。
+            args_list += ["-t", f"{cover:.3f}"]
+        args_list += ["-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+                      "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"]
+        if args.preview:
+            args_list += ["-c:v", "libx264", "-preset", "medium", "-crf", "20"]
+    else:
+        # 硬字幕：ass 是**滤镜**，不是输入文件。
+        # 滤镜图走 `-filter_complex_script`（写进文件）而不是 `-vf "ass=..."`，
+        # 这样路径里的反斜杠/引号都不经过滤镜解析器，见 _write_filter_script 的说明。
+        args_list += ["-t", f"{cover:.3f}"] if args.preview else []
+        filter_script = _write_filter_script(dst, ass_path)
+        log(f"滤镜图：{_rel(filter_script)}（{filter_script.read_text(encoding='utf-8').strip()}）")
+        args_list += [
+            "-/filter_complex", str(filter_script),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-c:a", "copy",
+        ]
+    # 视频被重编码过就必须 +faststart（moov 前置），否则网页播放器要下完整段才能起播。
+    if args.preview or not args.soft:
+        args_list += ["-movflags", "+faststart"]
+    args_list += [str(dst)]
+
+    try:
+        _run_ffmpeg(args_list, f"{mode} {dst.name}")
+    finally:
+        # 滤镜脚本是临时产物，成片烧完就没用了；失败也要清掉，免得 out/ 里留垃圾。
+        if filter_script is not None and filter_script.is_file():
+            try:
+                filter_script.unlink()
+            except OSError:
+                pass
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        error(f"{mode}没有产生有效文件：{dst}")
+
+    out_probe = _ffprobe(dst)
+    out_dur = _num((out_probe.get("format") or {}).get("duration"), 0.0)
+    audio_streams = [s for s in out_probe.get("streams") or [] if s.get("codec_type") == "audio"]
+    subtitle_streams = [s for s in out_probe.get("streams") or [] if s.get("codec_type") == "subtitle"]
+
+    log("")
+    log(f"输出：{dst}")
+    log(f"  体积 {human(dst.stat().st_size)}（{dst.stat().st_size} 字节） / 时长 {out_dur:.2f}s")
+    if audio_streams:
+        a = audio_streams[0]
+        log(f"  音轨：有（{a.get('codec_name', '?')}，{a.get('sample_rate', '?')} Hz，{a.get('channels', '?')} 声道）")
+    else:
+        error(
+            f"输出的 {dst.name} 没有音轨！硬字幕烧录用的是 `-c:a copy`，原片必须有音轨。"
+            "请先用 `python scripts/mix.py` 生成混音并重新渲染（AGENTS.md 阶段 10：别把无声片当成品交出去）"
+        )
+    if args.soft:
+        log(f"  字幕轨：{'有（mov_text）' if subtitle_streams else '没有 —— 封装失败'}")
+    else:
+        log("  字幕轨：无（已烧进画面，这是硬字幕的预期结果；播放器里关不掉）")
+
+    # 抽一帧存 png：AI 看不到画面，但人（和审图闸门）需要一张能直接打开看的证据。
+    verify_dir = PROJECT_ROOT / VERIFY_DIRNAME
+    frame_time = _frame_time(cues, cover if cover > 0 else (args.preview or 8.0))
+    frame_path = verify_dir / f"{Path(args.out).stem}-{frame_time:05.2f}s.png"
+    try:
+        verify_dir.mkdir(parents=True, exist_ok=True)
+        _run_ffmpeg(
+            ["-ss", f"{frame_time:.3f}", "-i", str(dst), "-frames:v", "1", "-y", str(frame_path)],
+            f"抽取审图帧 {frame_time:.2f}s",
+        )
+    except SystemExit:
+        frame_path = None  # type: ignore[assignment]
+        warn("抽帧失败（不影响成片），可以手工跑 ffmpeg 抽帧自查")
+    if frame_path is not None and frame_path.is_file():
+        log(f"  审图帧：{_rel(frame_path)}（{frame_time:.2f}s，{human(frame_path.stat().st_size)}）")
+        if frame_path.read_bytes()[:4] == b"\x89PNG":
+            log("  （已确认是合法 PNG；请打开这张图核对字幕是否落在安全区内）")
+
+    log("")
+    log(f"复查：python scripts/check_video.py {_rel(dst)}")
+    if args.preview:
+        log(
+            f"注意：这是 {cover:.2f}s 的预览片段，长度和 timing.duration 对不上，"
+            "check_video.py 的时长闸门**会**报 ERROR —— 那不算问题，预览只用来眼检字幕位置。"
+        )
+    else:
+        log("下一步：把上面那张审图帧逐张看过（字幕在安全区内、没有叠字、没有截字），再交付。")
+    return 0
+
+
+# ===========================================================================
+# main
+# ===========================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="subtitles.py",
+        description="promo-forge 字幕生成与烧录（AGENTS.md 阶段 7）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "例：\n"
+            "  python scripts/subtitles.py srt\n"
+            "  python scripts/subtitles.py srt --out out/subtitles/zh.srt\n"
+            "  python scripts/subtitles.py ass --fontsize 76\n"
+            "  python scripts/subtitles.py burn --preview 8\n"
+            "  python scripts/subtitles.py burn out/final-1080p.mp4 -o out/final-1080p-hard.mp4\n"
+            "  python scripts/subtitles.py burn --soft        # 软字幕封装，播放器可关\n"
+            "\n"
+            "时间轴口径：起点取 timing.json 的 voice.lines[].at，终点 = 起点 + 实测配音时长\n"
+            "（不足则用「字数/6+0.35」秒兜底），且不越过该句所属场景的窗口末端。\n"
+            "退出码：0 成功（含按字数估算的 WARN）；1 有 ERROR（缺 ffmpeg / 无旁白稿 / 写不出文件 / 烧录失败）。"
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="<子命令>")
+
+    p_srt = sub.add_parser("srt", help="生成 SRT 字幕（时间轴用真实配音时长）")
+    p_srt.add_argument("--out", default=DEFAULT_SRT, help=f"输出路径（默认 {DEFAULT_SRT}）")
+    p_srt.set_defaults(func=cmd_srt)
+
+    p_ass = sub.add_parser("ass", help="生成 ASS 字幕（含样式与安全区换算，可直接烧录）")
+    p_ass.add_argument("--out", default=DEFAULT_ASS, help=f"输出路径（默认 {DEFAULT_ASS}）")
+    p_ass.add_argument("--fontsize", type=float, default=None,
+                       help=f"覆盖字号；默认按画布高度换算（高 × {FONT_SCALE}）")
+    p_ass.set_defaults(func=cmd_ass)
+
+    p_burn = sub.add_parser("burn", help="把 ASS 烧进成片（默认硬字幕，--soft 走软字幕封装）")
+    p_burn.add_argument("video", nargs="?", default=DEFAULT_VIDEO,
+                        help=f"输入成片（默认 {DEFAULT_VIDEO}）")
+    p_burn.add_argument("-o", "--out", default=DEFAULT_OUT_VIDEO,
+                        help=f"输出路径（默认 {DEFAULT_OUT_VIDEO}）")
+    p_burn.add_argument("--soft", action="store_true",
+                        help="软字幕封装（-c:s mov_text，播放器可开关）；默认硬字幕烧进画面")
+    p_burn.add_argument("--preview", type=float, default=None, metavar="秒",
+                        help="只处理前 N 秒，用于快速验证效果（例如 --preview 8）")
+    p_burn.add_argument("--ass", default=DEFAULT_ASS,
+                        help=f"要烧的字幕文件；不存在会先自动生成（默认 {DEFAULT_ASS}）")
+    p_burn.set_defaults(func=cmd_burn)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    _force_utf8()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        # 不带子命令 = 只打印帮助（AGENTS.md 第 7 节：不要静默通过，但这不是错误）。
+        parser.print_help()
+        log("")
+        log("提示：最常用的两条是 `subtitles.py ass` 与 `subtitles.py burn --preview 8`。")
+        return 0
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        sys.stderr.write("ERROR: 用户中断\n")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

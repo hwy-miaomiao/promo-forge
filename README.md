@@ -104,7 +104,7 @@ promo-forge/
 ├── references/      # 八份方法论：需求问询 / 风格方向 / 素材与截图 / 配乐与卡点 / 配音与字幕 / 校验清单 / 踩坑记录 / 案例复盘
 ├── template/        # 复制到项目里的 Remotion 工程模板
 │   ├── src/         #   timing.json（唯一事实来源）+ Root/Promo + 组件 + 场景
-│   ├── scripts/     #   doctor / capture / media / music / tts / mix / check_assets / check_video / stills / sync_template
+│   ├── scripts/     #   doctor / capture / media / music / tts / mix / subtitles / fonts / deliver / check_assets / check_video / stills / sync_template
 │   ├── web/         #   基于 @remotion/player 的网页播放版
 │   └── public/      #   素材与音频（截图、混音结果）
 └── outputs/         # 克隆用法下的成片目录（git 忽略）
@@ -122,6 +122,9 @@ promo-forge/
 | `scripts/music.py` | 配乐：BPM / beat / bar / downbeat / 逐小节能量分析、剪段、直链下载 |
 | `scripts/tts.py` | 配音：免费 edge-tts（或 ElevenLabs）、多音色试听、时长与拖音审核、可选 STT 反查 |
 | `scripts/mix.py` | 混音：人声归一化、ducking、转场音效、两遍 loudnorm 母带到 -14 LUFS |
+| `scripts/subtitles.py` | 字幕：导出 SRT / ASS（样式与画面一致），或把字幕烧进画面（软字幕可选） |
+| `scripts/fonts.py` | 字体子集化：把片子里用到的字从系统字体抽成 300 KB 左右的子集并内嵌，换机器不缺字 |
+| `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格，并出三张候选封面 |
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口 |
 | `scripts/check_video.py` | 成片闸门：规格、音轨、响度、空档、渲染日志报错 + 逐场景抽帧联系表 |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
@@ -146,6 +149,19 @@ promo-forge/
 **直接渲染出来的片子没有声音？** 模板里不含音频：`timing.json` 的 `music.file` 指向的文件由 `scripts/mix.py` 生成。
 没混音时模板会自动静音渲染（不会报错），但 `check_assets.py`（渲染前）和 `check_video.py`（渲染后）都会把缺音轨报出来 ——
 交片前先跑一次 `python scripts/mix.py`。
+
+**换一台机器渲染出来是方块字 / 缺字？** 跑一次 `python scripts/fonts.py subset`：它把片子里真正用到的字
+（示例工程约 341 字）从系统中文字体里抽出来，生成 300 KB 左右的子集字体放进 `public/fonts/`，渲染直接用这份字体，
+换机器就不再依赖渲染机上装没装中文字体。子集是按当前文案生成的，**改了文案要重跑**，否则新字会变成方块。
+
+**怎么把字幕烧进画面？** 平台不认软字幕、或者要发给别人直接看时：先
+`npm run render:1080:nosubs` 渲一版**不带画面字幕**的成片，再
+`python scripts/subtitles.py burn out/final-1080p-nosubs.mp4 -o out/final-1080p-hard.mp4`。
+直接烧会把画面自带的字幕和烧进去的字幕叠成两行糊字。只要字幕文件的话用 `python scripts/subtitles.py srt`（SRT）或 `ass`（带样式）。
+
+**怎么知道能不能投抖音 / 小红书？** `python scripts/deliver.py check out/final-1080p.mp4 --platform all`
+会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条按「需人工确认」的 WARN 处理；
+封面用 `python scripts/deliver.py cover --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图。
 
 ## 参与贡献
 

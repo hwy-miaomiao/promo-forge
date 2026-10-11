@@ -104,6 +104,16 @@ pnpm install            # 没装 pnpm 就 npm install（首次会下载 Remotion
 python scripts/doctor.py               # 副本内再体检一次
 ```
 
+想让片子在任何机器上都不缺字，装完依赖跑一次字体子集化（把片子里真正用到的字内嵌进工程）：
+
+```bash
+python scripts/fonts.py subset     # 生成 public/fonts/promo-subset-*.ttf，并把 fonts.json 指过去
+python scripts/fonts.py check      # 确认 0 缺字；改了文案或加了场景之后要重跑
+```
+
+子集字体是**按当前文案与场景源码生成的**（示例工程约 341 字、300 KB 左右），改了文字就要重跑，
+否则新字会变成方块 —— `check_assets.py` / `fonts.py check` 会把缺字拦下来。
+
 复制后立刻：改 `src/timing.json` 的 `slug/title/aspect/duration/scenes`；`src/scenes/` 里的
 `Hook / Demo / Proof / Cta` 是可直接运行的示例场景（零外部素材也能渲出画面），照着它们写自己的场景，
 不需要的示例文件可以删掉，记得同步 `src/scenes/index.ts` 的注册表。
@@ -145,6 +155,20 @@ python scripts/tts.py audit      # 检查每句时长是否落在窗口内、有
 - 字幕：竖屏单行 ≤13 字、最多 2 行，屏上大字**最多比旁白早 1.5 秒**出现；停留时长 ≥ `字数 / 6 + 0.35` 秒
   （配音 5.5~6.5 字/秒，**字幕必须活到人声读完**，否则句尾还在念、字幕已经消失）。模板组件取
   `max(字数/8+0.4, 字数/6+0.35)`，并在场景结束前 0.15 秒收掉，避免和下一场景的字幕叠在一起。
+- 字幕有两条路：**画面内字幕**（`<Caption>` 组件，跟着画面一起渲染）和**字幕文件 / 硬字幕**
+  （`scripts/subtitles.py`，给平台上传用，或平台不认软字幕时烧进画面）：
+
+```bash
+python scripts/subtitles.py srt                  # out/subtitles/zh.srt（给平台或剪辑软件）
+python scripts/subtitles.py ass                  # out/subtitles/zh.ass（样式与画面一致）
+npm run render:1080:nosubs                       # 烧硬字幕前：先渲一版不带画面字幕的成片
+python scripts/subtitles.py burn out/final-1080p-nosubs.mp4 -o out/final-1080p-hard.mp4
+```
+
+  **烧硬字幕前必须先渲 nosubs 版**：画面里的 `<Caption>` 和烧进去的 ASS 都由 `captions.bottom` 定位，
+  直接烧会叠成两行糊字（`burn` 在 `captions.enabled=true` 时也会 WARN 提醒）。
+  硬字幕用**系统字体**渲染（`fonts.json` 的 `stack`），不用子集字体：字幕改一个字就可能超出子集范围，
+  那会静默变成方块；要改字幕就改 `voice.lines[].text` 并重跑 `tts.py`。
 
 ### 阶段 8 · 混音
 
@@ -173,6 +197,8 @@ python scripts/check_assets.py                      # 渲染前：缺文件/图�
 npm run stills -- --scenes                          # 每场景抽 40% 与 80% 两帧
 python scripts/media.py sheet out/stills --cols 4   # 拼成联系表
 python scripts/check_video.py out/final-1080p.mp4   # 渲染后：规格/响度/空档/渲染日志报错 + 联系表
+python scripts/fonts.py check                       # 缺字（内嵌子集 / 系统字体都算）
+python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预检（时长/画幅/码率/体积/音轨/响度）
 ```
 
 - **`check_assets.py` 与 `check_video.py` 必须 0 ERROR 才算通过**；WARN 要逐条说明为什么不影响交付。
@@ -192,6 +218,21 @@ npm run web:build && npm run web:serve    # 网页播放版
 没跑过混音就渲染，模板会**自动跳过音轨、渲出一支无声片**（不会报错，见 `src/Promo.tsx` 的
 `MUSIC_FILE_EXISTS`）—— 缺音轨由渲染前的 `check_assets.py`（ERROR: 混音文件）和渲染后的
 `check_video.py`（ERROR: 无音轨）拦下来。**别把无声片当成品交出去。**
+
+**投平台前再跑一次交付预检，并用脚本出候选封面**：
+
+```bash
+python scripts/deliver.py check out/final-1080p.mp4 --platform all
+python scripts/deliver.py cover out/final-1080p.mp4 --title "每天记账要花十几分钟？"
+```
+
+- `check` 按平台给硬限制与推荐值；**抖音、小红书的官方口径脚本抓不到**，那部分按 WARN 处理，
+  交付时必须说清"需人工确认"。
+- `cover` 出三张 1080×1920 候选封面 + 联系表：文字自动排进安全区、越界自动缩字号；
+  封面文字可能压住画面自带的字，脚本用亮像素比例粗判并提示换 `--position bottom|middle|top`，
+  最终**必须逐张看图**再交（`references/校验清单.md` 的 B8）。
+- 需要硬字幕时：先 `npm run render:1080:nosubs` 再 `subtitles.py burn`（见阶段 7），
+  烧完的片子要塞进 `check_video.py` 复查一遍。
 
 交付时告诉用户三件事：成片路径、网页版地址、以及"哪里还可以改、改一处要重做哪些步骤"。
 
@@ -293,6 +334,9 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。模板依赖：Remoti
 | `scripts/music.py` | 配乐：下载/分析/找节拍/逐小节能量/剪段 | `analyze <file...>` / `grid <file> [--from --to]` / `bars <file> --beat --downbeat --offset` / `cut <in> <out> --start --dur` |
 | `scripts/tts.py` | 配音：生成、多音色试听、时长与拖音审核 | `all` / `one <id>` / `audit` / `voices [--lang zh]` / `preview --text "..."` / `stt <file>`（需可选依赖） |
 | `scripts/mix.py` | 混音：放人声、ducking、音效、母带 | `[--no-vo]` / `--env` |
+| `scripts/subtitles.py` | 字幕：导出 SRT / ASS，烧成硬字幕或软字幕 | `srt [--out out/subtitles/zh.srt]` / `ass [--out out/subtitles/zh.ass]` / `burn [<mp4>] [-o out/final-1080p-hard.mp4] [--soft] [--preview <秒>]` |
+| `scripts/fonts.py` | 字体子集化与内嵌（换机器不缺字） | `subset [--role all\|display\|body\|mono] [--out public/fonts] [--name promo-subset] [--weight 700] [--flavor auto\|woff2\|ttf]` / `check` |
+| `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` |
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` |
 | `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log]` |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
@@ -306,6 +350,9 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。模板依赖：Remoti
 | `check_assets.py` | 0 ERROR；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 |
 | `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨；响度 -16~-12 LUFS；无 ≥1.0 秒空档；渲染日志无报错 |
 | `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO` 需人工确认） |
+| `fonts.py check` | 0 ERROR：片子用到的每个字符都有字形（内嵌子集或系统字体都算） |
+| `deliver.py check` | 目标平台 0 ERROR；码率/体积类 WARN 由人判断（抖音、小红书的官方口径脚本抓不到） |
+| `subtitles.py burn` | 烧完硬字幕的片子仍要过 `check_video.py`（音轨用 `-c:a copy` 保留）；烧之前画面里必须没有自带字幕 |
 | 人工审图 | 联系表逐张看过，`references/校验清单.md` 全部打勾 |
 
 脚本一律：**发现问题就非零退出并打印 `ERROR: ...` 行**，不要静默通过。
