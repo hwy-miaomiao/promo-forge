@@ -113,6 +113,8 @@ python scripts/fonts.py check      # 确认 0 缺字；改了文案或加了场�
 
 子集字体是**按当前文案与场景源码生成的**（示例工程约 341 字、300 KB 左右），改了文字就要重跑，
 否则新字会变成方块 —— `check_assets.py` / `fonts.py check` 会把缺字拦下来。
+**子集字体不进版本库**（字体授权 + 体积）：克隆或复制工程后先跑一次 `subset`；不跑也能渲
+（渲染侧会自动回退系统字体栈），只是换到没装中文字体的机器上会缺字。
 
 复制后立刻：改 `src/timing.json` 的 `slug/title/aspect/duration/scenes`；`src/scenes/` 里的
 `Hook / Demo / Proof / Cta` 是可直接运行的示例场景（零外部素材也能渲出画面），照着它们写自己的场景，

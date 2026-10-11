@@ -4,8 +4,6 @@ out/
 public/audio/*
 public/img/*
 public/fonts/*
-!public/fonts/*.ttf
-!public/fonts/*.woff2
 !public/**/.gitkeep
 audio-src/music/*
 audio-src/vo/*
