@@ -1,0 +1,46 @@
+/*
+ * index.css —— 全局样式。
+ *
+ * 这里只放"必须全局生效、写在组件里没用"的几条。其余一律内联样式：
+ * 场景组件要能在 Studio、render、@remotion/player 三个环境里都长一样，
+ * 少一层 CSS 作用域就少一类"只在网页版里错版"的诡异问题。
+ */
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  background: #000;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* ❗本项目踩过的坑，删掉这行必出事故：
+   浏览器（以及部分 CSS reset）对 img/video 默认带 `max-width: 100%`。
+   我们的 Shot 组件会给截图加 transform: scale() 做放大/Ken Burns，
+   一旦 max-width 生效，图片会被按容器宽度重新约束 → 放大后的截图当场被横向压扁，
+   而且只在"某几种缩放比"下才肉眼可见，非常难查。
+   所以这里显式放开：图片的尺寸只由 object-fit 与容器决定。 */
+img,
+video {
+  max-width: none;
+}
+
+/* 中文字形在 Chromium 里做亚像素渲染时笔画容易发虚，
+   antialiased 能让 1080×1920 下的细笔画更实（尤其是白字压在深色底上）。 */
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Studio 与网页版都不要再给 body 加滚动条：画面由 Remotion 自己控制尺寸 */
+body {
+  overflow: hidden;
+  font-family:
+    "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+  color: #fff;
+}

@@ -1,0 +1,332 @@
+/*
+ * web/style.css —— 网页版样式（唯一的样式文件，其余全在组件里内联）。
+ *
+ * 响应式的核心是这三行，不要删：
+ *   container-type: inline-size;  → 让 .screen 成为一个"容器查询单位"的参照
+ *   cqw 单位                       → 页面里所有文字/间距都相对**容器宽**，不是视口宽
+ *   aspect-ratio: var(--ratio)     → 视频区域的高度永远和 timing.json 的宽高比一致
+ *
+ * 为什么不用 vw/vh：手机上 vh 会被地址栏吃掉，桌面宽屏上 vw 又会让文字大得离谱。
+ * 用 cqw 之后，同一套数值在手机上是"小而清楚"，在桌面上是"按比例放大"，不会破版。
+ */
+
+:root {
+  /* 颜色与 src/timing.json 的 brand.colors 保持一致；改片子时一起改这两处 */
+  --bg: #0b0b12;
+  --fg: #ffffff;
+  --accent: #33e1a1;
+  --dim: rgba(255, 255, 255, 0.62);
+  --panel: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.12);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  /* 不做 100vh 高度锁定：iOS 地址栏会吃掉 vh，导致底部按钮被盖住 */
+  min-height: 100%;
+}
+
+img,
+video {
+  /* 与 src/index.css 同一条坑：默认 max-width 会把放大后的截图压扁 */
+  max-width: none;
+}
+
+.page {
+  min-height: 100dvh; /* 支持 dvh 的浏览器用动态视口高度，避免地址栏抖动 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4cqw;
+  padding: max(4cqw, env(safe-area-inset-top)) 5cqw max(6cqw, env(safe-area-inset-bottom));
+  box-sizing: border-box;
+  /* 径向渐变让页面不是一块死黑，和片子里的底色呼应 */
+  background:
+    radial-gradient(70% 45% at 50% 0%, rgba(51, 225, 161, 0.12) 0%, rgba(11, 11, 18, 0) 70%),
+    var(--bg);
+}
+
+/* 全页最大宽度：桌面浏览器上别让竖屏视频被拉成一条巨幕 */
+.page {
+  container-type: inline-size;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 2.4cqw;
+  font-size: 3.6cqw;
+}
+
+.head-logo {
+  width: 8cqw;
+  height: 8cqw;
+  border-radius: 2cqw;
+  object-fit: contain; /* logo 也不许被压扁 */
+  background: var(--panel);
+}
+
+.head-mark {
+  width: 8cqw;
+  height: 8cqw;
+  border-radius: 2cqw;
+  background: var(--accent);
+  color: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 4.4cqw;
+  line-height: 1;
+}
+
+.head-name {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.head-tag {
+  margin-left: auto;
+  font-size: 2.8cqw;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.6cqw 2.2cqw;
+}
+
+.stage {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2.4cqw;
+}
+
+/* 视频容器：宽高比由 --ratio 决定（在 App.tsx 里从 timing.json 推导） */
+.screen {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: var(--ratio);
+  /* 竖屏视频在桌面浏览器里会很高，用 70dvh 限制一下，同时保持不裁切内容 */
+  max-height: 70dvh;
+  margin: 0 auto;
+  background: #000;
+  border-radius: 3cqw;
+  overflow: hidden;
+  box-shadow: 0 6cqw 14cqw rgba(0, 0, 0, 0.55);
+  /* 让 --ratio 生效的关键：高度的计算参照是宽度，而宽度由容器决定 */
+  container-type: inline-size;
+}
+
+/* 加载态 */
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3cqw;
+  color: var(--dim);
+  font-size: 3.4cqw;
+}
+
+.spinner {
+  width: 9cqw;
+  height: 9cqw;
+  border-radius: 999px;
+  border: 0.7cqw solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.placeholder-text {
+  text-align: center;
+}
+
+.warn {
+  display: block;
+  margin-top: 1cqw;
+  font-size: 2.6cqw;
+  color: #ffb4a2;
+}
+
+/* 海报态：整层是一个按钮，点哪里都能播 */
+.cover {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  margin: 0;
+  padding: 6cqw;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4cqw;
+  text-align: center;
+  cursor: pointer;
+  color: var(--fg);
+  font: inherit;
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.15) 0%, rgba(0, 0, 0, 0.72) 100%),
+    var(--bg);
+}
+
+.cover-note {
+  max-width: 84%;
+  font-size: 3.6cqw;
+  line-height: 1.6;
+  color: var(--fg);
+  text-wrap: balance;
+}
+
+.play-btn {
+  width: 16cqw;
+  height: 16cqw;
+  border-radius: 999px;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 6cqw rgba(51, 225, 161, 0.45);
+}
+
+.play-tri {
+  width: 0;
+  height: 0;
+  /* 三角形用 border 画，不用图标字体（图标字体缺失时会变成豆腐块） */
+  border-left: 4.4cqw solid var(--bg);
+  border-top: 2.8cqw solid transparent;
+  border-bottom: 2.8cqw solid transparent;
+  margin-left: 1.2cqw;
+}
+
+.cover-hint {
+  font-size: 2.8cqw;
+  color: var(--dim);
+}
+
+/* 播放中的细进度条：transform 缩放而不是改 width，避免每帧触发布局 */
+.progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 0.9cqw;
+  background: rgba(255, 255, 255, 0.14);
+  pointer-events: none;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 100%;
+  transform-origin: left center;
+  background: var(--accent);
+  will-change: transform;
+}
+
+/* 结束卡片 */
+.ended {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4cqw;
+  padding: 7cqw;
+  text-align: center;
+  background: linear-gradient(180deg, rgba(11, 11, 18, 0.82) 0%, rgba(11, 11, 18, 0.96) 100%);
+}
+
+.ended-note {
+  margin: 0;
+  font-size: 3.6cqw;
+  line-height: 1.6;
+  color: var(--fg);
+  text-wrap: balance;
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.4cqw;
+  justify-content: center;
+}
+
+.btn {
+  font-size: 3.2cqw;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 2.6cqw 5cqw;
+  text-decoration: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.btn-secondary {
+  background: var(--panel);
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--dim);
+  border-color: var(--border);
+}
+
+.caption-note {
+  margin: 0;
+  font-size: 2.8cqw;
+  color: var(--dim);
+}
+
+.foot {
+  width: 100%;
+  margin-top: auto;
+  padding-top: 2cqw;
+  border-top: 1px solid var(--border);
+  font-size: 2.6cqw;
+  color: var(--dim);
+  text-align: center;
+}
+
+/* 横屏手机 / 矮窗口：把视频压到 60dvh，避免一屏只剩视频没文案 */
+@media (max-height: 520px) {
+  .screen {
+    max-height: 60dvh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}

@@ -1,0 +1,9 @@
+# promo-forge 模板依赖（Python 3.9+）
+# 安装： pip install -r requirements.txt
+numpy>=1.24
+scipy>=1.10
+Pillow>=10.0
+fonttools>=4.40
+requests>=2.31
+playwright>=1.40
+edge-tts>=6.1

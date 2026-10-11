@@ -1,0 +1,111 @@
+{
+  "slug": "demo",
+  "title": "小账本 · 示例片",
+  "fps": 60,
+  "width": 1080,
+  "height": 1920,
+  "aspect": "9:16",
+  "duration": 45,
+  "music": {
+    "file": "audio/music.wav",
+    "source": "audio-src/music/track.mp3",
+    "offset": 0.0,
+    "beat": 0.5,
+    "bar": 2.0,
+    "drop": 3.6,
+    "gain": 0.6,
+    "segments": []
+  },
+  "scenes": [
+    {
+      "name": "hook",
+      "start": 0,
+      "end": 4.5,
+      "note": "痛点开场：记账太慢"
+    },
+    {
+      "name": "demo",
+      "start": 4.5,
+      "end": 26,
+      "note": "真实界面：拍照记账 / 自动分类 / 月报"
+    },
+    {
+      "name": "proof",
+      "start": 26,
+      "end": 36,
+      "note": "真实作品快切蒙太奇"
+    },
+    {
+      "name": "cta",
+      "start": 36,
+      "end": 45,
+      "note": "品牌 + 网址"
+    }
+  ],
+  "pace": {
+    "minShot": 0.5,
+    "keyShot": 1.2,
+    "sceneMin": 3.0,
+    "stagger": 0.25,
+    "holdAfterReveal": 0.6
+  },
+  "voice": {
+    "engine": "edge",
+    "voice": "zh-CN-YunxiNeural",
+    "rate": "+8%",
+    "settings": {
+      "stability": 0.45,
+      "similarity_boost": 0.75
+    },
+    "rmsDb": -13.0,
+    "duckDb": -9.0,
+    "lines": [
+      {
+        "id": "01",
+        "scene": "hook",
+        "at": 0.6,
+        "text": "每天记账，是不是都要花十几分钟？"
+      },
+      {
+        "id": "02",
+        "scene": "demo",
+        "at": 5.0,
+        "text": "现在只要拍一张小票，剩下的交给它。"
+      },
+      {
+        "id": "03",
+        "scene": "demo",
+        "at": 12.5,
+        "text": "每一笔自动分类，月底自动生成报表。"
+      },
+      {
+        "id": "04",
+        "scene": "proof",
+        "at": 26.6,
+        "text": "已经有六万人在用它管理开支。"
+      },
+      {
+        "id": "05",
+        "scene": "cta",
+        "at": 37.0,
+        "text": "小账本，现在就能免费下载。"
+      }
+    ]
+  },
+  "captions": {
+    "enabled": true,
+    "maxChars": 13,
+    "maxLines": 2,
+    "bottom": 0.16
+  },
+  "brand": {
+    "name": "小账本",
+    "url": "xiaozhangben.app",
+    "logo": "",
+    "colors": {
+      "bg": "#0B0B12",
+      "fg": "#FFFFFF",
+      "accent": "#33E1A1"
+    }
+  }
+}

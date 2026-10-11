@@ -1,0 +1,17 @@
+# 统一换行符：仓库里一律 LF，检出时不按平台自动改写
+# （Windows 上被自动转成 CRLF 会让 .py 脚本的 shebang 与 diff 变得难看）
+* text=auto eol=lf
+
+# 二进制素材不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.avif binary
+*.mp3 binary
+*.wav binary
+*.mp4 binary
+*.ttf binary
+*.otf binary
+*.woff2 binary
+*.ttc binary

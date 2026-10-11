@@ -1,0 +1,13 @@
+node_modules/
+build/
+out/
+public/audio/*
+public/img/*
+public/fonts/*
+!public/**/.gitkeep
+audio-src/music/*
+audio-src/vo/*
+!audio-src/**/.gitkeep
+.env
+__pycache__/
+*.pyc

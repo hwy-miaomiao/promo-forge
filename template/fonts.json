@@ -1,0 +1,32 @@
+{
+  "_note": "字体角色表。stack 是 CSS 字体栈（按顺序回退），file 可指向 public/fonts/ 下的本地字体（留空则用系统字体）。check_assets.py 会用 systemCandidates 里第一个存在的字体文件检查 timing.json 里的文案有没有缺字。",
+  "roles": {
+    "display": {
+      "stack": ["PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "sans-serif"],
+      "weight": 800,
+      "file": ""
+    },
+    "body": {
+      "stack": ["PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "sans-serif"],
+      "weight": 400,
+      "file": ""
+    },
+    "mono": {
+      "stack": ["JetBrains Mono", "SF Mono", "Consolas", "monospace"],
+      "weight": 400,
+      "file": ""
+    }
+  },
+  "check": {
+    "systemCandidates": [
+      "C:/Windows/Fonts/msyh.ttc",
+      "C:/Windows/Fonts/msyhbd.ttc",
+      "C:/Windows/Fonts/simhei.ttf",
+      "/System/Library/Fonts/PingFang.ttc",
+      "/System/Library/Fonts/STHeiti Medium.ttc",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+      "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+    ],
+    "extraChars": "，。！？：；、…—「」『』（）《》·0123456789%+-×÷/\\|&#@*"
+  }
+}

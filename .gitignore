@@ -1,0 +1,29 @@
+# 成片与工程产物
+outputs/*
+!outputs/.gitkeep
+宣传片/
+
+# 审片临时文件
+.review-tmp/
+
+# 密钥
+.env
+
+# 每个项目的工程产物（如果项目直接放在本仓库里）
+template/out/
+template/public/audio/*
+template/public/img/*
+template/public/fonts/*
+!template/public/**/.gitkeep
+template/audio-src/music/*
+template/audio-src/vo/*
+!template/audio-src/**/.gitkeep
+
+# Node / Python
+node_modules/
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
