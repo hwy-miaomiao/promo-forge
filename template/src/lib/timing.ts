@@ -38,7 +38,11 @@ export type Music = {
   /** 第一次爆发的**视频时间**（秒） */
   drop: number;
   gain: number;
-  segments: MusicSegment[];
+  /**
+   * 可选：剪接片段（AGENTS.md 第 5 节把它列为可选字段）。
+   * 数组元素仍会被逐项校验：lib/beats.ts 的 energy() 跳过 at 非有限数的脏元素。
+   */
+  segments?: MusicSegment[];
 };
 
 export type SceneSpec = { name: string; start: number; end: number; note?: string };

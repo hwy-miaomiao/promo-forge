@@ -43,16 +43,16 @@ export const Cta: React.FC = () => {
   // energy 接受场景相对秒（内部会加回场景起点换成全片时间）
   const energy = beat.energy(beat.now);
 
-  // 网址在屏时长 = 本场景长度 - 网址出现时刻。
-  // AGENTS.md 要求 ≥2.5 秒；改 timing.json 的 cta 窗口后这里会跟着变。
-  const urlHold = ctaLength - tUrl;
   const urlP = ramp(t, [tUrl, tUrl + 0.35], [0, 1], EASE.out);
   // 光带扫过网址：每 2 小节一次，给"停留期"提供微动
   const sweep = loop(t, TIMING.music.bar * 2);
 
   const logo = TIMING.brand.logo.trim();
   const hasLogo = logo !== "";
-  void urlHold;
+  // 注：网址在屏时长 = ctaLength - tUrl（AGENTS.md 要求 ≥2.5 秒），但这个值**没有任何消费者**：
+  // 字幕/网址的寿命由自己的 ramp 决定，布局也没有按它缩放。原来这里算出来立刻 `void urlHold`
+  // 掉、注释却写「改 timing.json 的 cta 窗口后这里会跟着变」，是句空承诺，已删掉死变量。
+  // 要真正约束「网址停留 ≥2.5 秒」，得把它用进渲染（或让闸门去判 timing.json 的 cta 窗口）。
 
   return (
     <SceneFrame name="cta">

@@ -53,7 +53,13 @@ export const BrowserFrame: React.FC<BrowserFrameProps> = ({
       borderRadius: radius !== undefined ? `${radius}px` : "3%",
       background: bodyColor,
       border: `1px solid ${PALETTE.border}`,
-      boxShadow: `0 3% 9% ${alpha("#000000", 0.5)}`,
+      // ❗box-shadow 的偏移/模糊只能吃 <length>，写百分比是非法值，整条声明会被 CSS 丢掉
+      //   （实测 getComputedStyle().boxShadow === "none"，窗口完全没有抬起感）。
+      //   改回 px：Remotion 的 --scale 会整体缩放成片栅格，px 在 1080 与 4K 下比例一致；
+      //   18px / 54px ≈ 旧写法在窗口宽 600px 时的 3% / 9%。
+      //   （不要写 cqw：容器查询单位在**容器自己身上**会用最近的外层容器或视口来解析，
+      //    实测 3cqw 被算成 42px = 视口宽的 3%，不是窗口宽的 3%。）
+      boxShadow: `0 18px 54px ${alpha("#000000", 0.5)}`,
       overflow: "hidden",
       ...style,
     }}

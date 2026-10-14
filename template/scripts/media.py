@@ -34,12 +34,14 @@ import argparse
 import concurrent.futures
 import hashlib
 import html as html_mod
+import math
 import os
 import re
 import shutil
 import sys
 import unicodedata
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlparse
@@ -254,21 +256,95 @@ def _font_candidates() -> List[str]:
     return out
 
 
-def find_cjk_font() -> Optional[Path]:
-    """找一个能画中文的字体文件；一个都没有返回 None（调用方退回默认字体并 WARN）。"""
-    for c in _font_candidates():
+def _missing_glyphs(path: Path, text: str) -> List[str]:
+    """`text` 里有哪些字符在字体 `path` 的 cmap 里没有。
+
+    联系表标签要画的东西并不都是固定字：`联系表：{目录}`、`{文件名}`、`cover 裁切预览：…`
+    里带**用户给的路径和文件名**，这些字不会出现在 `fonts.py` 那份固定文案清单里，
+    子集字体（`check.systemCandidates[0]`）十有八九没有。Pillow 不做字形回退：缺了就是方块，
+    而且它画不出来时既不报错也不返回空 —— getmask() 会照常给出一张 .notdef 的图，
+    光看"有没有画出来"判断不了。所以这里直接查 cmap。
+    fontTools 缺失就返回空列表（看不出缺字，但也不该因此中断出图）。
+    """
+    try:
+        from fontTools.ttLib import TTFont  # type: ignore
+    except ImportError:
+        return []
+    suffix = path.suffix.lower()
+    font_number = 0
+    try:
+        font = TTFont(str(path), fontNumber=font_number) if suffix in (".ttc", ".otc") else TTFont(str(path))
+    except Exception:
+        return []
+    try:
+        cmap = font.getBestCmap() or {}
+    except Exception:
+        return []
+    finally:
         try:
-            p = Path(str(c)).expanduser()
-            if p.is_file():
-                return p
+            font.close()
+        except Exception:
+            pass
+    return [ch for ch in dict.fromkeys(text) if not ch.isspace() and ord(ch) not in cmap]
+
+
+def _font_covering(text: str) -> Tuple[Optional[Path], List[str]]:
+    """挑第一个能画出 `text` 全部字符的字体；返回 (字体路径, 前一个字体缺的字符)。
+
+    一个都覆盖不了时返回 (None, 最后一个候选缺的字符)，调用方照旧退回默认字体并 WARN。
+    """
+    last_missing: List[str] = []
+    for cand in _font_candidates():
+        try:
+            path = Path(str(cand)).expanduser()
+        except (OSError, ValueError):
+            continue
+        if not path.is_absolute():
+            path = C.PROJECT_ROOT / path
+        try:
+            if not path.is_file():
+                continue
         except OSError:
             continue
-    return None
+        missing = _missing_glyphs(path, text)
+        if not missing:
+            return path, []
+        last_missing = missing
+    return None, last_missing
 
 
-def _load_font(size: int) -> Any:
+def find_cjk_font() -> Optional[Path]:
+    """找一个能画中文的字体文件；一个都没有返回 None（调用方退回默认字体并 WARN）。
+
+    候选清单里第一条是 `public/fonts/promo-subset-display.ttf` 这种**相对路径**
+    （`fonts.json` 的 `check.systemCandidates`，相对项目根）。原来这里用
+    `Path(str(c))` 按**进程 CWD** 解析：在 template 根下跑能命中子集字体，
+    从 workspace 根（或任何别的目录）调用就落到下一条系统字体上
+    —— 同一台机器、同一份配置，人审联系表和成片用的却不是一个字体文件。
+    `_common.first_existing_font()` 就是为这个坑写的（它把相对候选按
+    `C.PROJECT_ROOT` 解析，见其 `:488-491` 的注释），这里直接改用它。
+    """
+    return C.first_existing_font(_font_candidates())
+
+
+def _load_font(size: int, text: str = "") -> Any:
+    """`text` 非空时按「能不能画出这些字符」挑字体（见 `_font_covering`）。
+
+    子集字体只含片子里的字，而联系表的标题带用户路径/文件名：不筛就会印出满屏方块。
+    """
     Image, _, ImageFont, _ = _pil()
-    font_path = find_cjk_font()
+    font_path: Optional[Path] = None
+    missing: List[str] = []
+    if text:
+        font_path, missing = _font_covering(text)
+        if font_path is None:
+            C.warn(
+                f"没有字体能画出标签里的这些字符「{''.join(missing)}」"
+                "（子集字体只含片子里的字，联系表的标题还带目录名/文件名）——"
+                "这几处会显示成方块，不影响成片"
+            )
+    if font_path is None:
+        font_path = find_cjk_font()
     if font_path is not None:
         try:
             return ImageFont.truetype(str(font_path), size)
@@ -444,7 +520,27 @@ def cmd_grab(args: argparse.Namespace) -> int:
     req = _requests()
     md_files: List[Path] = []
     for raw in args.md_files:
-        for p in sorted(Path().glob(raw)) if any(ch in raw for ch in "*?[") else [Path(raw)]:
+        # 绝对路径 + 通配符：PowerShell 不展开 `*`（cmd.exe 会展开，bash 也会），
+        # 原来直接把它喂给 Path().glob() -> 未捕获 NotImplementedError:
+        # Non-relative patterns are unsupported（真 CLI 退 1、出 traceback，没有 ERROR: 行）。
+        # 拆成「绝对父目录 .glob(名字片段)」：既保留通配能力，又满足 pathlib 只吃相对模式的要求。
+        if any(ch in raw for ch in "*?["):
+            abs_dir = None
+            for base in (Path(raw).parent, Path.cwd()):
+                try:
+                    if base.is_absolute() and base.is_dir():
+                        abs_dir = base
+                        break
+                except OSError:
+                    continue
+            if abs_dir is not None:
+                matches = sorted(abs_dir.glob(Path(raw).name))
+            else:
+                C.warn(f"通配符路径的父目录既不是绝对路径也不存在：{raw}，改成只试文件名部分：{Path(raw).name}")
+                matches = sorted(Path().glob(Path(raw).name))
+        else:
+            matches = [Path(raw)]
+        for p in matches:
             if p.is_file():
                 md_files.append(p)
             else:
@@ -523,7 +619,6 @@ def _render_sheet(files: Sequence[Path], out_path: Path, cols: int, width: int,
     Image, ImageDraw, _, _ = _pil()
     resample = _lanczos(Image)
     fs = max(13, int(width * 0.042))
-    font = _load_font(fs)
     label_h = int(fs * 2.5) if labels else 0
     pad = max(6, int(width * 0.02))
     header_h = int(fs * 2.2)
@@ -558,6 +653,11 @@ def _render_sheet(files: Sequence[Path], out_path: Path, cols: int, width: int,
     for r in range(rows):
         chunk = thumbs[r * cols:(r + 1) * cols]
         row_h.append(max(t[3][1] for t in chunk) + label_h + pad)
+
+    # 标签字体要等缩略图列表出来再挑：标签里既有固定的中文（"联系表："），也有
+    # 用户给的目录名/文件名，必须挑一个**这些字都有**的字体（子集字体通常不含目录名里的字）。
+    label_text = title_prefix + "".join(f.name for f, _t, _o, _s in thumbs)
+    font = _load_font(fs, label_text)
 
     sheet_w = cols * width + pad * (cols + 1)
     sheet_h = header_h + sum(row_h) + pad * rows + pad
@@ -640,17 +740,34 @@ def _safe_width(path: Path) -> Optional[int]:
 # 子命令 3：crop
 # ---------------------------------------------------------------------------
 
+#: --ratio 每边的合理范围（0.001~1000）。超出这个量级的输入（inf / 1e400 / 手误多打几个 0）
+#: 只会把裁切算爆，直接报错比算出一个荒唐的裁切框好。
+RATIO_MIN = Fraction(1, 1000)
+RATIO_MAX = Fraction(1000)
+
+
 def _parse_ratio(raw: str) -> Tuple[int, int]:
     txt = raw.strip().lower().replace("：", ":").replace("x", ":").replace("*", ":")
     parts = [p for p in txt.split(":") if p.strip()]
-    if len(parts) != 2 or raw.strip() in ("", "cover"):
+    if len(parts) != 2 or txt in ("", "cover"):
         C.error(f"--ratio 写法是 宽:高，例如 9:16、16:9、1:1；现在给的是 {raw!r}")
     try:
-        rw, rh = int(float(parts[0])), int(float(parts[1]))
-    except ValueError:
+        # 用 Fraction 而不是 float：9.5:16.9 这类小数比例要精确表示，
+        # inf / 1e400 这类解析不出有限数值的输入也要当场一行报错，而不是抛 OverflowError。
+        rw_frac = Fraction(parts[0].strip())
+        rh_frac = Fraction(parts[1].strip())
+    except (ValueError, ZeroDivisionError):
         C.error(f"--ratio 里不是数字：{raw!r}（写法：9:16）")
-    if rw <= 0 or rh <= 0:
+    if rw_frac <= 0 or rh_frac <= 0:
         C.error(f"--ratio 必须是正数：{raw!r}")
+    if not (RATIO_MIN <= rw_frac <= RATIO_MAX) or not (RATIO_MIN <= rh_frac <= RATIO_MAX):
+        C.error(f"--ratio 数值超出合理范围（每边 0.001~1000）：{raw!r}")
+    # 放大成精确整数对：9.5:16.9 -> 95:169、0.5:16 -> 1:32（以前 int(float()) 会静默截断）
+    factor = math.lcm(rw_frac.denominator, rh_frac.denominator)
+    rw = rw_frac.numerator * (factor // rw_frac.denominator)
+    rh = rh_frac.numerator * (factor // rh_frac.denominator)
+    if factor != 1:
+        C.log(f"--ratio {raw} 按精确比例 {rw}:{rh} 计算（不截断小数）")
     return rw, rh
 
 
@@ -693,7 +810,6 @@ def cmd_crop(args: argparse.Namespace) -> int:
         C.error(f"输出图 {C.rel(out_path)} 是个目录，请给文件名，例如 {C.rel(out_path)}/check-crop.jpg")
     cell_w = args.cell
     fs = max(13, int(cell_w * 0.05))
-    font = _load_font(fs)
     label_h = int(fs * 2.6)
     pad = max(6, int(cell_w * 0.03))
     header_h = int(fs * 2.2)
@@ -725,6 +841,9 @@ def cmd_crop(args: argparse.Namespace) -> int:
     row_h = max(c[1].size[1] for c in cells) + label_h + pad
     sheet_w = cols * cell_w + pad * (cols + 1)
     sheet_h = header_h + rows * row_h + pad
+    # 同 _render_sheet：标签里有文件名，字体要挑一个这些字都有的
+    # （子集字体只有片子里的字，文件名里的字常常不在其中）。
+    font = _load_font(fs, "".join(name for name, _t, _i in cells))
     sheet = Image.new("RGB", (sheet_w, sheet_h), SHEET_BG)
     draw = ImageDraw.Draw(sheet)
     draw.text((pad, int(header_h * 0.3)),
@@ -768,6 +887,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     fmt = args.format.lower()
     if fmt not in FMT_EXT:
         C.error(f"--format 只能是 jpg / png / webp，现在是 {args.format!r}")
+    # 与 sheet 的 --cols/--width、crop 的 --cols/--cell 同一类参数校验（见 cmd_sheet 的注释）。
+    # 原来 --max 0/负数 会一路走到 `im.resize((0, new_h))`，抛未捕获
+    # ValueError: height and width must be > 0（真 CLI 退 1 且出 traceback，没有 ERROR: 行）；
+    # 负数还会先把 new_w 写成负数。0 也不是「不限宽」的意思（不限宽就是给一个很大的数）。
+    if args.max < 1:
+        C.error(f"--max 必须 ≥ 1（现在给的是 {args.max}）。"
+                f"例：python scripts/media.py prepare raw dst --max 2800")
     dst = C.ensure_dir(args.dst)
     src_files = _collect_images([args.src])
     if not src_files:

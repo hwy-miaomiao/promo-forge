@@ -515,12 +515,25 @@ def _db(value: float) -> float:
 
 
 def _music_of_timing() -> Dict[str, Any]:
-    """读 timing.json 的 music 段；读不到就返回 {}（不退出）。"""
+    """读 timing.json 的 music 段；读不到或没有 music 段就返回 {}（不退出）。
+
+    这里**故意**不走 C.load_timing()：那个函数发现 timing.json 缺失/非法会打一行
+    `ERROR:` 并 SystemExit(1)。原来的实现把 SystemExit 吞掉 return {}，于是脚本
+    一边往 stderr 打 ERROR、一边以 0 退出（AGENTS.md 第 7 节：「发现问题就非零退出，
+    不要静默通过」）。而且调用方拿不到「timing.json 到底读没读到」，bars 就把默认 0
+    标成了「来自 src/timing.json 的 music.offset」（那时 music_cfg 其实是 {}）。
+
+    所以这里自己静默探测一次：读不到就返回 {}，由调用方按「没读到」如实标注来源。
+    注意：本函数是探测，不是校验 —— 命令行参数 `--drop/--offset` 永远优先，
+    只有它们缺省时才会用到这里的值。
+    """
     try:
-        timing = C.load_timing()
-    except SystemExit:
+        data = C.load_json(C.TIMING_PATH)
+    except ValueError:
         return {}
-    music = timing.get("music")
+    if not isinstance(data, dict):
+        return {}
+    music = data.get("music")
     return music if isinstance(music, dict) else {}
 
 
@@ -538,6 +551,33 @@ def _top_moments(per_sec: Any, count: int = 5, min_gap: int = 2) -> List[int]:
         if len(picked) >= count:
             break
     return sorted(picked)
+
+
+def _burst_runs(per_sec: Any, peak: float, ratio: float = 0.5,
+                bridge_sec: int = 1) -> List[Tuple[int, int]]:
+    """把「每秒能量 ≥ ratio × 最强一秒」的秒数合并成**爆发段**，返回 [(起, 止)]（闭区间，整数秒）。
+
+    原来 cmd_analyze 直接拿达标的**秒数**当「爆发次数」：任何连续响 2 秒以上的曲子都会
+    数出 ≥ 2，AGENTS.md 阶段 5「全片 ≥2 次能量爆发」这条闸门等于没查（实测：唯一一段
+    强音在 1~7 秒的曲子被判「60 秒里有 6 秒 → OK」）。爆发是**段**：中间掉下去再起来
+    才算第二次；段内 ≤ bridge_sec 秒的回落（真实音乐里很常见）算同一段、不另起一段。
+    """
+    if peak <= 0:
+        return []
+    runs: List[Tuple[int, int]] = []
+    start = None
+    last_hot = None
+    for i, v in enumerate(per_sec):
+        if float(v) >= ratio * peak:
+            if start is None:
+                start = i
+            last_hot = i
+        elif start is not None and last_hot is not None and (i - last_hot) > bridge_sec:
+            runs.append((start, last_hot))
+            start = None
+    if start is not None and last_hot is not None:
+        runs.append((start, last_hot))
+    return runs
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
@@ -585,19 +625,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         for i in moments:
             C.log(f"  第 {i:3d} 秒（{_db(float(per_sec[i])):6.1f} dB，相对最强 {float(per_sec[i]) / peak * 100:5.1f}%）")
         # 第一次爆发是否够早
-        first_strong = None
-        for i, v in enumerate(per_sec):
-            if peak > 0 and float(v) >= 0.5 * peak:
-                first_strong = i
-                break
+        # 「爆发」= 该秒的每秒能量 ≥ 最强一秒的一半（整曲 per_sec 口径，成片口径要另算）。
+        burst_secs = [i for i, v in enumerate(per_sec) if peak > 0 and float(v) >= 0.5 * peak]
+        burst_runs = _burst_runs(per_sec, peak)
+        first_strong = burst_secs[0] if burst_secs else None
         if first_strong is None:
             # rc=1 会让脚本以非零码退出，AGENTS.md 第 7 节要求这种时候必须有一行
             # `ERROR: ...`（code=0 只打印不退出，报告照旧打完）。
             C.error("整首曲子没有明显能量峰值：建议换一首鼓点更清晰的曲子（AGENTS.md 阶段 5）", code=0)
             rc = 1
+            C.log(f"  · 硬指标「第一次能量爆发」：整曲 {per_sec.size} 秒里没有任何一秒达到最强"
+                  f"（{_db(peak):.1f} dB）的一半（={_db(peak * 0.5):.1f} dB）→ 判不合格")
         else:
             C.log("")
-            C.log(f"第一次能量爆发（≥最强值一半）出现在第 {first_strong} 秒。")
+            C.log(f"第一次能量爆发（≥最强值一半）出现在第 {first_strong} 秒（整曲口径）。")
             if first_strong > FIRST_DROP_MAX_SEC:
                 C.error(f"AGENTS.md 阶段 5 要求最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发，"
                         f"这首要等到 {first_strong} 秒：要么从爆发的部分剪起（music.py cut），"
@@ -605,9 +646,36 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 rc = 1
             else:
                 C.log(f"OK: 符合「最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发」")
-        if info["consistency"] < CONSISTENCY_WARN:
-            C.warn(f"节拍一致性偏低（{info['consistency']:.2f}）：这首曲子节拍不规整，"
-                   f"卡点会显得拖。建议换鼓点更清晰的曲子，或改用「按小节能量切镜头」而不是逐拍对齐。")
+        # AGENTS.md 阶段 5 的三条硬指标都在这里逐条给出**数值 + 阈值**。
+        # 原来第一条只打一句没有数字的「OK」，第二条只在 <0.8 时才 WARN（0.8~0.9 之间
+        # 一声不吭，而闸门要求 ≥0.9），第三条（≥2 次爆发）根本没查 —— 三条都成了盲区。
+        C.log("")
+        C.log("AGENTS.md 阶段 5 硬指标逐条核对（下面全部是**整首候选曲目**的口径，"
+              "不是在成片里截出来的那一段）：")
+        if first_strong is None:
+            C.log(f"  · 第一次能量爆发：无（整曲最强 {_db(peak):.1f} dB）"
+                  f"，要求最晚第 {FIRST_DROP_MAX_SEC:.0f} 秒完成第一次爆发 → 不合格")
+        else:
+            mark = "OK" if first_strong <= FIRST_DROP_MAX_SEC else "不合格"
+            C.log(f"  · 第一次能量爆发：第 {first_strong} 秒（整曲最强一秒 {_db(peak):.1f} dB，"
+                  f"判据 = 该秒 ≥ 它的一半 {_db(peak * 0.5):.1f} dB）；"
+                  f"要求 ≤ {FIRST_DROP_MAX_SEC:.0f} 秒 → {mark}")
+        C.log(f"  · 能量爆发次数：{len(burst_runs)} 次（共 {len(burst_secs)} 秒达标；"
+              f"连续秒算一段、段内 ≤1 秒的回落算同一段），要求 ≥ 2 **次（段）** → "
+              f"{'OK' if len(burst_runs) >= 2 else '不合格'}")
+        C.log(f"  · 节拍一致性：{info['consistency']:.2f}（判据 1 − 标准差/均值，"
+              f"由 {info['interval_count']} 个起音间隔反推，拍长 {info['interval_mean']:.3f}s"
+              f"± {info['interval_std']:.3f}s）；要求 ≥ {CONSISTENCY_MIN} → "
+              f"{'OK' if info['consistency'] >= CONSISTENCY_MIN else '不合格'}")
+        if len(burst_runs) < 2:
+            C.warn(f"整曲只数出 {len(burst_runs)} 次能量爆发（每次 = 一段连续、段内 ≤1 秒回落、"
+                   f"每秒能量 ≥ 最强一半的段落；共 {len(burst_secs)} 秒达标），"
+                   f"AGENTS.md 阶段 5 要求全片 ≥2 次爆发：换一首动态更明显的曲子，"
+                   f"或用 music.py cut 从爆发段剪两段能量不同的素材接起来。")
+        if info["consistency"] < CONSISTENCY_MIN:
+            C.warn(f"节拍一致性 {info['consistency']:.2f} < {CONSISTENCY_MIN}"
+                   f"（AGENTS.md 阶段 5 的硬性要求）：拍点检测与真实听感对不上，"
+                   f"卡点会显得拖。换鼓点更清晰的曲子，或改用「按小节能量切镜头」而不是逐拍对齐。")
         C.log("")
         C.log(f"下一步：python scripts/music.py grid {C.rel(path)} --from 0 --to 30   # 拿 beat/bar/downbeat")
     return rc
@@ -637,7 +705,10 @@ def cmd_grid(args: argparse.Namespace) -> int:
     C.log(f"BPM          ：{info['bpm']:.2f}")
     C.log(f"beat（拍长）  ：{period:.4f} 秒   ← 填 timing.json 的 music.beat")
     C.log(f"bar（小节长） ：{bar:.4f} 秒   ← 填 music.bar（= {BAR_BEATS:.0f} beat）")
-    C.log(f"第一个强拍    ：{info['downbeat']:.3f} 秒（音乐时间，从区间起点算）")
+    # 原来只报「从区间起点算」的 downbeat，下面换算 offset 时又漏了 --from，
+    # 非零分析区间下写回 timing.json 的 offset 会整整差一个 --from（详见末尾的换算段）。
+    C.log(f"第一个强拍    ：{info['downbeat']:.3f} 秒（相对分析区间起点）；"
+          f"绝对位置：{info['from'] + info['downbeat']:.3f} 秒（这个才是音乐文件里的时间）")
     C.log(f"节拍一致性    ：{info['consistency']:.2f}（1 - 标准差/均值；"
           f"起音间隔中位 {info['interval_ratio']:.2f} 拍，"
           f"由间隔反推的拍长 {C.fmt_sec(info['interval_mean'])}"
@@ -649,8 +720,23 @@ def cmd_grid(args: argparse.Namespace) -> int:
         mark = "  <= downbeat" if k == info["downbeat_index"] else ""
         C.log(f"  第 {k + 1} 拍：{s:.3f}{mark}")
 
+    # 时间轴要对齐三个口径（AGENTS.md 阶段 5 / references/配乐与卡点.md）：
+    #   · 区间内相对时间 t（info["downbeat"] 是**相对分析区间起点**的，--from 20 时它是 0.006 而不是 20.006）
+    #   · 音乐绝对时间 = t + from
+    #   · 视频时间 = 音乐绝对时间 + offset，其中 offset = drop − (from + downbeat)
+    # 原来表头承诺「音乐时间 → 视频时间 = 音乐时间 + offset」，却只印区间内的相对值，
+    # 还把它标成「音乐时间」：--from 20 时输出 0.000s，看起来像「曲子第一拍在 0 秒」。
+    from_sec = float(info["from"])
+    downbeat_abs = from_sec + float(info["downbeat"])
+    offset_here = None if drop is None else drop - downbeat_abs
     C.log("")
-    C.log("前 8 拍的时间轴（音乐时间 → 视频时间 = 音乐时间 + offset）：")
+    if offset_here is None:
+        C.log("前 8 拍的时间轴（音乐**绝对**时间；没有 drop 就算不出 offset，所以给不出视频时间）：")
+        C.log(f"  分析区间从音乐 {from_sec:.3f}s 起：音乐绝对时间 = 区间内时间 + {from_sec:.3f}")
+    else:
+        C.log("前 8 拍的时间轴（区间内时间 → 音乐绝对时间 → 视频时间 = 音乐绝对时间 + offset）：")
+        C.log(f"  offset = drop({drop:.3f}) − downbeat_abs({downbeat_abs:.3f}) = {offset_here:+.3f}s"
+              f"（downbeat_abs = --from {from_sec:.3f} + downbeat {float(info['downbeat']):.3f}）")
     np = _np()
     onset, fps = info["onset"], info["fps"]
     pooled = _pool(onset)
@@ -666,7 +752,12 @@ def cmd_grid(args: argparse.Namespace) -> int:
         else:
             strength = "—（贴区间起点，包络还没开始，测不到）"
         beat_no = i % int(BAR_BEATS) + 1
-        C.log(f"  {t:7.3f}s  第 {i + 1:2d} 拍（小节内第 {beat_no} 拍）  强度 {strength}")
+        music_abs = from_sec + t
+        if offset_here is None:
+            cols = f"  {t:7.3f}s  {music_abs:8.3f}s  {'—':>9}"
+        else:
+            cols = f"  {t:7.3f}s  {music_abs:8.3f}s  {music_abs + offset_here:8.3f}s"
+        C.log(f"{cols}  第 {i + 1:2d} 拍（小节内第 {beat_no} 拍）  强度 {strength}")
 
     if info["consistency"] < CONSISTENCY_WARN:
         C.warn(f"节拍一致性 {info['consistency']:.2f} < {CONSISTENCY_WARN}：这首曲子节拍不规整。"
@@ -684,23 +775,33 @@ def cmd_grid(args: argparse.Namespace) -> int:
     C.log("")
     if drop is None:
         C.log("musicOffset 换算（把 --drop 或 timing.json 的 music.drop 给我，我就能算出具体数字）：")
-        C.log(f"  offset = drop - downbeat = drop - {info['downbeat']:.3f}")
+        C.log(f"  offset = drop - downbeat_abs = drop - {info['from'] + info['downbeat']:.3f}"
+              f"（downbeat_abs = --from {info['from']:.3f} + downbeat {info['downbeat']:.3f}）")
         C.log("  （drop 是**视频时间**：你想让画面第几秒爆发就填几。把它写成音乐时间是最常见的错，"
               "写完用下面的 bars 复核。）")
     else:
-        v = drop - info["downbeat"]
+        # downbeat 是「相对分析区间起点」的量（_analyze_track 里 phase 是在 seg 上量的），
+        # 而 offset 的语义是「音乐文件时间 → 视频时间」。原来写成 v = drop - downbeat，
+        # 漏掉了 --from：只要 --from 非 0，写回 timing.json 的 offset 就整整差一个 --from。
+        # 实测（60s/120BPM 鼓点轨，downbeat 真值在文件时间 0,2,4…）：--from 20 打印 +2.994，
+        # 正确值是 -17.006，误差恰好 = --from。
+        downbeat_abs = info["from"] + info["downbeat"]
+        v = drop - downbeat_abs
         C.log(f"musicOffset 换算（drop = {drop:.3f} 秒，来自{drop_src}）：")
-        C.log(f"  offset = drop - downbeat = {drop:.3f} - {info['downbeat']:.3f} = {v:+.3f}")
+        C.log(f"  分析区间起点 = {info['from']:.3f}s，区间内第一个强拍 = {info['downbeat']:.3f}s"
+              f" → 绝对拍位 = {info['from']:.3f} + {info['downbeat']:.3f} = {downbeat_abs:.3f}s")
+        C.log(f"  offset = drop - downbeat_abs = {drop:.3f} - {downbeat_abs:.3f} = {v:+.3f}")
         C.log(f"  ↑ 语义：视频时间 = 音乐时间 + offset。混音脚本会把音乐文件摆在视频 {v:+.3f} 秒处起播，"
-              f"好让音乐里的那个重拍（音乐 {info['downbeat']:.3f} 秒）正好落在画面第 {drop:.3f} 秒。"
+              f"好让音乐里的那个重拍（音乐 {downbeat_abs:.3f} 秒）正好落在画面第 {drop:.3f} 秒。"
               + ("offset 为负 = 要跳过音乐开头这一小段，写 timing.json 的 music.segments 或让 mix.py 从 "
                  f"{abs(v):.3f} 秒处截。" if v < 0 else ""))
         C.log(f"  填完以后验证：python scripts/music.py bars <曲子> --beat {period:.4f} "
-              f"--downbeat {info['downbeat']:.3f} --offset {v:+.3f}，"
+              f"--downbeat {downbeat_abs:.3f} --offset {v:+.3f}，"
               f"看「视频时间」列上第 {drop:.1f} 秒附近是不是 DROP? 那一小节。")
     C.log("")
-    C.log("注意：downbeat 是从分析区间起点算的。如果你用 --from 截了一段，"
-          "它对应的是整首曲子的第 --from 秒 + 上面这个数。")
+    C.log(f"注意：上面第一行报的 downbeat 是相对分析区间的（这里 --from {info['from']:.3f}s → 绝对 "
+          f"{info['from'] + info['downbeat']:.3f}s）；换算 offset 用的已经是绝对拍位。"
+          "如果你用 --from 截了一段，`bars --downbeat` 要填绝对拍位，不是区间相对值。")
     return 0
 
 
@@ -708,9 +809,20 @@ def cmd_grid(args: argparse.Namespace) -> int:
 # 子命令：bars
 # ---------------------------------------------------------------------------
 
-def _band_rms(x: Any, sr: int, band: Optional[Tuple[float, float]]) -> Any:
-    """整段信号在某个频段的 RMS；band=None 表示全频。"""
+def _band_rms(x: Any, sr: int, band: Optional[Tuple[float, float]],
+              short_chunks: Optional[List[int]] = None) -> Any:
+    """整段信号在某个频段的 RMS；band=None 表示全频。
+
+    片段样点数 ≤ 27（`sosfiltfilt` 的 padlen 必须小于样点数）时不再抛
+    `ValueError: The length of the input vector x must be greater than padlen, which is 27.`
+    ——那是裸 traceback（stderr 里没有 `ERROR:` 行、用户不知道哪个小节出的问题，
+    `--beat 0.0004` 这种每小节十几个样点的调用更是必崩）。现在降级成单向 sosfilt
+    （有相位延迟，但这么短的片段本来就只能看趋势），并把样点数记进 short_chunks，
+    由调用方打一条说明日志。
+    """
     np = _np()
+    if x.size == 0:
+        return 0.0
     if band is None:
         return float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
     signal = _signal()
@@ -720,7 +832,13 @@ def _band_rms(x: Any, sr: int, band: Optional[Tuple[float, float]]) -> Any:
     if low >= high:
         return 0.0
     sos = signal.butter(4, [low, high], btype="bandpass", output="sos")
-    y = signal.sosfiltfilt(sos, x.astype(np.float64))
+    x64 = x.astype(np.float64)
+    if x64.size <= 27:
+        if short_chunks is not None:
+            short_chunks.append(int(x64.size))
+        y = signal.sosfilt(sos, x64)
+    else:
+        y = signal.sosfiltfilt(sos, x64, padlen=min(27, x64.size - 1))
     return float(np.sqrt(np.mean(y ** 2)))
 
 
@@ -739,25 +857,33 @@ def cmd_bars(args: argparse.Namespace) -> int:
 
     music_cfg = _music_of_timing()
     offset = args.offset
-    offset_src = "--offset"
+    offset_src = "命令行 --offset"
     if offset is None:
-        try:
-            offset = float(music_cfg.get("offset", 0.0))
-            offset_src = "src/timing.json 的 music.offset"
-        except (TypeError, ValueError):
+        # 只有真的从 timing.json 里读到了 music.offset 才这么说。
+        # 原来读不到时 music_cfg 是 {}，却仍标注「来自 src/timing.json 的 music.offset」，
+        # 等于把默认 0 说成是文件里的值（假出处）。
+        if music_cfg.get("offset") is None:
             offset = 0.0
-            offset_src = "默认 0"
+            offset_src = "默认值 0，timing.json 里没有 music.offset"
+        else:
+            try:
+                offset = float(music_cfg["offset"])
+                offset_src = "src/timing.json 的 music.offset"
+            except (TypeError, ValueError):
+                offset = 0.0
+                offset_src = "默认值 0，timing.json 的 music.offset 不是数字"
 
     data, sr = load_audio(path)
     total = len(data) / float(sr)
     C.log(f"文件：{C.rel(path)}（{C.fmt_sec(total)}）")
     C.log(f"beat {C.fmt_sec(beat)} × {beats_per_bar:.0f} = bar {C.fmt_sec(bar)}；"
-          f"downbeat {C.fmt_sec(downbeat)}；offset {offset:+.3f}（来自{offset_src}）")
+          f"downbeat {C.fmt_sec(downbeat)}；offset {offset:+.3f}，来源：{offset_src}")
     C.log(f"视频时间 = 音乐时间 + offset；下面每行的「音乐时间」是小节起点")
 
     rows: List[List[str]] = []
     drop_flags: List[int] = []
     full_dbs: List[float] = []
+    short_chunks: List[int] = []
     for i in range(count):
         t0 = downbeat + i * bar
         t1 = t0 + bar
@@ -768,8 +894,8 @@ def cmd_bars(args: argparse.Namespace) -> int:
         if chunk.size == 0:
             break
         full = _band_rms(chunk, sr, None)
-        low = _band_rms(chunk, sr, BAND_LOW)
-        high = _band_rms(chunk, sr, BAND_HIGH)
+        low = _band_rms(chunk, sr, BAND_LOW, short_chunks)
+        high = _band_rms(chunk, sr, BAND_HIGH, short_chunks)
         full_db = _db(full)
         full_dbs.append(full_db)
         prev = full_dbs[max(0, i - 2):i]
@@ -794,6 +920,13 @@ def cmd_bars(args: argparse.Namespace) -> int:
     for r in rows:
         C.log("  " + "  ".join([r[0].rjust(4), r[1].rjust(9), r[2].rjust(9),
                                 r[3].rjust(7), r[4].rjust(7), r[5].rjust(7), "  " + r[6]]).rstrip())
+    if short_chunks:
+        C.warn(
+            f"{len(short_chunks)} 个小节的样点数太少（最少 {min(short_chunks)} 个，"
+            f"sosfiltfilt 的 padlen=27 要求至少 28 个），低频/高频两列已降级成**单向滤波**"
+            f"估计（有相位延迟）：只当趋势看，别据此判断频段能量。"
+            f"检查 --beat（现在 {beat:.4f}s，一个 bar = {beat * beats_per_bar:.4f}s）是不是写小了"
+        )
 
     C.log("")
     if drop_flags:
@@ -1024,7 +1157,9 @@ def build_parser() -> argparse.ArgumentParser:
                        epilog="例：python scripts/music.py bars audio-src/music/track.mp3 --beat 0.4615 --downbeat 0.23 --count 16")
     b.add_argument("file", metavar="文件", help="音频文件")
     b.add_argument("--beat", type=float, required=True, metavar="秒", help="拍长（秒），来自 grid 的 music.beat")
-    b.add_argument("--downbeat", type=float, required=True, metavar="秒", help="第一个强拍（音乐秒），来自 grid")
+    b.add_argument("--downbeat", type=float, required=True, metavar="秒",
+                   help="第一个强拍（**音乐文件里的绝对秒**，来自 grid 的「绝对位置」那一行；"
+                        "用 --from 截过一段就要加回 --from，别填区间相对值）")
     b.add_argument("--offset", type=float, default=None, metavar="秒",
                    help="视频时间 = 音乐时间 + offset；不给就读 src/timing.json 的 music.offset")
     b.add_argument("--count", type=int, default=16, metavar="小节数", help="算几个小节，默认 16")

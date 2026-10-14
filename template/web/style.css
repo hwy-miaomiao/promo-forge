@@ -333,6 +333,70 @@ video {
   }
 }
 
+/*
+ * 横屏手机：App.tsx 顶部第 3 条承诺的"视频在左、文案在右"两栏布局。
+ *
+ * 为什么必须单独写：竖排单列在 844×390 这类横屏里，.screen 按 --ratio 从宽度反推出
+ * 高度（9:16 时 ≈1500px），文案和页脚被整个推到首屏之外 —— 看起来就是"只有一张黑屏"。
+ * 用 orientation + max-height 两个条件限定"真的很矮的横屏"：桌面窗口（够高）不受影响，
+ * 仍是原来那套居中单列。
+ *
+ * 两栏的实现要点：.stage 变横向 flex；.screen 的高度由视口高（--ls-screen-h）决定、
+ * 宽度用 calc 按 --ratio 显式算出来 —— 横屏下视频不该再按宽度撑满，那正是"文案被挤出去"的根因。
+ */
+@media (orientation: landscape) and (max-height: 560px) {
+  .page {
+    /* 横屏宽度充足：放开 720px 上限，两栏才真正并排；上下内边距也收紧 */
+    max-width: none;
+    gap: 1.6cqw;
+    padding: max(2cqw, env(safe-area-inset-top)) 3cqw max(2cqw, env(safe-area-inset-bottom));
+    /* 横屏下视频的高度：由视口高度决定，不再由宽度撑满反推 */
+    --ls-screen-h: 62dvh;
+  }
+
+  .head {
+    font-size: 2.6cqw;
+  }
+
+  .stage {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 3cqw;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .screen {
+    /* 高度由视口决定、宽度按 --ratio 反推。
+       宽度这里必须用 calc 显式算出来：flex 项在 `align-self: stretch`（或 height:100%）下
+       不会拿 aspect-ratio 去反推主尺寸 —— 实测宽度会塌成 0，视频整块看不见。 */
+    height: var(--ls-screen-h);
+    width: calc(var(--ls-screen-h) * var(--ratio));
+    flex: 0 0 auto;
+    max-height: 100%;
+    /* 给右栏留位置：整宽 − 文案栏 − 间距，避免横版视频把文案挤出去 */
+    max-width: calc(100% - 32cqw - 3cqw);
+    margin: 0;
+    border-radius: 2cqw;
+  }
+
+  .caption-note {
+    /* 右边那一栏：与视频同高、垂直居中、左对齐 */
+    flex: 0 1 32cqw;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    font-size: 2.2cqw;
+    text-align: left;
+  }
+
+  .foot {
+    padding-top: 1.2cqw;
+    font-size: 2cqw;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .spinner {
     animation: none;

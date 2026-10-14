@@ -32,7 +32,8 @@ AI 听不到声音，所以音色必须由用户试听拍板：``preview`` 子�
 必需：ffmpeg / ffprobe（``doctor.py`` 会体检）。
 edge 引擎：``pip install edge-tts``；eleven 引擎：``pip install requests`` + ``ELEVENLABS_API_KEY``
 （环境变量，或项目根 ``.env`` 文件）。
-可选：``pip install faster-whisper`` —— 只有 ``stt`` 子命令需要，没装只打印 WARN 并退出 0。
+可选：``pip install faster-whisper`` —— 只有 ``stt`` 子命令需要。``stt`` 是**校验**命令：
+没装依赖 / 转写失败 / 找不到对照稿，都算「没校验成」，一律打印 ``ERROR:`` 并以退出码 1 结束。
 
 退出码
 ------
@@ -363,11 +364,16 @@ def _trim_silence(src: Path, dst: Path) -> None:
 
 def _apply_tempo(src: Path, factor: float) -> None:
     """原地变速（atempo），factor 必须 ≤ MAX_TEMPO，调用方负责保证。"""
-    tmp = src.with_suffix(src.suffix + ".tempo")
+    # 临时名必须是 `01.tempo.mp3` 这种**以 .mp3 结尾**的形式：写成 `01.mp3.tempo` 时
+    # ffmpeg 从扩展名推不出封装格式（命令行又没给 -f），会直接
+    # `Unable to choose an output format` 失败——而这条路径正是「最多加速 12%」的
+    # 唯一实现，等于该补救手段 100% 不可用。两个都做上：名字合法 + 显式 -f mp3。
+    tmp = src.with_name(f"{src.stem}.tempo{src.suffix}")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(src), "-filter:a", f"atempo={factor:.6f}",
         "-ac", "1", "-ar", "48000", "-b:a", VO_BITRATE,
+        "-f", "mp3",
         str(tmp),
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -620,22 +626,12 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
     text = str(line.get("text", "") or "")
     out_path = vo_dir / f"{line_id}.mp3"
 
-    try:
-        start, end = line_window(timing, line)
-    except Exception as exc:
-        warn(f"第 {line_id} 句取窗口失败（{exc}），按 at 起 8 秒兜底")
-        start = float(line.get("at", 0.0) or 0.0)
-        end = start + 8.0
-    start = float(start)
-    end = float(end)
-    window = round(end - start, 3)
-
     entry = {
         "id": line_id,
         "scene": str(line.get("scene", "") or ""),
         "at": round(float(line.get("at", 0.0) or 0.0), 3),
         "text": text,
-        "window": [round(start, 3), round(end, 3)],
+        "window": [0.0, 0.0],   # 窗口算出来了再覆盖；算不出来就保持 0，配合 status=ERROR 表达「没有窗口」
         "duration": 0.0,
         "status": "OK",
         "took_speedup": False,
@@ -643,8 +639,27 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
         "file": _rel(out_path),
     }
 
+    try:
+        start, end = line_window(timing, line)
+    except Exception as exc:
+        # 与 cmd_audit 同口径：窗口算不出来就直接判这句 ERROR，**不要**退回「at 起 8 秒」
+        # 的假窗口——假窗口会让人以为这句塞得进，生成出来的音频却盖到下一句上。
+        # 注意 entry 必须先构造好再用：在这里裸引用一个还没赋值的名字会抛 UnboundLocalError，
+        # 那会让 `tts.py one/all` 直接崩掉 traceback，连 report.json 都写不出来。
+        entry["status"] = "ERROR"
+        entry["error"] = str(exc)
+        _err_line(
+            f"第 {line_id} 句取不到合法窗口（{exc}）：已判 ERROR，"
+            "请改 timing.json 的 at / 场景边界后重跑本命令"
+        )
+        return entry
+    start = float(start)
+    end = float(end)
+    window = round(end - start, 3)
+    entry["window"] = [round(start, 3), round(end, 3)]
+
     if not line_id or not text:
-        warn(f"timing.json 的 voice.lines 里有缺 id 或 text 的句子，已标记 ERROR：{line!r}")
+        _err_line(f"timing.json 的 voice.lines 里有缺 id 或 text 的句子，已标记 ERROR：{line!r}")
         entry["status"] = "ERROR"
         return entry
 
@@ -773,6 +788,39 @@ def _read_report():
     return data, path
 
 
+def _err_line(msg: str) -> None:
+    """打印一条 ``ERROR:`` 行但**不退出**。
+
+    ``all`` 要跑完所有句子、把 report.json 写出来之后才统一收口退出，所以这里用
+    ``error(msg, code=0)``（只打印、不 ``sys.exit``）。但「不退出」不等于「降级成 WARN」：
+    ``cmd_one`` 失败时会提示「见上面的 ERROR 行」，上面就必须真有 ERROR 行，
+    否则用户按提示往上翻只看得到 WARN，找不到真正的原因。
+    """
+    error(msg, code=0)
+
+
+def _merge_into_report(entries: list, timing: dict, new_first: bool = False) -> None:
+    """把本次生成的记录**合并**进已有 report.json，保留别的句子。
+
+    ``tts.py all --only 02`` 只重做 02：如果直接整份覆盖，01/03 的记录就没了，
+    之后 ``audit`` 和交付说明会以为那两句从来没生成过（旧版本就是这么丢的）。
+    ``cmd_one`` 复用同一条路径（``new_first=True``：报告里原本没有这一句时放到最前面，
+    保持它以前的位置）。
+    """
+    previous, _ = _read_report()
+    merged: list = []
+    fresh = {str(item.get("id")): item for item in entries}
+    if previous:
+        for item in previous["lines"]:
+            key = str(item.get("id"))
+            if key in fresh:
+                merged.append(fresh.pop(key))
+            else:
+                merged.append(item)
+    rest = list(fresh.values())
+    _write_report(rest + merged if new_first else merged + rest, timing)
+
+
 # ===========================================================================
 # 子命令
 # ===========================================================================
@@ -804,7 +852,9 @@ def cmd_all(args) -> int:
     for line in todo:
         entries.append(_process_line(timing, line, engine, args.force, cache))
 
-    _write_report(entries, timing)
+    # 合并进已有报告：`all --only 01,03` 这种局部重生成以前会整份覆盖，
+    # 把没重做的句子从 report.json 里抹掉（audit 只看得到本次这几句）。
+    _merge_into_report(entries, timing)
     _write_json(cache_path, cache)
 
     ok = sum(1 for e in entries if e["status"] == "OK")
@@ -855,19 +905,7 @@ def cmd_one(args) -> int:
     _write_json(cache_path, cache)
 
     # 合并进已有报告（保留其它句子的记录，audit 才有全貌）
-    report, report_path = _read_report()
-    merged = []
-    replaced = False
-    if report:
-        for item in report["lines"]:
-            if str(item.get("id")) == str(entry["id"]):
-                merged.append(entry)
-                replaced = True
-            else:
-                merged.append(item)
-    if not replaced:
-        merged = [entry] + merged if report else [entry]
-    _write_report(merged, timing)
+    _merge_into_report([entry], timing, new_first=True)
 
     if entry["status"] in ("ERROR", "TOO_LONG"):
         if entry["status"] == "TOO_LONG":
@@ -891,15 +929,32 @@ def cmd_audit(args) -> int:
     errors = 0
     echoes = 0
     stale = 0
+    window_errors = 0   # 窗口非法（line_window 抛错）的句数，最后按审核不通过处理
+    window_details: list = []   # [(句号, 原因)]，汇总时报全，不要只报第一句
     for line in lines:
         line_id = str(line.get("id", "")).strip()
         text = str(line.get("text", "") or "")
         path = vo_dir / f"{line_id}.mp3"
         try:
             start, end = line_window(timing, line)
-        except Exception:
-            start = float(line.get("at", 0.0) or 0.0)
-            end = start + 8.0
+        except Exception as exc:
+            # 窗口不合法就**不能**再来一个「at 起 8 秒」的假窗口：窗口被人为放大之后
+            # needed 会变小，本来 TOO_LONG 的句子会变成 OK，这个命令就会打印
+            # 「审核通过」并退 0——正是 AGENTS.md 第 7 节禁止的静默通过。
+            # 一律按 ERROR 记账（`_common.line_window` 的 docstring 也是这么约定的），
+            # 走完表格再统一报错退 1。
+            window_errors += 1
+            window_details.append((line_id, str(exc)))
+            rows.append((line_id, text, 0.0, 0.0, 0.0, "ERROR"))
+            # 这里**不能**用 error()：error() 会立刻 sys.exit()，循环就断了——
+            # 多句非法时只打印第一句，后面本该一起报出来的句子永远看不到，
+            # 而且上面的 window_errors 聚合也成了死代码。逐句记下来，走完表格统一报。
+            warn(
+                f"第 {line_id} 句取不到合法窗口：{exc}"
+                "（窗口 = 所在场景结束与下一句 at 中更早的那个，再扣 0.15s 尾巴；"
+                "不合法说明 at 写得太密或排到了场景结束之后，请改 timing.json）"
+            )
+            continue
         window = float(end) - float(start)
 
         if not path.is_file() or path.stat().st_size == 0:
@@ -942,23 +997,33 @@ def cmd_audit(args) -> int:
         log(
             _pad(line_id, 6)
             + _pad(_clip(text, 24), 26)
-            + _pad(f"{window:.2f}s", 9)
+            + _pad(f"{window:.2f}s" if window else "—", 9)
             + _pad(f"{duration:.2f}s" if duration else "—", 9)
             + _pad(f"{margin:+.2f}s" if duration else "—", 9)
             + status
         )
     log("")
 
-    if errors:
+    if errors or window_errors:
         longest = max((r for r in rows if r[5] in ("TOO_LONG", "MISSING")), key=lambda r: r[3] - r[2], default=None)
         tip = ""
         if longest is not None:
             cut = max(1, int(math.ceil(len(longest[1]) - CHARS_PER_SEC * longest[2])))
             tip = f"例如第 {longest[0]} 句建议删掉约 {cut} 个字。"
+        if window_details:
+            # 把每一句的窗口原因都打在 ERROR 汇总里（上面只有 WARN 逐句行，
+            # 有些 CI 只抓 stderr 的 ERROR 行看，所以这里必须带全）。
+            log("")
+            for line_id, why in window_details:
+                log(f"  窗口非法 第 {line_id} 句：{why}")
         error(
-            f"审核不通过：{errors} 句 TOO_LONG/MISSING。字数超窗口必须改稿删字（AGENTS.md 阶段 7），"
-            f"不允许靠加速硬压。{tip}改完重跑 `python scripts/tts.py all`"
+            f"审核不通过：{errors} 句 TOO_LONG/MISSING、{window_errors} 句窗口非法"
+            f"（共 {errors + window_errors} 句，上面每句都有对应行）。"
+            f"字数超窗口必须改稿删字（AGENTS.md 阶段 7），不允许靠加速硬压；"
+            f"窗口非法说明 at 太密或排到了场景结束 / 下一句之后。"
+            f"{tip}改完重跑 `python scripts/tts.py all`"
         )
+    # 走到这里说明 0 ERROR / 0 窗口非法。（error() 已经 sys.exit，不会再往下走。）
     if echoes:
         warn(f"{echoes} 句疑似尾部拖音（ECHO），请人工试听确认：这是 AI 听不出来的项")
     if stale:
@@ -1079,8 +1144,14 @@ def cmd_stt(args) -> int:
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
-        warn("未安装 faster-whisper（可选），跳过转写校验")
-        return 0
+        # stt 是校验命令：没装依赖 = 没校验成，必须 ERROR + 非零退出。
+        # 以前这里打一条 WARN 就 return 0，等于「校验没做」也算通过（AGENTS.md 第 7 节：
+        # 发现问题就要非零退出并打印 ERROR 行，不要静默通过）。
+        error(
+            "未安装 faster-whisper，没做转写回读校验："
+            "`pip install faster-whisper` 之后重跑本命令（首次运行会下载模型）。"
+            "不想校验就别跑 `stt`，别把「没校验」当成「校验通过」"
+        )
 
     timing = load_timing()
     lines = _voice_lines(timing)
@@ -1097,13 +1168,14 @@ def cmd_stt(args) -> int:
         segments, info = model.transcribe(str(audio), language=args.lang, beam_size=5)
         hypothesis = "".join(seg.text for seg in segments).strip()
     except Exception as exc:  # noqa: BLE001
-        warn(f"faster-whisper 转写失败（{exc}）；{_net_hint()}")
-        return 0
+        # 转写失败同样是「没校验成」：以前 WARN + return 0 会让 `stt` 在网络不通时
+        # 也报「通过」，比缺依赖那次更危险（依赖在、人以为校验真的跑了）。
+        error(f"faster-whisper 转写失败（{exc}）；{_net_hint()} —— 这次没校验成，请修好后重跑")
 
     log(f"识别结果：{hypothesis}")
     if not reference:
-        warn(f"timing.json 里没有 id={line_id} 的句子，无法比对（可用 --id 指定）")
-        return 0
+        # 没有对照稿就比不了 —— 同样是「没校验成」，不能 return 0 当通过。
+        error(f"timing.json 里没有 id={line_id} 的句子，无法比对（可用 --id 指定）—— 这次没校验成")
     log(f"稿件原文：{reference}")
 
     normalize = lambda s: re.sub(r"[\s，。！？：；、,.!?:;…—\-—「」『』（）()《》]", "", s)  # noqa: E731

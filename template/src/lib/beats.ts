@@ -113,8 +113,16 @@ export const energy = (videoTime: number, timing: Timing): number => {
   // 拍内脉冲：越靠近拍点越高，用平方让峰值更"尖"，视觉上更像心跳
   const pulse = Math.pow(1 - phase(videoTime, timing), 2) * (videoTime >= drop ? 0.16 : 0.09);
 
-  // 剪接片段处再补一次能量（换段落 = 听觉上的新开始）
-  const segHit = segments.reduce((acc, s) => Math.max(acc, Math.exp(-Math.max(0, videoTime - s.at) / (beatLen * 2)) * 0.3), 0);
+  // 剪接片段处再补一次能量（换段落 = 听觉上的新开始）。
+  // ❗segments 在 AGENTS.md 第 5 节里是**可选**字段：缺省 / null / 写错类型时都要兜底成
+  //   "没有剪接片段"，不许崩。早先直接 `segments.reduce(...)`，缺字段会抛
+  //   `TypeError: Cannot read properties of undefined (reading 'reduce')`；而 energy()
+  //   被 4 个场景每帧调用（Hook/Cta/Demo/Proof），一抛就是整场渲染失败（不是降级）。
+  const segList = Array.isArray(segments) ? segments : [];
+  const segHit = segList.reduce((acc, s) => {
+    if (!s || typeof s.at !== "number" || !Number.isFinite(s.at)) return acc;
+    return Math.max(acc, Math.exp(-Math.max(0, videoTime - s.at) / (beatLen * 2)) * 0.3);
+  }, 0);
 
   return Math.min(1, base + afterDrop + pulse + segHit);
 };

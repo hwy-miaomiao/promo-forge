@@ -102,14 +102,128 @@ FADE_OUT_S = 0.6
 SILENCE_NOISE_DB = -45
 
 # AGENTS.md 第 7 节：渲染日志里出现这些字样一律按失败处理。
+#
+# 但**裸子串匹配会误杀**，实测三种误报：
+#   - `[ERROR:gpu_init.cc(481)] Passthrough is not supported, GL is disabled`
+#     Chromium 启动期的非致命提示，渲染照样成功；
+#   - `Finished: 0 errors, 0 warnings` 这种自称 0 个错误的汇总行；
+#   - `2 errors: ...` 这种带数量的汇总行。
+# 误报的代价比漏报更大：日志里躺着几条红字，真问题就淹没了。
+#
+# 所以 `error` 单独用正则判（见 `_log_error_hit`），口径是：
+#   命中 = 独立的 `error(s)` 词 + 紧跟 `:`，或数量词 `≥1 error(s)`，或大写 `ERROR(S)`；
+#   且不是 Chromium 那种 `[组件:文件(行号)]` 前缀行（前缀剥掉后剩下的话还要再判一次）、
+#   不是自称「0 errors / no errors」的汇总行。
+# ❗但「自称零错误」只豁免**这一行没有别的硬信号**的情况：汇总行后面常跟着真错误
+#   （`Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'`），所以
+#   `_RX_LOG_STRONG` 里那批信号（未捕获异常 / 子进程非零退出 / 段错误 / MODULE_NOT_FOUND /
+#   模块解析失败 / ffmpeg 读不了输入 / 找不到编解码参数 / 浏览器进程退出）**无条件**先命中。
+# 其余三个词（AGENTS.md 阶段 9 的原文口径）保持纯子串匹配，且**大小写不敏感**
+# ——旧实现是整行 `.lower()` 之后再子串匹配，`Cannot be decoded` / `Failed to load`
+# 都要能命中。改这里要同步改根文档。
 LOG_ERROR_PATTERNS = (
     "cannot be decoded",
-    "Error:",
     "failed to load",
     "Timeout",
-    "ERROR",
 )
+LOG_ERROR_LABEL = "Error:/ERROR"
+#: Chromium / ANGLE 的日志前缀，形态固定为 `[ERROR:组件名(行号)]`（也兼容 `[W:...]` / `[I:...]`）。
+#: 组件名允许 `:`，但**不许含**小括号和 `]`，否则贪婪匹配会连 `(481)]` 一起吞掉、
+#: 导致 `\(\d+\)` 匹配失败（实测踩过这个坑）
+_RX_LOG_CHROMIUM_PREFIX = re.compile(
+    r"^\s*\[(?:ERROR|WARNING|INFO|E|W|I):[A-Za-z0-9_.:+-]+\(\d+\)\]\s*", re.IGNORECASE)
+#: 独立的 error 词 + 紧跟的 `:`（`Error:` / `errors:` 都算）
+_RX_LOG_ERROR = re.compile(r"errors?\s*:", re.IGNORECASE)
+#: 独立的 error / errors 词。**必须忽略大小写**：旧的裸子串实现是整行 `.lower()`
+#: 之后再匹配，只认全大写会把 `Error while loading page` / `error allocating buffer`
+#: 这类真报错放过去（独立复核实测 20 条矩阵里漏 3 条）。误杀靠下面的
+#: `_RX_LOG_ZERO` 与「数量 > 0」两道挡，而不是靠大小写敏感。
+#: ❗它只管「有没有 error 词」，用 `_RX_LOG_ERROR_WORD`；后者比 `\bERRORS?\b` 多一个
+#: 「后面不许跟字母」的前瞻（`errored` / `erroring` 不算 error 词），实现见文件下方。
+#: 带数量的汇总行：`2 errors:` / `1 error`
+_RX_LOG_ERROR_COUNT = re.compile(r"(?<!\d)(\d+)\s+errors?\b", re.IGNORECASE)
+#: 「零错误」汇总行：`Finished: 0 errors, 0 warnings` / `no errors` / `without errors`
+#: （`error` 单数也认：`0 error` / `no error` 同样是自称没出错）
+_RX_LOG_ZERO = re.compile(r"(?:\b0\b|\bno\b|\bwithout\b|\bnone\b)\s+errors?\b", re.IGNORECASE)
+
+#: 强失败信号：这些字样一旦出现，**任何**「自称零错误」的豁免都不成立。
+#:
+#: 为什么需要单独一层（实测踩过，BUGS-REPORT P2-9）：渲染工具会把汇总行和真错误写在
+#: **同一行**——
+#:     `Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'`
+#: 旧实现先判 `_RX_LOG_ZERO` 就会整行豁免，同行的 `Cannot find module` 被静默放行；
+#: 只认「一个 error 词 + `:`」的口径也救不回来，因为 `errors:` 已经在零错误分组里了。
+#: 所以强信号必须**无条件**先判（顺序即语义，改动这里等于改闸门口径）。
+#:
+#: 另外 8 个词是 AGENTS.md 阶段 9 三个词之外的覆盖缺口（BUGS-REPORT P2-10）：这些是
+#: 「进程真崩了 / 依赖真找不到 / ffmpeg 真读不了输入」的硬信号，旧闸门一个都不吃。
+#: 写正则而不是裸子串，是为了不被 `errored` / `error-handling` 这类普通词误杀
+#: （误报的代价比漏报更大，见上面 LOG_ERROR_PATTERNS 的注释）。
+_RX_LOG_STRONG = (
+    # Node / JS 侧未捕获异常
+    re.compile(r"\bunhandled\s+(?:exception|rejection|error)\b", re.IGNORECASE),
+    # 子进程非零退出（`Command failed with exit code 1` / `exited with code 137` / `exit status 1`）
+    re.compile(r"\b(?:failed with exit code|exited with code|exit status)\s*-?\d+", re.IGNORECASE),
+    # 原生崩溃
+    re.compile(r"\bsegmentation fault\b|\bcore dumped\b", re.IGNORECASE),
+    # Node 的模块解析失败：错误码 + 报错原文两种真实文案
+    re.compile(r"\bMODULE_NOT_FOUND\b"),
+    re.compile(r"cannot find module", re.IGNORECASE),
+    re.compile(r"unable to resolve module", re.IGNORECASE),
+    # ffmpeg / ffprobe 读到坏输入
+    re.compile(r"invalid data found when processing input", re.IGNORECASE),
+    re.compile(r"could not find codec parameters", re.IGNORECASE),
+    # 渲染用浏览器进程自己非零退出（Chromium 常打「GPU process exited unexpectedly」这类
+    # 无害噪声，所以这里**必须**同时要求 failed/error/non-zero，避免误杀）
+    re.compile(
+        r"chrome-headless-shell[^\n]{0,80}?(?:failed|error|non-zero|非零)"
+        r"|(?:failed|error|crashed)[^\n]{0,80}?chrome-headless-shell",
+        re.IGNORECASE,
+    ),
+)
+#: 独立的 error / errors 词。比 `\bERRORS?\b` 多两项排除（都是实测踩出来的误报源）：
+#:   1. 后面不许再跟字母 —— `\b` 只看「词字符与非词字符之间」，`errored` 整串都是词字符，
+#:      所以 `\berrors?\b` 其实匹配不到；真正会误报的是 `error-handling` 这种**用连字符
+#:      接起来的复合词**（`-` 是非词字符，`error` 正好落在词边界上）。
+#:   2. 前面不许是被连字符连接的前半截（`pre-error` / `non-error` 同理）。
+_RX_LOG_ERROR_WORD = re.compile(r"(?<![A-Za-z]-)\berrors?\b(?![A-Za-z-])", re.IGNORECASE)
 LOG_MAX_HITS = 20
+
+
+def _log_error_hit(line: str) -> bool:
+    """这一行算不算「渲染日志里有报错字样」。口径见上面 LOG_ERROR_PATTERNS 的注释。
+
+    分成几步而不是一条大正则：Python 的 lookbehind 要求定宽，写成一条正则会被编译期
+    直接拒绝（静默漏报），这里改成显式谓词更好读也更好测。
+
+    三个容易写错的地方（都是实测踩出来的）：
+    1. 不能按「整行前缀」豁免。`[ERROR:gpu_init.cc(481)] …` 是噪声，但
+       `[ERROR:CONSOLE(0)] "Uncaught Error: boom"` 是**真错**。所以只把
+       `[组件:文件(行号)]` 这段前缀剥掉，剩下的话继续判。
+    2. 不能按「行首是 Finished/Done/Rendered」整行豁免。`Finished: 0 errors` 是噪声，
+       但 `Finished: 1 error` / `Rendered with error: ffmpeg exited 1` 是真错。
+       所以只在「这一行自称零错误」时才豁免（交给 `_RX_LOG_ZERO` 判）。
+    3. ❗**强信号必须先于零错误豁免判**。汇总行和真错误会写在同一行
+       （`Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'`），
+       先判零错误就整行放行。`_RX_LOG_STRONG` 就是这道前置判定，顺序不能调。
+
+    三个阶段 9 的三个词（`cannot be decoded` / `failed to load` / `Timeout`）也在这里一起判，
+    大小写不敏感——这样「这一行算不算报错」只有一个入口，不会再出现两套口径。
+    """
+    rest = _RX_LOG_CHROMIUM_PREFIX.sub("", line)
+    for rx in _RX_LOG_STRONG:
+        if rx.search(rest):
+            return True
+    lowered = rest.lower()
+    for term in LOG_ERROR_PATTERNS:
+        if term.lower() in lowered:
+            return True
+    if _RX_LOG_ZERO.search(rest):
+        return False
+    count = _RX_LOG_ERROR_COUNT.search(rest)
+    if count:
+        return int(count.group(1)) > 0
+    return bool(_RX_LOG_ERROR.search(rest) or _RX_LOG_ERROR_WORD.search(rest))
 
 # 模板 remotion.config.ts 的编码设置；不一致不算硬失败，但要提醒平台兼容性。
 EXPECTED_CODEC = "h264"
@@ -407,6 +521,9 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
     actual_fps = _parse_fraction(video.get("r_frame_rate")) or _parse_fraction(video.get("avg_frame_rate"))
     if fps_override is not None:
         target_fps, fps_source = float(fps_override), "--fps"
+        if target_fps <= 0:
+            report.fail(item, f"--fps 给的是 {target_fps:g}，不是有效帧率；要么去掉 --fps，"
+                              "要么给正数（预览版用 --fps 30）")
     else:
         fps_source = "timing.json"
         try:
@@ -414,7 +531,12 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
         except (TypeError, ValueError):
             target_fps = 0.0
             report.fail(item, "timing.json 的 fps 不是数字，无法比对帧率")
-    if target_fps:
+        if target_fps <= 0:
+            # timing.json 的 fps 是 0/负数时，容差判定 abs(actual-0) <= 1 对 30fps 以下
+            # 的产物一律为真，会静默报「帧率通过」——这类畸形值必须显式报错
+            report.fail(item, f"timing.json 的 fps 是 {target_fps:g}，不是有效帧率；"
+                              "改回 60（或预览用的 30）再重渲")
+    if target_fps > 0:
         if actual_fps <= 0:
             report.warn(item, "ffprobe 没报出帧率，跳过帧率比对（可能是可变帧率文件）")
         elif abs(actual_fps - target_fps) <= FPS_TOLERANCE:
@@ -507,15 +629,20 @@ def check_render_log(report: Report, log_path: Path) -> None:
 
     hits = []
     for lineno, line in enumerate(text.splitlines(), start=1):
+        # AGENTS.md 阶段 9 的三个词是整行 `.lower()` 之后做子串匹配的（旧实现如此），
+        # `Cannot be decoded` / `Failed to load resource` / `TimeoutError` 都要命中。
         lowered = line.lower()
         for pattern in LOG_ERROR_PATTERNS:
             if pattern.lower() in lowered:
                 hits.append((lineno, pattern, line.strip()))
                 break
+        else:
+            if _log_error_hit(line):
+                hits.append((lineno, LOG_ERROR_LABEL, line.strip()))
 
     if hits:
-        for lineno, pattern, line in hits[:LOG_MAX_HITS]:
-            report.fail(item, f"{_rel(log_path)}:{lineno} 命中「{pattern}」：{line[:200]}")
+        for lineno, label, line in hits[:LOG_MAX_HITS]:
+            report.fail(item, f"{_rel(log_path)}:{lineno} 命中「{label}」：{line[:200]}")
         if len(hits) > LOG_MAX_HITS:
             report.fail(item, f"渲染日志里还有 {len(hits) - LOG_MAX_HITS} 处匹配没打印（同类问题）")
         report.fail(

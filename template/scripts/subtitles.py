@@ -15,6 +15,9 @@
    ``MarginV`` 由 ``captions.bottom`` 换算并压进竖屏安全区（上 10% / 下 18% / 左 6% / 右 14%）。
 3. ``burn`` —— 用 ffmpeg 把 ASS 烧成硬字幕（``-vf ass=...``），或 ``--soft`` 封装成软字幕
    （``-c:s mov_text``）。``--preview N`` 只处理前 N 秒，方便先看 8 秒再决定要不要整片跑。
+   ASS 不存在、或比 ``src/timing.json`` 旧（改过稿 / 重跑过 tts）时**自动重建**再烧；
+   用的是磁盘上已有的新 ASS 时会打一条 WARN，提醒它不校验内容（那份 ASS 不在项目里时，
+   WARN 里会额外点名）。
 
 AI 看不到画面，所以这里把「字幕读得完、不串场、不出安全区」全部变成可计算的秒数与像素值。
 **烧完仍然要人工审图**：脚本会把抽帧存到 ``out/verify-subs/``，再跑 ``check_video.py`` 复查。
@@ -49,6 +52,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -61,14 +65,15 @@ try:  # pragma: no cover - 只在 _common.py 缺失时走到
     from _common import (  # type: ignore
         FONTS_PATH,
         PROJECT_ROOT,
+        TIMING_PATH,
         error,
         fmt_sec,
         fonts_config,
         has_cmd,
         human,
-        line_window,
         load_json,
         load_timing,
+        line_window,
         log,
         scene_window,
         warn,
@@ -164,18 +169,41 @@ def _rel(path: Any) -> str:
         return p.as_posix()
 
 
-def _resolve_user_path(value: Any, cwd_first: bool = True) -> Path:
+def _in_project(path: Any) -> bool:
+    """路径是否落在项目根里（``_rel()`` 的反面判据，用来把「项目外的文件」点名说清）。"""
+    try:
+        Path(path).resolve().relative_to(PROJECT_ROOT.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_user_path(value: Any, allow_cwd_fallback: bool = True) -> Path:
     """把用户给的路径变成绝对路径。
 
-    先按当前工作目录解析（脚本在项目根跑时二者一致），再退回项目根，
-    免得用户 ``cd`` 到别处后 ``out/subtitles/zh.srt`` 落错地方。
+    **相对路径优先按项目根解析**：本项目所有命令的路径口径都相对项目根
+    （``out/subtitles/zh.ass``、``out/final-1080p.mp4`` 指的就是工程里那一份）。
+    以前反过来（当前工作目录优先），于是站在别处跑、或那个目录下碰巧有一份同名
+    ``out/subtitles/zh.ass``，就会把**项目外**的文件当成项目自己的字幕用
+    （``burn`` 连内容都不看就烧进成片），而项目里那份被完全无视、一条提示都没有。
+
+    只有项目根下确实没有这个路径时，才退回当前工作目录，并且必须打一条 WARN 说清
+    「这不是项目里的文件」——往项目外写的东西不会同步进工程，不能静默发生。
     """
     p = Path(str(value)).expanduser()
     if p.is_absolute():
         return p
-    if cwd_first and p.exists():
+    project_path = (PROJECT_ROOT / p).resolve()
+    if project_path.exists():
+        return project_path
+    if allow_cwd_fallback and p.exists():
+        warn(
+            f"{p.as_posix()} 不在项目里（{PROJECT_ROOT} 下没有这个路径），"
+            f"本次用的是当前工作目录下的 {p.resolve()}；"
+            "往项目外写文件不会进工程，请确认这就是你要的那份"
+        )
         return p.resolve()
-    return (PROJECT_ROOT / p).resolve()
+    return project_path
 
 
 def _disp_width(text: str) -> int:
@@ -392,13 +420,16 @@ _FAMILY_FONTS = {
     "wenquanyi micro hei": ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",),
 }
 
-#: 探针字符：选一个**只有中文字体才有**的汉字。用常见字（如「一」）会让
-#: 「命中了一个不含汉字的拉丁字体」这种坏情况漏过去——微软雅黑和 Cascadia Code
-#: 都「有」U+4E00 吗？不一定，但 U+9F99（龙）才是真正区分得开的探针。
-_PROBE_CHAR = "龙"
+# 注（2026-10-12）：这里原本有一个 `_PROBE_CHAR = "龙"` 常量，用来「用一个只有中文字体
+# 才有的汉字」探某个字体能不能打中文。它已被 `_family_missing(font_file, text)` 取代：
+# 后者逐个查**本片字幕真正要用的**每个字在字体 cmap 里有没有码位（用常见字「一」探会漏，
+# 更别说单一探针字根本代表不了整段文案）。不再保留那个常量，免得后来者以为它还在用。
 
 #: 系统字体索引缓存（族名 -> 字体文件），首次用到时才构建。
 _FONT_INDEX: Optional[Dict[str, Path]] = None
+
+#: 字体 cmap 缓存（字体路径 -> 码位集合，读不了记 None）。缺字判据用它，别用 getmask()。
+_CMAP_CACHE: Dict[str, Optional[set]] = {}
 
 #: 建索引时调 fc-list 的超时（本机 4426 条，通常 1 秒内返回）。
 FC_LIST_TIMEOUT_S = 30.0
@@ -473,27 +504,53 @@ def _font_path_file(font_path: Path) -> Optional[Path]:
     return None
 
 
-def _family_covers(font_file: Path, text: str) -> bool:
-    """字体文件里有没有 text 里的字？用来戳穿「名字能解析、但字形其实是拉丁字体」这种静默失败。
+def _font_cmap(font_file: Path) -> Optional[set]:
+    """用 fontTools 读字体 cmap 里的码位集合；读不了（没装 fontTools / 字体损坏）返回 None。"""
+    key = str(font_file)
+    if key in _CMAP_CACHE:
+        return _CMAP_CACHE[key]
+    codes: Optional[set] = None
+    try:
+        from fontTools.ttLib import TTFont  # 模板依赖里已有 fontTools
 
-    没有 Pillow 就返回 True（不拦，只跳过这层检查——它不是硬依赖）。
+        with TTFont(key, lazy=True) as tt:
+            codes = set(tt.getBestCmap().keys())
+    except Exception:  # noqa: BLE001 - 字体坏掉不该中断烧录，降级到下面的 getmask
+        codes = None
+    _CMAP_CACHE[key] = codes
+    return codes
+
+
+def _family_missing(font_file: Path, text: str) -> Optional[str]:
+    """字体缺的第一个字；全都有返回 None。
+
+    **必须查 cmap，不能用 `font.getmask(ch).getbbox() is None`**（本函数的老实现）：
+    Pillow 会自己做字体回退，字体 cmap 里根本没有那个字时 getmask 照样从系统字体里
+    借一个字形，bbox 永远非空 —— 判据因此恒为「有字」。实测本仓库的
+    `public/fonts/promo-subset-*.ttf`（cmap 342 个码位）对「马上安卓候鑫」这 6 个
+    不在子集里的字，老判据真阳性 0 / 假阴性 6，于是「缺字就换字体」的兜底成了死代码，
+    字幕整行变方框却退 0（`deliver.py` 的 `_font_supports` 早就改用 cmap 了，这里对齐它）。
+    没有 fontTools 时才退回 getmask —— 不可靠，只求聊胜于无。
     """
     if not text:
-        return True
-    try:
-        from PIL import ImageFont  # type: ignore
-    except ImportError:
-        return True
-    try:
-        font = ImageFont.truetype(str(font_file), 32)
-        for ch in dict.fromkeys(text):
-            if ch.isspace():
-                continue
-            if font.getmask(ch).getbbox() is None:
-                return False
-        return True
-    except OSError:
-        return True
+        return None
+    codes = _font_cmap(font_file)
+    for ch in dict.fromkeys(text):
+        if ch.isspace():
+            continue
+        if codes is not None:
+            if ord(ch) not in codes:
+                return ch
+            continue
+        try:  # 降级路径
+            from PIL import ImageFont  # type: ignore
+
+            face = ImageFont.truetype(str(font_file), 32)
+            if face.getmask(ch).getbbox() is None:
+                return ch
+        except Exception:  # noqa: BLE001 - 量不了就当它没问题
+            continue
+    return None
 
 
 def _first_generic(cfg: Dict[str, Any]) -> str:
@@ -540,9 +597,24 @@ def _resolve_font_family(cfg: Dict[str, Any], text: str = "") -> str:
     stack = _body_font_stack(cfg)
     concrete = [n for n in stack if n.lower() not in GENERIC_FAMILIES]
 
+    # 本机有这个族名的字体文件，**还要**确认它真的含本片字幕用到的字。
+    # 只查「文件存在」是不够的：stack 里第二位可能是个能解析、但不含汉字的字体
+    # （实测：把 Cascadia Code 放在 PingFang SC 后面时，早期版本会直接返回它，
+    #  字幕整行变豆腐块，而烧录退出码是 0）。缺字就继续往后找，不在这里静默定案。
+    first_available: Optional[Tuple[str, Path, str]] = None
     for name in concrete:
-        if _family_available(name):
+        found_file = _family_available(name)
+        if found_file is None:
+            continue
+        missing = _family_missing(found_file, text) if text else None
+        if missing is None:
             return name
+        if first_available is None:
+            first_available = (name, found_file, missing)
+        warn(
+            f"字体栈里的「{name}」（{found_file.name}）本机有，但它缺「{missing}」这类字，"
+            "用它字幕会变成方框；继续往后找"
+        )
 
     for name in concrete:
         found = _fc_match(name)
@@ -554,10 +626,11 @@ def _resolve_font_family(cfg: Dict[str, Any], text: str = "") -> str:
             # fontconfig 回落到一个不相干的字体（实测：PingFang SC -> Cascadia Code），
             # 这不是「替代字体」，是「没找到」。用它会把汉字渲成方框。
             continue
-        if text and not _family_covers(font_file, text):
+        missing = _family_missing(font_file, text) if text else None
+        if missing is not None:
             warn(
                 f"fontconfig 把「{name}」解析到「{families[0]}」（{font_file.name}），"
-                f"但那个字体缺汉字（缺「{_PROBE_CHAR}」这类字），字幕会变成方框；继续往后找"
+                f"但那个字体缺「{missing}」这类字，字幕会变成方框；继续往后找"
             )
             continue
         main = families[0]
@@ -566,6 +639,18 @@ def _resolve_font_family(cfg: Dict[str, Any], text: str = "") -> str:
             f"（{font_file.name}）；它已确认含有本片字幕用到的汉字"
         )
         return main
+
+    if first_available is not None:
+        # 走到这里说明整条栈里没有一个「文件存在且字全」的字体。手上这个至少是
+        # 真实的字体文件（比 fontconfig 随便给的替代字体强），用它并明确报警。
+        name, found_file, missing = first_available
+        warn(
+            f"字体栈里没有一条能覆盖本片字幕全部用字：退回首选可用字体「{name}」"
+            f"（{found_file.name}），它缺「{missing}」这类字，字幕会出现方框。"
+            "换一个含这些字的字体（改 fonts.json 的 roles.body.stack）或改文案；"
+            "烧完**必须**打开 out/verify-subs/ 下的审图帧确认汉字正常显示"
+        )
+        return name
 
     chosen = concrete[0] if concrete else DEFAULT_FONT_FAMILY
     warn(
@@ -697,7 +782,18 @@ def _ffprobe(path: Path) -> Dict[str, Any]:
 
 
 def _audio_duration(path: Path) -> Optional[float]:
-    """ffprobe 量音频时长；测不到返回 None（调用方回退到字数估算）。"""
+    """ffprobe 量音频时长；测不到返回 None（调用方回退到字数估算）。
+
+    入口的 ``_ensure_ffmpeg()`` 已经挡住「没装 ffprobe」，这里再自查一次：调用链不止
+    一条（``srt``/``ass``/``burn`` 都走到这里），而「缺工具」是 ERROR 级故障，不是降级
+    路径 —— 以前它被下面的 ``except SystemExit`` 吞掉，于是没装 ffprobe 的机器上会打
+    ERROR 行、却以退出码 0 写出按字数估算的字幕（闸门形同虚设，见 FIX-B P2-20）。
+    吞 ``SystemExit`` 因此只剩「文件本身量不出来」（坏文件 / 不是媒体），调用方会为它打
+    WARN 并回退，那是文件头写明的降级路径。
+    """
+    if not has_cmd("ffprobe"):
+        # FIX-B P2-20 兜底：缺工具 → 真 ERROR + 非零退出，绝不静默估算
+        error("找不到 ffprobe。它随 ffmpeg 一起安装，请确认 PATH 里有它（跑 doctor.py 体检）。")
     try:
         info = _ffprobe(path)
     except SystemExit:
@@ -923,7 +1019,78 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
                 f"（{fmt_sec(cur.start)}~{fmt_sec(cur.end)}）在屏上重叠 {fmt_sec(prev.end - cur.start)}："
                 "同屏两句字幕会互相盖住，请调整 timing.json 的 at 或缩短前一句"
             )
+
+    check_voice_windows(timing, raw_lines)
     return cues
+
+
+def check_voice_windows(timing: Dict[str, Any], raw_lines: List[Any]) -> int:
+    """旁白**窗口不够放**检查，返回有问题的句数。
+
+    先说清楚为什么不是「窗口相交检查」（这一点被实测推翻了）：
+    ``_common.line_window()`` 的窗口是「本句 at → min(场景结束, 下一句 at) - 0.15s」，
+    所以任何时刻的窗口集合都是**按 at 切出来的一串互不相交的区间**（实测：at=0/10/37/17
+    四句得到 [0,9.85] [10,16.85] [17,36.85] [37,59.85]，两两间隙恰好都是 0.15 秒）。
+    因此「窗口重叠」永远不可能发生，写成交叉检查就是死代码。
+
+    真正的风险是这个：**窗口装不下这句的实测人声**。窗口末端被下一句的 at 钉死，
+    而实测时长由稿子长度决定；`subtitles.py` 自己会把字幕压到窗口内（不串场），
+    但压不回来的部分是**人声本身溢出了**，听感上就是「这句还没说完下一句就开口」。
+    本检查把它显式报出来，并给出每种写法还差多少秒。
+
+    ``tts.py audit`` 也判同一件事（TOO_LONG，先尝试 ≤12% 加速）；本函数是字幕侧的
+    独立提示，用 ``audio-src/vo/report.json`` 的实测时长，两者口径相同、互相印证。
+    窗口取不到（``line_window`` 抛错）时不在这里报错 —— 那是 ``tts.py audit`` 的 ERROR。
+    """
+    entries, _ = _load_vo_report()
+    vo_dir = PROJECT_ROOT / VO_DIRNAME
+    problems = 0
+
+    for order, item in enumerate(raw_lines, start=1):
+        if not isinstance(item, dict):
+            continue
+        line_id = str(item.get("id", "")).strip() or f"#{order}"
+        try:
+            win_start, win_end = line_window(timing, item)
+        except (ValueError, KeyError, TypeError):
+            continue
+
+        # 实测人声时长：与 build_cues 同口径（ffprobe 优先，report.json 兜底）。
+        mp3 = vo_dir / f"{line_id}.mp3"
+        measured: Optional[float] = None
+        source = ""
+        if mp3.is_file() and mp3.stat().st_size > 0:
+            measured = _audio_duration(mp3)
+            source = _rel(mp3)
+        elif line_id in entries:
+            recorded = _num(entries[line_id].get("duration"), 0.0)
+            if recorded > 0:
+                measured = recorded
+                source = "report.json"
+        if not measured:
+            continue  # 还没有配音；build_cues 那边已经 Warn 过了
+
+        room = win_end - win_start
+        over = measured - room
+        if over <= 1e-6:
+            continue
+        problems += 1
+        need_speed = measured / room if room > 0 else float("inf")
+        warn(
+            f"第 {line_id} 句的窗口只放得下 {fmt_sec(room)}"
+            f"（{fmt_sec(win_start)}~{fmt_sec(win_end)}），但 {source} 实测 {fmt_sec(measured)}，"
+            f"超出 {fmt_sec(over)}：这句人声会盖到下一句的起播点。"
+            f"要到齐得加速到 {need_speed:.2f}×（tts.py 只允许 ≤12%，即 1.12×），"
+            "所以按 AGENTS.md 阶段 7 改短稿子，或把后一句的 at 往后挪"
+        )
+
+    if problems:
+        warn(
+            f"共 {problems} 句窗口不够放。tts.py audit 对同一批句子会报 TOO_LONG；"
+            "字幕侧只能把字幕压进窗口（不串场），压不住人声，请按上面的秒数改稿后重跑 "
+            "`python scripts/tts.py all` 再回来生成字幕"
+        )
+    return problems
 
 
 # ===========================================================================
@@ -1127,6 +1294,63 @@ def _file_stats(path: Path) -> str:
     return f"{human(len(data))}（{len(data)} 字节） / {len(lines)} 行"
 
 
+def _source_stamp() -> float:
+    """``src/timing.json`` 的修改时间；读不到时返回「现在 + 1 秒」。
+
+    读不到就不该相信磁盘上任何已有产物 —— 返回一个比「刚刚写出来的文件」还晚的时间戳，
+    让 mtime 比较一律判过期、宁可重建，也不烧一份来路不明的旧 ASS。
+    """
+    try:
+        return TIMING_PATH.stat().st_mtime
+    except OSError:
+        return time.time() + 1.0
+
+
+def _is_stale(path: Path, stamp: float, slack: float = 0.5) -> bool:
+    """``path`` 是不是比 ``stamp`` 旧（``slack`` 秒容差，避开同秒写入的抖动）。
+
+    ``slack`` 的必要性：``subtitles.py ass`` 紧接着 ``burn`` 跑时，两份产物的 mtime
+    可能落在同一秒里；没有容差就会把刚生成的 ASS 再生成一遍（无害但会刷屏）。
+    """
+    try:
+        return path.stat().st_mtime < stamp - slack
+    except OSError:
+        return True
+
+
+def _stale_audio_note(stamp: float) -> str:
+    """有配音音频比 ``src/timing.json`` 更新时，返回一句该提醒的话（否则空串）。
+
+    为什么要有这条：ASS 的每句时长既可能来自 timing.json 的窗口，也可能来自 tts 跑完
+    写下的实测时长。只重跑 ``tts.py all``（音频变长变短）而不动 timing.json 时，
+    mtime 判据一点都看不出来，烧出去的仍是老时间轴。这里不自动重建（重建与否该由人定），
+    只把「你现在烧的可能是旧时间轴」这层信息说出来。
+    """
+    try:
+        voice_dir = PROJECT_ROOT / VO_DIRNAME
+        files = sorted(voice_dir.glob("*")) if voice_dir.is_dir() else []
+    except OSError:
+        return ""
+    newest = 0.0
+    newest_name = ""
+    for path in files:
+        if path.suffix.lower() not in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > newest:
+            newest, newest_name = mtime, path.name
+    if newest <= stamp - 0.5:
+        return ""
+    return (
+        f"注意：{newest_name} 比 {TIMING_PATH.name} 新（重跑过 tts？），"
+        "而本命令只按 timing.json 的修改时间决定要不要重建 ASS；"
+        "音频长短变了要显式跑 `python scripts/subtitles.py ass` 重生成字幕。"
+    )
+
+
 # ===========================================================================
 # 子命令
 # ===========================================================================
@@ -1141,6 +1365,10 @@ def _out_was_given() -> bool:
 
 
 def cmd_srt(args) -> int:
+    # FIX-B P2-20 入口闸门：缺 ffmpeg/ffprobe 必须在这里就非零退出。
+    # _audio_duration() 会把 _ffprobe 的 SystemExit 吞成「按字数估算」，所以以前
+    # 没装 ffprobe 的机器上会打一堆 ERROR 行、却以退出码 0 写出估算出来的字幕。
+    _ensure_ffmpeg()
     timing = load_timing()
     out = _resolve_user_path(args.out)
     log(f"生成 SRT：{_rel(out)}")
@@ -1161,6 +1389,10 @@ def cmd_srt(args) -> int:
 
 
 def cmd_ass(args) -> int:
+    # FIX-B P2-20 入口闸门：缺 ffmpeg/ffprobe 必须在这里就非零退出。
+    # _audio_duration() 会把 _ffprobe 的 SystemExit 吞成「按字数估算」，所以以前
+    # 没装 ffprobe 的机器上会打一堆 ERROR 行、却以退出码 0 写出估算出来的字幕。
+    _ensure_ffmpeg()
     timing = load_timing()
     out = _resolve_user_path(args.out)
     if args.fontsize is not None and args.fontsize <= 0:
@@ -1220,14 +1452,43 @@ def cmd_burn(args) -> int:
     if args.preview is not None and args.preview <= 0:
         error(f"--preview 必须是正数秒数，收到 {args.preview}")
 
-    # ASS 不存在就先自动生成（burn 的语义是「一条命令拿到带字幕的成片」）。
+    # ASS 不存在、或者比 timing.json 旧，就先自动生成（burn 的语义是「一条命令拿到带字幕的成片」）。
+    #
+    # 以前这里只判 ``not ass_path.is_file()``：改完稿、重跑 tts 之后磁盘上那份
+    # out/subtitles/zh.ass 还是旧的，于是**照旧被烧进成片**（下面用的是 ass_path），
+    # 退出码 0、一条提示都没有 —— 画面上的字幕和 timing.json 对不上，还找不到原因。
+    # 现在按 mtime 判过期（同一份 src/timing.json 是唯一的字幕来源），过期就重建。
     ass_path = _resolve_user_path(args.ass)
     # 时间轴一律现算一遍：抽帧要挑「字幕在屏上」的时刻，不能依赖磁盘上那份 ASS 还新不新。
     cues = build_cues(timing)
+    stamp = _source_stamp()
     if not ass_path.is_file():
         log(f"没有 {_rel(ass_path)}，先自动生成一份 ASS")
         _build_ass(cues, timing, ass_path, None)
         log(f"ASS 已生成：{_rel(ass_path)}（{_file_stats(ass_path)}）")
+    elif _is_stale(ass_path, stamp):
+        log(
+            f"{_rel(ass_path)} 比 {_rel(TIMING_PATH)} 旧（改过稿），先重建再烧。"
+            "注意判据只看 timing.json 的修改时间：句子的 at / 文字变了会重建，"
+            "但只重跑过 tts、音频长短变了而 timing.json 没动，这里不会重建"
+            "（那种情况见下面那条提醒）"
+        )
+        _build_ass(cues, timing, ass_path, None)
+        log(f"ASS 已重建：{_rel(ass_path)}（{_file_stats(ass_path)}）")
+    else:
+        # 项目外的同名 ASS 是老坑：_resolve_user_path 以前按当前工作目录优先解析，
+        # 站在别处跑就会把项目外那份「来源不明」的 ASS 烧进成片（FIX-B P2-3）。
+        # 解析顺序已经改成项目根优先，这里再把「不在项目里」明说出来。
+        outside = "" if _in_project(ass_path) else "注意：这份 ASS 不在项目里（是项目外的文件），来源不明；"
+        warn(
+            f"用的是磁盘上已有的 {_rel(ass_path)}：它比 {_rel(TIMING_PATH)} 新，"
+            "但本命令不校验它的内容。" + outside
+            + "改过字体、字幕参数（captions 字号 / bottom）"
+            "或重跑过 tts（音频时长变了）之后，请显式跑 `python scripts/subtitles.py ass` 重生成，别直接 burn"
+        )
+    audio_note = _stale_audio_note(stamp)
+    if audio_note:
+        warn(audio_note)
 
     # 画面里已经有 <Caption> 渲染的字幕时，再烧一遍硬字幕会变成两行叠字 —— 实测过：
     # 两行糊在一起，哪一行都看不清（两者位置都由 captions.bottom 决定，必然重合）。

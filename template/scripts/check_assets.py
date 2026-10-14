@@ -17,7 +17,9 @@
 5. **字体缺字**：用 ``fonts.json`` 的 ``check.systemCandidates`` 找第一个存在的字体，
    检查 timing.json 全部文案的每个字符是否都被 cmap 覆盖，缺字 → ERROR（会渲染成方块）；
 6. **音频**：``public/<music.file>`` 与 ``audio-src/vo/<id>.mp3`` 是否齐全；
-7. **真实素材配额**：``public/img/`` 图片数 < 6 → WARN（AGENTS.md 阶段 4 要求 ≥6 张）。
+7. **真实素材配额**：``public/img/`` 图片数 < 6 → WARN（AGENTS.md 阶段 4 要求 ≥6 张）；
+   总数达标后再按场景分段核「每个功能段落 ≥1 张真实截图」「有一段 ≥6 张真实作品的快切蒙太奇」
+   （用了 ``PhoneFrame/BrowserFrame/Shot`` 的段落一张真实图都没引用 → WARN；变量拼路径的段落不下结论）。
 
 典型调用
 --------
@@ -93,6 +95,21 @@ TIME_EPS = 1e-6
 # 只认字面量；变量/模板字符串一律跳过并提示（静态扫不出来，别假装扫过了）。
 ASSET_CALL_RE = re.compile(r"""\b(staticFile|assetUrl)\s*\(\s*(['"])([^'"]*)\2\s*\)""")
 ASSET_PROP_RE = re.compile(r"""\b(?:src|poster|image)\s*=\s*(["'])([^"'{}]+)\1""")
+# 场景组件里"裸字符串"形式的素材引用（数组 / 变量 / props 都算）：
+#   const WORKS = ["img/work-01.png", …]  或  <Shot src="img/work-01.png" />
+# 用来统计每个场景到底引用了几张真实图（「分段素材」检查）。
+SCENE_LITERAL_RE = re.compile(r"""(["'])([^"'\\\n]+)\1""")
+# 静态扫不出来的写法：素材 prop 里放的是表达式（`src={…}`），或 staticFile()/assetUrl()
+# 的实参不是字面量。出现这些就不对这一段下结论（不猜）。
+# 注意别把「样式里的模板字符串」当成动态素材引用：场景代码里到处都是 `blur(${p}px)` 这类写法，
+# 那跟素材路径无关，把它当动态会让整项检查永远不敢下结论。
+DYNAMIC_ASSET_RE = re.compile(
+    r"""\b(?:src|poster|image)\s*=\s*\{|(?:staticFile|assetUrl)\s*\(\s*[^"')\s]"""
+)
+# 组件化的"素材容器"：用了它们就说明这一段要展示真实界面/作品（AGENTS.md 阶段 4/6）。
+MATERIAL_COMPONENTS = ("PhoneFrame", "BrowserFrame", "Shot")
+# AGENTS.md 阶段 4：必须有一段由 ≥6 张真实作品组成的快切蒙太奇。
+MONTAGE_MIN = 6
 REMOTE_PREFIXES = ("http://", "https://", "data:", "blob:", "//")
 
 SCAN_DIRS = ("src", "web")
@@ -166,13 +183,67 @@ def _rel(path: Path) -> str:
         return Path(path).as_posix()
 
 
+# `_read_json_file` 的错误分类哨兵：
+#   文件**不存在** = "没配"（可选文件，调用方一般 WARN）；
+#   其余错误（不是 UTF-8 / 读不出来 / JSON 语法坏）= "配坏了"，调用方必须报 ERROR ——
+#   闸门不能因为一个坏文件就静默跳过一整项检查（那就是假绿）。
+JSON_MISSING = "文件不存在"
+
+
 def _read_json_file(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8")), None
     except FileNotFoundError:
-        return None, "文件不存在"
+        return None, JSON_MISSING
+    except UnicodeDecodeError as exc:
+        # 以前这里会裸崩：Windows 上把 JSON 存成 GBK（记事本默认编码）就会走到这。
+        return None, f"不是 UTF-8 文本（第 {exc.start} 字节起：{exc.reason}）"
     except json.JSONDecodeError as exc:
         return None, f"JSON 解析失败：{exc}"
+    except OSError as exc:
+        return None, f"读不了文件：{exc}"
+
+
+def _obj(value):
+    """只归一化、不报错的版本：坏输入（非对象）→ 空 dict。
+
+    给没有 report 参数的工具函数用（_collect_texts / _local_window 这类）；
+    真正的 `ERROR:` 行由对应的检查项报（见 _sub_dict），避免同一处坏输入刷出四条。
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _sub_dict(container: dict, key: str, report: Report, item: str, expected: str) -> dict:
+    """取 timing.json 的子对象（brand/captions/music/voice…）之前先做类型断言。
+
+    契约里它们都是对象；坏输入（字符串、列表、数字）以前会在最深的 `.get()` 上
+    AttributeError 裸崩，用户看到的是 traceback 而不是 `ERROR: ...` 行。
+    这里统一拦住：不是对象就报一行 ERROR 并返回空 dict，让后面的检查继续跑
+    （一个字段坏掉不该让整项闸门消失，也不该顺手掩盖别的问题）。
+    """
+    value = container.get(key)
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    report.fail(
+        item,
+        f"{key} 应该是对象（{expected}），现在是 {type(value).__name__}：{value!r}",
+    )
+    return {}
+
+
+def _positive_number(value):
+    """把数字字段转成 float；非数字 / 非正数 / NaN / Inf 一律 None（调用方报 ERROR）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < number < float("inf"):
+        return None
+    return number
 
 
 # ===========================================================================
@@ -275,7 +346,12 @@ def _collect_asset_refs():
                 continue
             text = _strip_ts_comments(raw)
             for lineno, line in enumerate(text.splitlines(), start=1):
-                if "staticFile" not in line and "assetUrl" not in line and "src=" not in line:
+                if (
+                    "staticFile" not in line
+                    and "assetUrl" not in line
+                    and "src=" not in line
+                    and not ASSET_PROP_RE.search(line)
+                ):
                     continue
                 # 变量/拼接写法：静态扫不出来，明确提示而不是假装通过
                 if "staticFile(" in line and not ASSET_CALL_RE.search(line):
@@ -347,7 +423,8 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     item = "品牌与字体文件"
     problems = []
 
-    logo = str(((timing.get("brand") or {}).get("logo")) or "").strip()
+    brand = _sub_dict(timing, "brand", report, item, "{name, url, logo, colors}")
+    logo = str(brand.get("logo") or "").strip()
     if logo:
         candidate = PROJECT_ROOT / "public" / logo.lstrip("/")
         if not candidate.is_file():
@@ -360,7 +437,14 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     fonts_cfg, err = _read_json_file(fonts_path)
     roles_checked = 0
     if fonts_cfg is None:
-        report.warn(item, f"读不到 fonts.json（{err}），跳过字体文件检查")
+        if err == JSON_MISSING:
+            report.warn(item, f"读不到 fonts.json（{err}），跳过字体文件检查")
+        else:
+            report.fail(
+                item,
+                f"fonts.json 存在但读不出来（{err}）：这一项不能跳过 —— 角色的字体文件不查，"
+                "等于没查「字体 404 / 回退系统字体」，修好这个文件再重跑",
+            )
         return
     for role in FONT_ROLES:
         role_cfg = (fonts_cfg.get("roles") or {}).get(role) or {}
@@ -406,6 +490,22 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         return
 
     problems = []
+    # 首个场景必须从 0 开始。scenes 首尾相接只保证它们彼此不断开：首场景 start=2 时，
+    # 前面那 2 秒既没有画面也没有字幕（Promo 的 <Sequence> 从 0 开始，场景组件在自己窗口外
+    # return null，屏幕上就是黑的），但下面的 OK 文案会写「0 ~ N 秒」，看起来一切正常
+    # —— 声明的 [0, duration] 覆盖不到开头那段，成片还比 duration 短。
+    try:
+        first_start = float(scenes[0].get("start"))
+    except (TypeError, ValueError):
+        first_start = None
+        problems.append("第一个场景的 start 不是数字（必须从 0 开始）")
+    if first_start is not None and abs(first_start) > 1e-4:
+        problems.append(
+            f"第一个场景「{scenes[0].get('name', '#0')}」start={first_start:g}，不是 0："
+            "片头这几秒是黑屏也没有字幕，成片时长还会比 duration 短。"
+            "把首场景 start 改成 0，并顺移后面的场景"
+        )
+
     previous = None
     for index, scene in enumerate(scenes):
         name = scene.get("name", f"#{index}")
@@ -429,7 +529,12 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         for text in problems:
             report.fail(item, text)
     else:
-        report.ok(item, f"{len(scenes)} 个场景首尾相接（0 ~ {scenes[-1].get('end')} 秒）")
+        # 起点用**实际**算出来的首场景 start（上面的断言保证它 ≈0），不许再写死「0 ~ …」：
+        # 真出现 0 以外的值时，那句话会替坏时间轴打掩护。
+        report.ok(
+            item,
+            f"{len(scenes)} 个场景首尾相接（{first_start:g} ~ {float(scenes[-1].get('end')):g} 秒）",
+        )
 
     # duration == 最后一个场景的 end
     try:
@@ -453,30 +558,46 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         report.ok(item, f"duration={duration:g} 秒 = 最后一个场景的 end")
 
     # 字幕安全区：单行 ≤13 字、最多 2 行（AGENTS.md 阶段 7）
-    captions = timing.get("captions", {}) or {}
-    max_chars = captions.get("maxChars", 13)
-    max_lines = captions.get("maxLines", 2)
+    captions = _sub_dict(timing, "captions", report, item, "{enabled, maxChars, maxLines, bottom}")
+    max_chars = _positive_number(captions.get("maxChars", 13))
+    max_lines = _positive_number(captions.get("maxLines", 2))
+    if max_chars is None:
+        report.fail(
+            item,
+            f"captions.maxChars 必须是正数，现在是 {captions.get('maxChars')!r}："
+            "它是「一行放多少字」的判据，不是数字就没法算容量（默认 13）",
+        )
+        max_chars = 13.0
+    if max_lines is None:
+        report.fail(
+            item,
+            f"captions.maxLines 必须是正数，现在是 {captions.get('maxLines')!r}："
+            "它是「最多几行」的判据，不是数字就没法算容量（默认 2）",
+        )
+        max_lines = 2.0
     too_long = []
-    for line in (timing.get("voice", {}) or {}).get("lines", []) or []:
+    for line in (_obj(timing.get("voice")).get("lines", []) or []):
         if not isinstance(line, dict):
             continue
         text = str(line.get("text", "") or "")
-        if max_chars and len(text) > float(max_chars) * float(max_lines):
+        if len(text) > max_chars * max_lines:
             too_long.append((str(line.get("id", "")), len(text)))
     if too_long:
         detail = "、".join(f"第 {lid} 句 {n} 字" for lid, n in too_long)
         report.warn(
             item,
-            f"这些句子超过字幕容量（{max_lines} 行 × {max_chars} 字）：{detail}。"
+            f"这些句子超过字幕容量（{max_lines:g} 行 × {max_chars:g} 字）：{detail}。"
             "竖屏字幕会挤爆或被迫缩字号，建议拆句或删字",
         )
     else:
-        report.ok(item, f"字幕容量 {max_lines} 行 × {max_chars} 字，所有句子都放得下")
+        report.ok(item, f"字幕容量 {max_lines:g} 行 × {max_chars:g} 字，所有句子都放得下")
 
 
 def check_music_fields(report: Report, timing: dict) -> None:
     item = "配乐字段"
-    music = timing.get("music", {}) or {}
+    # music 的坏输入（字符串/列表/数字）只在这里报一次 ERROR；
+    # 其它消费点（check_audio 等）用 _obj 静默归一，避免同一个字段刷出多条。
+    music = _sub_dict(timing, "music", report, item, "{file, source, offset, beat, bar, drop, gain}")
     problems = []
     for key in ("beat", "bar"):
         try:
@@ -518,13 +639,15 @@ def check_music_fields(report: Report, timing: dict) -> None:
         )
 
 
-def _safe_window(timing: dict, line: dict):
-    """优先用 _common.line_window；它抛错时退回本地等价实现，保证检查不中断。"""
-    try:
-        start, end = line_window(timing, line)
-        return float(start), float(end)
-    except Exception:
-        pass
+_WINDOW_FALLBACKS: list = []
+
+
+def _local_window(timing: dict, line: dict):
+    """本地那份窗口实现（`_common.line_window` 的等价物，独立算一遍用）。
+
+    只在 ``line_window`` 抛错时当兜底用；单独抽成函数是为了让
+    :func:`check_window_consistency` 能拿它跟公共口径逐句比对。
+    """
     start = float(line.get("at", 0.0) or 0.0)
     scenes = [s for s in (timing.get("scenes") or []) if isinstance(s, dict)]
     scene = None
@@ -534,7 +657,7 @@ def _safe_window(timing: dict, line: dict):
             break
     scene_end = float(scene.get("end", start + 8.0)) if scene else start + 8.0
     next_at = None
-    for other in (timing.get("voice", {}) or {}).get("lines", []) or []:
+    for other in _obj(timing.get("voice")).get("lines", []) or []:
         if not isinstance(other, dict):
             continue
         try:
@@ -547,9 +670,81 @@ def _safe_window(timing: dict, line: dict):
     return start, end - 0.15
 
 
+def _safe_window(timing: dict, line: dict):
+    """优先用 _common.line_window；它抛错时退回本地等价实现，保证检查不中断。
+
+    **退回不是静默的**：本地这份实现（下一句按「at 严格更大里最小的那个」取）与
+    ``_common.line_window``（下一步按「按 at 排序后紧跟其后、且 at 严格更大」取）在
+    ``at`` 回跳的时间轴上是两个算法，可能给出不同的窗口。一旦退回就把这条记进
+    ``_WINDOW_FALLBACKS``，收尾由 :func:`check_window_consistency` 打 WARN 说明
+    「本次用的不是公共口径」，避免检查结果看起来正常、其实换了一套口径。
+    """
+    try:
+        start, end = line_window(timing, line)
+        return float(start), float(end)
+    except Exception as exc:
+        _WINDOW_FALLBACKS.append((str(line.get("id", "")).strip() or "?", exc))
+    return _local_window(timing, line)
+
+
+def check_window_consistency(report: Report, timing: dict) -> None:
+    """报出「本轮用过本地窗口实现」这件事，并逐句核对两份实现是否一致。
+
+    ``_common.line_window`` 对同一份 timing 抛错（例如某句 at 已经贴到场景末尾、
+    扣掉 0.15s 尾巴后窗口为空），说明时间轴本身有问题，那是 ``tts.py audit`` 的 ERROR；
+    这里只负责：① 告诉使用者本次检查没有用公共口径；② 把能算出窗口的句子逐句比对，
+    一致就明说一致，不一致就列出差在哪 —— 这正是审计里担心的「两份实现各自漂移」。
+
+    **不能只看 ``_WINDOW_FALLBACKS``**：那个列表只有 ``_safe_window`` 被调用过才会填，
+    而这个检查项跑在 ``check_voice_length`` 之前的话它永远是空的（曾经就是这么错的）。
+    所以这里自己逐句调一次 ``line_window``，有多少句抛错、哪些句不一致，都在本轮现算。
+    """
+    item = "旁白窗口口径"
+    lines = [ln for ln in (_obj(timing.get("voice")).get("lines") or []) if isinstance(ln, dict)]
+    if not lines:
+        return
+
+    failed: list = []
+    mismatched: list = []
+    checked = 0
+    for line in lines:
+        line_id = str(line.get("id", "")).strip() or "?"
+        try:
+            want = line_window(timing, line)
+        except Exception as exc:  # 这一句公共口径算不出来 → 检查里走的是本地兜底
+            failed.append((line_id, exc))
+            continue
+        try:
+            got = _local_window(timing, line)
+        except Exception:
+            continue
+        checked += 1
+        if abs(want[0] - got[0]) > 1e-6 or abs(want[1] - got[1]) > 1e-6:
+            mismatched.append(
+                "%s: 公共口径 %.3f~%.3f vs 本地 %.3f~%.3f"
+                % (line_id, want[0], want[1], got[0], got[1])
+            )
+
+    if failed:
+        ids = "、".join(lid for lid, _ in failed)
+        report.warn(
+            item,
+            f"{len(failed)} 句（{ids}）的窗口取不到 _common.line_window 的值，"
+            "本次检查里这些句子用的是脚本内的等价实现；"
+            "那些句子本身需要按 tts.py audit 的报错改 timing.json",
+        )
+    if mismatched:
+        report.warn(item, "两份窗口实现结果不一致：" + "；".join(mismatched))
+    elif checked:
+        report.ok(item, f"能算出窗口的 {checked} 句里，本地实现与 _common.line_window 完全一致")
+
+
 def check_voice_lines(report: Report, timing: dict) -> None:
     item = "旁白时间窗"
-    lines = [line for line in ((timing.get("voice", {}) or {}).get("lines") or []) if isinstance(line, dict)]
+    # voice 的坏输入（字符串/列表/数字）只在这一个检查项里报 ERROR；
+    # 其余消费点用 _obj 静默归一，避免同一个字段刷出好几条 ERROR。
+    voice = _sub_dict(timing, "voice", report, item, "{engine, voice, rate, lines}")
+    lines = [line for line in (voice.get("lines") or []) if isinstance(line, dict)]
     if not lines:
         report.warn(item, "voice.lines 是空的：片子里没有任何旁白（确认这是有意为之）")
         return
@@ -592,10 +787,11 @@ def check_voice_lines(report: Report, timing: dict) -> None:
 
 def check_voice_length(report: Report, timing: dict) -> None:
     item = "旁白字数"
-    lines = [line for line in ((timing.get("voice", {}) or {}).get("lines") or []) if isinstance(line, dict)]
+    lines = [line for line in (_obj(timing.get("voice")).get("lines") or []) if isinstance(line, dict)]
     if not lines:
         return
     over = []
+    bad_window = []
     for line in lines:
         line_id = str(line.get("id", "")).strip() or "?"
         text = str(line.get("text", "") or "")
@@ -605,11 +801,22 @@ def check_voice_length(report: Report, timing: dict) -> None:
             continue
         window = end - start
         if window <= 0:
+            # 窗口非法 = at 排到了场景结束之后、或和下一句挤在一起。
+            # tts.py audit 对这种情况是 ERROR；这里至少要说一句，别静默跳过（静默跳过
+            # 会让「窗口算不出来」看起来像「这句没问题」）。
+            bad_window.append((line_id, start, end))
             continue
         budget = CHARS_PER_SEC * window
         if len(text) > budget:
             cut = int(round(len(text) - budget + 0.49))
             over.append((line_id, len(text), window, max(1, cut)))
+    for line_id, start, end in bad_window:
+        report.warn(
+            item,
+            f"第 {line_id} 句的旁白窗口不合法（{start:.2f}s~{end:.2f}s，长度 {end - start:.2f}s）："
+            "at 排到了场景结束之后，或者和下一句挤在一起。字数检查没法按这个窗口算，"
+            "请按 `python scripts/tts.py audit` 的报错改 timing.json",
+        )
     if over:
         for line_id, count, window, cut in over:
             report.warn(
@@ -619,7 +826,9 @@ def check_voice_length(report: Report, timing: dict) -> None:
                 "AGENTS.md 阶段 7：字数超窗口必须改稿，不许靠加速硬压",
             )
     else:
-        report.ok(item, f"{len(lines)} 句都在 {CHARS_PER_SEC} 字/秒的预算内")
+        checked = len(lines) - len(bad_window)
+        if checked > 0:
+            report.ok(item, f"{checked} 句都在 {CHARS_PER_SEC} 字/秒的预算内")
 
 
 # ===========================================================================
@@ -712,6 +921,114 @@ def check_asset_quota(report: Report, timing: dict) -> None:
         report.ok(item, f"public/img/ 有 {len(files)} 张图片（片长 {duration:g}s 要求 ≥{required}）")
 
 
+def _scene_files(timing: dict):
+    """把 timing.json 的 scenes[].name 映到 src/scenes/<Name>.tsx（大小写不敏感）。
+
+    AGENTS.md 阶段 6 的约定是「一个场景 = 一个组件」，模板里是 hook → Hook.tsx。
+    名字在 src/scenes/ 下找不到对应文件就跳过 —— 不猜（宁可不查，也不误报）。
+    """
+    directory = PROJECT_ROOT / "src" / "scenes"
+    if not directory.is_dir():
+        return []
+    by_stem = {path.stem.casefold(): path for path in sorted(directory.glob("*.tsx"))}
+    mapping = []
+    for scene in (timing.get("scenes") or []):
+        if not isinstance(scene, dict):
+            continue
+        name = str(scene.get("name", "") or "").strip()
+        path = by_stem.get(name.casefold())
+        if path is not None:
+            mapping.append((name, path))
+    return mapping
+
+
+def _inspect_scene_file(path: Path):
+    """→ (场景引用的 public/ 图片集合, 有没有静态扫不出来的动态引用, 有没有用素材容器组件)。"""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set(), True, False  # 读不出来：按"有动态引用"处理，不对这一段下结论
+    text = _strip_ts_comments(raw)
+    dynamic = bool(DYNAMIC_ASSET_RE.search(text))
+    material = any(re.search(r"\b%s\b" % component, text) for component in MATERIAL_COMPONENTS)
+    refs = set()
+    for _quote, value in SCENE_LITERAL_RE.findall(text):
+        candidate = value.strip().replace("\\", "/")
+        if candidate.lower().endswith(IMAGE_SUFFIXES) and _looks_like_public_asset(candidate):
+            refs.add(candidate.lstrip("/"))
+    return refs, dynamic, material
+
+
+def check_scene_assets(report: Report, timing: dict) -> None:
+    """按场景分段核验真实素材（AGENTS.md 阶段 4 的硬性配额）。
+
+    总数配额（check_asset_quota）只说明"素材够不够"，说明不了"这一段有没有素材"：
+    6 张图全塞进 proof、用了 PhoneFrame 的 demo 一张都没引用时，以前照样 0 ERROR / 0 WARN。
+    这里按「一个场景 = 一个组件」把引用分组，逐段判「每个功能段落 ≥1 张真实截图」，
+    并核「有一段 ≥6 张真实作品（快切蒙太奇）」。
+
+    只对静态能证明的部分下结论：场景里出现变量拼路径（``src={…}`` 或模板字符串）时，
+    那一段的计数标为"扫不出来"、不下断言；全片总数不达标时也不重复报（那是
+    :func:`check_asset_quota` 的 WARN）。
+    """
+    item = "分段素材"
+    scenes = _scene_files(timing)
+    if not scenes:
+        return
+
+    files = _image_files(PROJECT_ROOT / "public" / "img")
+    try:
+        duration = float(timing.get("duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    required = IMG_MIN_COUNT_SHORT if duration <= SHORT_FILM_S else IMG_MIN_COUNT_LONG
+    if len(files) < required:
+        # 总数就不够：check_asset_quota 已经报了 WARN，这里不再把同一件事说第二遍。
+        return
+
+    counts = []
+    empty_segments = []
+    dynamic_segments = []
+    for name, path in scenes:
+        refs, dynamic, material = _inspect_scene_file(path)
+        counts.append((name, len(refs), material, dynamic))
+        if dynamic:
+            dynamic_segments.append(name)
+        elif material and not refs:
+            empty_segments.append(name)
+
+    detail = "、".join(f"{name} {count} 张" for name, count, _m, _d in counts)
+    montage = max((count for _n, count, _m, _d in counts), default=0)
+
+    if empty_segments:
+        report.warn(
+            item,
+            f"这些功能段落一张真实截图都没引用：{'、'.join(empty_segments)}（分段计数：{detail}）。"
+            "AGENTS.md 阶段 4 的硬性配额是「每个功能段落至少 1 张真实截图」——"
+            "全片总数够了不代表每一段都有素材，请给这些场景补 capture.py --factor 2 的真实截图",
+        )
+    if montage < MONTAGE_MIN:
+        hint = ""
+        if dynamic_segments:
+            hint = (
+                f"（{'、'.join(dynamic_segments)} 用变量拼路径，静态扫不出来 —— "
+                "如果那一段就是把 ≥6 张作品拼起来的蒙太奇，请人工确认）"
+            )
+        report.warn(
+            item,
+            f"没有任何一个场景静态可见 ≥{MONTAGE_MIN} 张真实作品图（分段计数：{detail}）。"
+            "AGENTS.md 阶段 4 要求必须有一段由 ≥6 张真实作品组成的快切蒙太奇" + hint,
+        )
+    if not empty_segments and montage >= MONTAGE_MIN:
+        note = ""
+        if dynamic_segments:
+            note = (
+                f"；{'、'.join(dynamic_segments)} 用变量拼路径"
+                "，那一段的素材数静态扫不出来（未下结论）"
+            )
+        report.ok(item, f"按场景分段统计：{detail}；每个功能段落都有真实截图{note}")
+
+
 # ===========================================================================
 # 4. 字体缺字
 # ===========================================================================
@@ -722,12 +1039,12 @@ def _collect_texts(timing: dict):
     title = timing.get("title")
     if title:
         texts.append(("title", str(title)))
-    brand = timing.get("brand", {}) or {}
+    brand = _obj(timing.get("brand"))
     if brand.get("name"):
         texts.append(("brand.name", str(brand["name"])))
     if brand.get("url"):
         texts.append(("brand.url", str(brand["url"])))
-    for line in ((timing.get("voice", {}) or {}).get("lines") or []):
+    for line in (_obj(timing.get("voice")).get("lines") or []):
         if isinstance(line, dict) and line.get("text"):
             texts.append((f"voice.lines[{line.get('id')}].text", str(line["text"])))
     for scene in ((timing.get("scenes") or [])):
@@ -741,7 +1058,14 @@ def check_fonts(report: Report, timing: dict) -> None:
     fonts_path = PROJECT_ROOT / "fonts.json"
     fonts_cfg, err = _read_json_file(fonts_path)
     if fonts_cfg is None:
-        report.warn(item, f"读不到 fonts.json（{err}），跳过缺字检查")
+        if err == JSON_MISSING:
+            report.warn(item, f"读不到 fonts.json（{err}），跳过缺字检查")
+        else:
+            report.fail(
+                item,
+                f"fonts.json 存在但读不出来（{err}）：缺字检查不能跳过 —— "
+                "一个坏文件不该让整项闸门悄悄消失，修好它再重跑",
+            )
         return
 
     check_cfg = fonts_cfg.get("check", {}) or {}
@@ -840,7 +1164,7 @@ def check_fonts(report: Report, timing: dict) -> None:
 # ===========================================================================
 
 def check_audio(report: Report, timing: dict) -> None:
-    music = timing.get("music", {}) or {}
+    music = _obj(timing.get("music"))
     declared = str(music.get("file", "") or "").strip()
     if not declared:
         report.fail(
@@ -859,7 +1183,7 @@ def check_audio(report: Report, timing: dict) -> None:
         else:
             report.ok("混音文件", f"{_rel(mix_path)}（{human(mix_path.stat().st_size)}）")
 
-    lines = [line for line in ((timing.get("voice", {}) or {}).get("lines") or []) if isinstance(line, dict)]
+    lines = [line for line in (_obj(timing.get("voice")).get("lines") or []) if isinstance(line, dict)]
     vo_dir = PROJECT_ROOT / "audio-src" / "vo"
     missing = []
     for line in lines:
@@ -901,6 +1225,9 @@ def main(argv=None) -> int:
     report = Report(strict=args.strict)
     log(f"渲染前检查：{PROJECT_ROOT}")
     log("")
+    # 模块级兜底表要按「本轮」清零：同一进程里再调一次 main() 时，
+    # 上一轮的行号不能跟着冒出来（否则会出现指向旧输入的幽灵告警）。
+    _WINDOW_FALLBACKS.clear()
 
     timing = load_timing()
 
@@ -910,8 +1237,12 @@ def main(argv=None) -> int:
     check_music_fields(report, timing)
     check_voice_lines(report, timing)
     check_voice_length(report, timing)
+    # 放在 check_voice_length 之后：那个检查项会（在兜底时）填 _WINDOW_FALLBACKS，
+    # 这里的 WARN 才能反映真实用例。不过本函数也不依赖那张表 —— 它自己逐句现算。
+    check_window_consistency(report, timing)
     check_images(report, timing)
     check_asset_quota(report, timing)
+    check_scene_assets(report, timing)
     check_fonts(report, timing)
     check_audio(report, timing)
 

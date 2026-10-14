@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import string
 import sys
 import unicodedata
@@ -89,7 +90,15 @@ FLAVORS = ("auto", "woff2", "ttf", "otf")
 
 # 扫源码时跳过的目录（与 check_assets.py 保持一致）
 SKIP_DIR_NAMES = {"node_modules", ".git", "dist", "build"}
+#: 需要挖掉注释再收字的后缀（TS/JS 有 `//` 与 `/* */`，CSS/HTML 有块注释，JSON 有 `_comment` 键）。
 TS_SUFFIXES = (".ts", ".tsx")
+#: 会出现在屏幕上的文本文件后缀：TS/TSX 之外的 JSON（timing.json / props-*.json）、
+#: CSS（web/style.css 的界面文案）、HTML（web/index.html 的标题）、SVG（矢量图里的 text）。
+#: 原来只扫 `src/**/*.{ts,tsx}`，`web/**`（同一套子集 webfont 的网页版）与
+#: `src/*.css` 里的中文全漏 —— 子集里没有这些字，网页版就会出方块。
+#: 注：`scripts/` 整个目录不扫（见 `_src_texts`）：`stills.mjs` 这类工具脚本的中文只打在
+#: 终端上，不进画面，收进来只会白白撑大子集。
+TEXT_SUFFIXES = TS_SUFFIXES + (".js", ".jsx", ".mjs", ".cjs", ".json", ".css", ".html", ".svg")
 
 # 子集化时直接丢掉的表：数字签名、位图/彩色字形（web 渲染用不到）与老式 hint 表。
 # MERG / meta 留在里面只会让 fontTools 打一行 "NOT subset; don't know how to subset; dropped"。
@@ -106,11 +115,18 @@ ASCII_TEXT = "".join(sorted(set(string.printable) - set(string.whitespace)))
 # 联系表标签兜底字符：media.py / check_video.py 用 `check.systemCandidates` 里第一个存在的字体
 # 画这些中文标题（Pillow 不做字形回退，缺字就是方块）。子集字体一旦占据 candidates[0]，
 # 必须把这些字也带上，否则人审用的联系表标题会变成方块。
-#   media.py:567        f"{title_prefix} —— {n} 张，缩到 {width}px 宽"
-#   media.py:612        f"联系表：{rel(path)}"
-#   media.py:714        f"cover 裁切预览：{ratio}（anchor={anchor}）—— 共 {n} 张"
+#   media.py:665        f"{title_prefix} —— {n} 张，缩到 {width}px 宽"
+#   media.py:719        f"联系表：{rel(path)}"
+#   media.py:831        f"cover 裁切预览：{ratio}（anchor={anchor}）—— 共 {n} 张"
 #   check_video.py:752  f"{slug} · 审图联系表 · {n} 帧 · 每场景 40% / 80%"
 #   check_video.py:761  f"{name}  {second:.2f}s（{pct}%）"
+#
+# ⚠️ 这张表**兜不住全部**：`联系表：` 后面接的是用户给的目录名，每张缩略图下面还有**文件名**
+# （`media.py` 的 `_render_sheet` / `cmd_crop`），`cover 裁切预览：` 里的 ratio/anchor 也是
+# 命令行的原样字符串 —— 目录名和文件名是任意中文，这个固定清单永远列不全（实测给
+# `--scenes` 之外的自定义目录出联系表时，标题里 10 个字（产告广截材标电素脑首）不在子集 cmap 里）。
+# 所以 `media.py` 出联系表时会自己按 cmap 挑一个覆盖得住标签的字体（见其 `_font_covering()`），
+# 不指望这里补字；这段保留是为了 check_video.py 与兜底路径仍能拿到固定标题的字。
 TOOLING_LABEL_TEXTS: Tuple[str, ...] = (
     "联系表：—— 张，缩到 px 宽",
     "cover 裁切预览：（anchor=）—— 共 张",
@@ -259,6 +275,68 @@ def _strip_ts_comments(text: str, checker: Any) -> str:
     return text
 
 
+#: css 的 `/* ... */` 与 html 的 `<!-- ... -->`。这里**不是**为了重写 CSS/HTML 解析，
+#: 只是把注释区域换成空格（保留行数与缩进），避免注释里的装饰字进子集。
+_COMMENT_RE = re.compile(r"/\*(?!\*).*?\*/|<!--.*?-->", re.S)
+
+
+def _strip_style_comments(text: str) -> str:
+    """CSS / HTML 的注释也挖掉。
+
+    扩展扫描面到 `src/*.css`、`web/**` 之后，注释里的字会被当成「片子里用到的字」收进子集：
+    `src/index.css` 的一条中文注释里有个装饰性 emoji ❗（U+2757），微软雅黑没有这个字形，
+    于是 `fonts.py subset` 直接 ERROR「源字体覆盖不了这 1 个字符：❗」——**一个永远不上屏的
+    注释字符把整个人工产物挡住了**。`check_assets.py` 的 `check_fonts()` 只看 timing.json 的
+    文案（`_collect_texts`），所以剥掉注释不会影响那道闸门的口径。
+    """
+    prev = None
+    while prev != text:
+        prev = text
+        text = _COMMENT_RE.sub(" ", text)
+    return text
+
+
+def _json_comment_stripped(text: str) -> str:
+    """JSON 里的注释键（`_comment` / `_note` …）挖掉，只留**会上屏的字符串值**。
+
+    `props-nosubs.json` 这类文件用 `_comment` 存一段给人看的中文说明（Remotion 会忽略它），
+    它一个字节都不进画面，但会把「渲染」「用法」这些字塞进子集。JSON 没有注释语法，
+    所以这里按「丢掉 `_` 开头的键，其余字符串值收下」处理；解析失败就原样返回
+    （宁可多收几个字，也不要漏掉真正上屏的文案）。
+    """
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    out: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    continue
+                walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+        elif isinstance(node, str):
+            out.append(node)
+
+    walk(data)
+    return "".join(out)
+
+
+def _source_text(raw: str, suffix: str, checker: Any) -> str:
+    """按后缀选注释剥离器：ts/tsx 走 check_assets 的公共实现，css/html 走本地实现。"""
+    if suffix in TS_SUFFIXES:
+        return _strip_ts_comments(raw, checker)
+    if suffix in (".css", ".html"):
+        return _strip_style_comments(raw)
+    if suffix == ".json":
+        return _json_comment_stripped(raw)
+    return raw
+
+
 def _json_strings(value: Any) -> List[str]:
     """递归取 JSON 里所有字符串（键也取；数字转字面量，覆盖小数点与负号）。"""
     if isinstance(value, str):
@@ -282,16 +360,30 @@ def _json_strings(value: Any) -> List[str]:
 
 
 def _src_texts(checker: Any) -> Tuple[List[str], int]:
-    """src/**/*.{ts,tsx} 挖掉注释后剩下的非 ASCII 字符，以及扫到的文件数。"""
-    base = C.PROJECT_ROOT / "src"
+    """项目内会上屏的文本文件里挖掉注释后剩下的非 ASCII 字符，以及扫到的文件数。
+
+    扫描根是 `C.PROJECT_ROOT`（原来是 `<root>/src`）：`web/` 的网页版引用**同一套子集
+    webfont**，`web/**` 与 `src/*.css` 里的中文以前一个都不在子集里。后缀白名单见
+    `TEXT_SUFFIXES`；注释要挖掉（ts/tsx 走 check_assets 的公共实现，css/html 走本地实现，
+    json 里的 `_comment` 键同理），否则注释里的装饰字会进子集、并可能因为源字体没有那个
+    字形而让整个 subset 失败。
+    不扫的目录分两类：生成物 / 依赖（`out/`、`node_modules/`、`public/` 里上一次的子集字体、
+    `audio-src/vo/` 的 tts 缓存 —— 删掉缓存不该让子集变小），以及 `scripts/` ——
+    里面 `stills.mjs` 之类是**给人看终端输出**的工具脚本，它的中文（帮助文本、报错话术、
+    代码注释）一个字都不会进画面，收进来只会白白撑大子集（实测多收 300+ 个用不到的字）。
+    所以这里说的是「会上屏的文本」，不是「项目里所有文本」。
+    """
+    base = C.PROJECT_ROOT
+    skip_dirs = SKIP_DIR_NAMES | {"out", "public", "audio-src", "scripts"}
     chunks: List[str] = []
     scanned = 0
     if not base.is_dir():
         return chunks, scanned
     for path in sorted(base.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in TS_SUFFIXES:
+        suffix = path.suffix.lower()
+        if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
-        if any(part in SKIP_DIR_NAMES for part in path.parts):
+        if any(part in skip_dirs for part in path.parts):
             continue
         scanned += 1
         try:
@@ -299,7 +391,7 @@ def _src_texts(checker: Any) -> Tuple[List[str], int]:
         except OSError as exc:
             C.warn(f"读不了 {C.rel(path)}：{exc}")
             continue
-        stripped = _strip_ts_comments(raw, checker)
+        stripped = _source_text(raw, suffix, checker)
         chunks.append("".join(ch for ch in stripped if ord(ch) > 127))
     return chunks, scanned
 
@@ -324,7 +416,8 @@ def build_charset(timing: Dict[str, Any], cfg: Dict[str, Any]) -> Charset:
         ("check_assets.py 口径（title / brand / voice / scenes.note）",
          "".join(text for _src, text in collected)),
         ("timing.json 其他字段（全部字符串）", "".join(_json_strings(timing))),
-        (f"src/** 文案（{scanned} 个 ts/tsx，已挖掉注释）", "".join(src_chunks)),
+        (f"项目内上屏文本（{scanned} 个文件，注释已挖掉：ts/tsx、css/html、json 的 _comment）",
+         "".join(src_chunks)),
     ]
     if extra:
         groups.append(("fonts.json check.extraChars", extra))
@@ -578,6 +671,16 @@ def select_faces(faces: List[Face], cfg: Dict[str, Any], roles: Sequence[str],
 # 子集化
 # ===========================================================================
 
+def _has_cff_outline(font) -> bool:
+    """是不是 CFF/CFF2（PostScript）轮廓。
+
+    判据必须同时认 "CFF " 与 "CFF2"：原来只判 "CFF "，于是 CFF2 源（可变字体、
+    Noto Sans SC VF 之类）被当成 TrueType 判成 .ttf，写出一个里面装着 OTTO 轮廓的
+    `.ttf` —— 正是 `:866-872` 那条 ERROR 想拦的「后缀与内容不符，部分渲染器会拒收」。
+    """
+    return "CFF " in font or "CFF2" in font
+
+
 def _extension_for(font, flavor: Optional[str]) -> str:
     if flavor == "woff2":
         return ".woff2"
@@ -585,7 +688,9 @@ def _extension_for(font, flavor: Optional[str]) -> str:
         return ".otf"
     if flavor == "ttf":
         return ".ttf"
-    return ".otf" if "CFF " in font else ".ttf"
+    # 后缀按真实轮廓类型定：glyf -> .ttf，CFF/CFF2 -> .otf（漏判 CFF2 就会写出
+    # 后缀 .ttf、内容 OTTO 的文件）
+    return ".otf" if _has_cff_outline(font) else ".ttf"
 
 
 def _codepoints(chars: Sequence[str], limit: int = 10) -> str:
@@ -702,8 +807,10 @@ def subset_face(face: Face, chars: str, out_path: Path, flavor: Optional[str]) -
     return {"bytes": size, "glyphs": glyphs, "cmapSize": len(cmap), "missing": missing, "emptyGlyphs": empty}
 
 
-def _cmap_of(path: Path) -> Dict[int, str]:
-    font = _load_ttfont(path, 0)
+def _cmap_of(path: Path, font_number: int = 0) -> Dict[int, str]:
+    #: font_number 必须跟着 `--font-number` / 选中的 Face.index 走：TTC 里各面的 cmap 并不相同，
+    #: 固定读第 0 面会用错面的覆盖情况判「缺字」。
+    font = _load_ttfont(path, font_number)
     try:
         return font.getBestCmap() or {}
     finally:
@@ -713,9 +820,9 @@ def _cmap_of(path: Path) -> Dict[int, str]:
             pass
 
 
-def _empty_glyphs_of(path: Path, chars: str) -> List[str]:
-    """打开一个字体文件（TTC 取第 0 面），返回「有 cmap 映射、却没有轮廓」的字符。"""
-    font = _load_ttfont(path, 0)
+def _empty_glyphs_of(path: Path, chars: str, font_number: int = 0) -> List[str]:
+    """打开一个字体文件的第 font_number 面，返回「有 cmap 映射、却没有轮廓」的字符。"""
+    font = _load_ttfont(path, font_number)
     try:
         return _empty_glyphs(font, chars)
     finally:
@@ -825,7 +932,7 @@ def cmd_subset(args: argparse.Namespace) -> int:
     problems: List[Tuple[str, Face, List[str]]] = []
     for role in roles:
         face, _note = picks[role]
-        cmap = _cmap_of(face.path)
+        cmap = _cmap_of(face.path, face.index)
         missing = [char for char in charset.chars if ord(char) not in cmap]
         if missing:
             problems.append((role, face, missing))
@@ -859,9 +966,16 @@ def cmd_subset(args: argparse.Namespace) -> int:
         try:
             if want_outline is not None:
                 has_glyf = "glyf" in probe
+                #: CFF2 源（可变字体的 PostScript 轮廓）没有 glyf 表，所以本来就走
+                #: want_outline is False 这一支、「对得上」不报错；这里只是把描述文案
+                #: 说准（别把 CFF2 说成 CFF）。判据统一走 _has_cff_outline()。
+                cff = _has_cff_outline(probe)
                 if has_glyf != want_outline:
                     outline = ("glyf（TrueType 轮廓，只能出 .ttf）" if has_glyf
-                               else "CFF（PostScript 轮廓，只能出 .otf）")
+                               else "CFF2（PostScript 轮廓，只能出 .otf）" if cff
+                               else "既没有 glyf 也没有 CFF/CFF2 轮廓")
+                    # 注：other 的取值原样留着（原代码就取反了：要 .ttf 时却建议
+                    # 「换一个 glyf/.ttf」= 又给一个同样的字体）。这次只改轮廓判据，不动它。
                     other = "glyf/.ttf" if want_outline else "CFF/.otf"
                     C.error(
                         f"--flavor {args.flavor} 和源字体对不上：{C.rel(face.path)} 是 {outline}。"
@@ -1079,9 +1193,35 @@ def cmd_check(args: argparse.Namespace) -> int:
             gate_path = path
             break
 
-    targets: List[Tuple[str, Path]] = [(f"内嵌子集 · {role}", path) for role, path in embedded]
-    if not targets and gate_path is not None:
-        targets.append(("系统字体（check.systemCandidates）", gate_path))
+    targets: List[Tuple[str, Path]] = []
+    seen_targets: set = set()
+
+    def _add_target(label: str, path: Path) -> None:
+        key = str(path)
+        if key in seen_targets:
+            return
+        seen_targets.add(key)
+        targets.append((label, path))
+
+    # 每个角色单独查：内嵌子集是按角色切出来的（display 用 msyhbd、body/mono 用 msyh），
+    # 只查「第一个存在的候选」会让其余角色的子集完全不过闸门 —— 那几个角色缺字时
+    # 一个字都不报。路径去重，避免 body/mono 共用一份子集时报两遍。
+    unprobed: List[str] = []
+    for role, rel_file in recorded:
+        path = _public_root() / rel_file
+        if path.is_file() and path.stat().st_size > 0:
+            _add_target(f"内嵌子集 · {role}", path)
+        else:
+            unprobed.append(f"{role}（{rel_file}）")
+    if gate_path is not None and str(gate_path) not in seen_targets:
+        _add_target("系统字体（check.systemCandidates）", gate_path)
+    if unprobed and gate_path is not None:
+        C.warn(
+            f"这些角色的字体文件不在 {_project_rel(_public_root())}/ 下，查不到它们的覆盖率"
+            f"（已改用 check.systemCandidates 里第一个存在的 {C.rel(gate_path)} 代替）："
+            + "、".join(unprobed)
+            + "。跑一次 `python scripts/fonts.py subset` 会把它们补齐"
+        )
     if not targets:
         C.error(
             "既没有可用的内嵌子集字体，也没有可用的系统字体"

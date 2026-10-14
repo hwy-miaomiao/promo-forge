@@ -331,8 +331,10 @@ def run(
     """跑一条外部命令。
 
     check=True（默认）：命令不存在 / 超时 / 退出码非 0 -> 打印 ERROR 并 exit(1)。
-    check=False：命令不存在 -> 抛 FileNotFoundError；失败 -> 原样返回 CompletedProcess。
+    check=False：命令不存在 -> 抛 FileNotFoundError；失败 -> 原样返回 CompletedProcess；
+        超时 -> 抛 subprocess.TimeoutExpired（调用方自己接住，别让裸异常漏到终端）。
     capture=True（默认）：stdout/stderr 收进返回值（UTF-8 解码，坏字节替换）；False 则直接透传到终端。
+    timeout：秒；不传 = 不限制时长。
     """
     argv = [str(c) for c in cmd]
     if not argv:

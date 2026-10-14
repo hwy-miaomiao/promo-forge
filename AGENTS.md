@@ -133,7 +133,10 @@ python scripts/fonts.py check      # 确认 0 缺字；改了文案或加了场�
 
 - 免费路线：从免费可商用曲库取 1~3 首候选放进 `audio-src/music/`，用 `music.py analyze/grid/bars` 分析出
   BPM、beat、bar、downbeat、drop 和逐小节能量；写回 `timing.json` 的 `music.beat/bar/drop/offset`。
-- 音乐与画面必须对齐到 beat 或 bar：`musicOffset = drop - downbeat`（**爆发时刻 − 重拍时刻**；正负号含义与三种典型情形见 `references/配乐与卡点.md`）。
+- 音乐与画面必须对齐到 beat 或 bar：**`offset = drop − downbeat_abs`，其中 `downbeat_abs = --from + downbeat`**
+  （**爆发时刻 − 重拍时刻**；`music.py grid` 报的 `downbeat` 是**相对分析区间起点**的，`--from 0` 时两者相同，
+  用 `--from` 截过一段就必须加回去，否则写回 `timing.json` 的 offset 会整整差一个 `--from`；
+  正负号含义与三种典型情形见 `references/配乐与卡点.md`）。
 - **硬性要求：全片 ≥2 次能量爆发；最晚在第 4 秒完成第一次爆发；节拍一致性 ≥0.9；候选统一到 -14 LUFS 后再给用户试听。**
 - 试听必须交给用户：把候选剪成同样的 15 秒片段，叠上人声给用户听，让他选（AI 听不到声音，禁止自己拍板）。
 
@@ -206,6 +209,11 @@ python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预
 - **`check_assets.py` 与 `check_video.py` 必须 0 ERROR 才算通过**；WARN 要逐条说明为什么不影响交付。
 - 抽帧联系表**必须逐张看过**，对照 `references/校验清单.md` 的审图项打勾（构图、字幕安全区、截图清晰度、品牌名拼写）。
 - 渲染日志里出现 `cannot be decoded` / `Error:` / `failed to load` 一律按失败处理，即使渲染"成功结束"。
+  另有 9 条**强失败信号**同享此判据，而且**优先于**「`0 errors` 自称零错误」的豁免（汇总行会跟真错误写在同一行）：
+  `Unhandled exception` / `Command failed with exit code N`、`exited with code N`、`exit status N` /
+  `Segmentation fault`、`core dumped` / `MODULE_NOT_FOUND`、`Cannot find module`、`Unable to resolve module`（依赖或路径真找不到）/
+  `Invalid data found when processing input`、`Could not find codec parameters`（ffmpeg 读不了输入）/
+  `chrome-headless-shell` 非零退出。判据实现见 `template/scripts/check_video.py` 的 `_RX_LOG_STRONG`。
 
 ### 阶段 10 · 渲染与交付
 
@@ -274,6 +282,13 @@ python scripts/deliver.py cover out/final-1080p.mp4 --title "每天记账要花�
 
 竖屏安全区（相对画面高宽）：上 10%、下 18%、左 6%、右 14%（右侧留给平台互动按钮）。
 
+**`timing.json` 的 `pace` 与上面这两张表的关系**：数值必须一致，但职责不同 ——
+`pace.stagger`（0.25s）是**唯一被场景代码读走**的一项（`stagger(i, TIMING.pace.stagger)` 驱动"元素逐个出现"）；
+`pace.minShot / keyShot / sceneMin / holdAfterReveal` 是**给人（和 AI）看的约束**：它们描述"镜头 / 焦点 / 场景"级别的判断，
+渲染路径里没有消费者，也没有自动闸门会判 —— 写场景时照着做，验收靠阶段 9 的抽帧审图与 `references/校验清单.md`。
+**不要为了让这些字段"有人读"而把它们接进动画**（那等于把审美判断伪装成机械判定），也**不要单独删掉那些字段**：
+删字段必须连 `src/lib/timing.ts` 的 `Pace` 类型一起改，否则类型与数据对不上。
+
 ## 5. `src/timing.json` 字段契约（**整支片子唯一事实来源**）
 
 TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music / check_*）**都读这一个文件**，
@@ -326,7 +341,12 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
 
 ## 6. 技术栈与脚本速查
 
-Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。模板依赖：Remotion 4 + React 19 + Vite（网页播放版）；不引入 Tailwind、GSAP 等额外框架，画面用内联样式 + 少量全局 CSS。
+Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnpm ≥10.4**（模板默认，`template/package.json` 的
+`packageManager` 声明了期望版本 `pnpm@11.7.0`）：`pnpm-workspace.yaml` 的 `allowBuilds` 是 pnpm 10.4 才有的配置项，
+更老的 pnpm 认不出它 → esbuild 的构建脚本被跳过 → 装依赖时看不出来、`remotion render` 那天才炸
+（`esbuild: Failed to install correctly`）；`doctor.py` 会把这行拦下来（低于 10.4 判 MISSING）。
+没装 pnpm 可以 `npm install` 兜底（`doctor.py` 只报 WARN），但 npm 不认 `allowBuilds`，esbuild 需要手动确认。
+模板依赖：Remotion 4 + React 19 + Vite（网页播放版）；不引入 Tailwind、GSAP 等额外框架，画面用内联样式 + 少量全局 CSS。
 
 | 脚本 | 用途 | 关键参数 |
 | --- | --- | --- |

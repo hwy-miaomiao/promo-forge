@@ -68,8 +68,19 @@ export const PhoneFrame: React.FC<PhoneFrameProps> = ({
         position: "relative",
         borderRadius: frameRadius ? `${frameRadius}px` : "12%",
         background: bodyColor,
-        // 两层阴影：外阴影把手机"抬起来"，内阴影模拟机身与屏幕的接缝
-        boxShadow: `0 2.4% 6% ${alpha("#000000", 0.55)}, inset 0 0 0 0.5% ${alpha(PALETTE.fg, 0.12)}`,
+        // ❗机身是"按宽度算比例"的容器：里面的状态栏字号必须用容器查询单位（cqw），
+        // 不能用百分比 —— CSS 的百分比 font-size 是相对**父元素 font-size**（默认 16px），
+        // `3.6%` 只有 0.576px：浏览器把文本钳到最小 6px、而 em 子元素（信号柱/电池）
+        // 仍按 0.576px 解析，实测整条状态栏不可见（1080 画布上「9:41」只有 6px 高、
+        // 信号柱 0.078px 宽）。声明成 inline-size 容器后，里面的 3.6cqw = 机身内容宽的 3.6%。
+        containerType: "inline-size",
+        // 两层阴影：外阴影把手机"抬起来"，内阴影模拟机身与屏幕的接缝。
+        // ❗box-shadow 的偏移/模糊/扩散只能吃 <length>：写百分比（原来的 `0 2.4% 6% …
+        //   inset 0 0 0 0.5%`）是非法值，**整条声明**（包含合法的内阴影）会被浏览器丢掉 ——
+        //   实测 getComputedStyle().boxShadow === "none"，机身完全没有抬起感。
+        //   改 px：Remotion 的 --scale 整体缩放栅格，px 在 1080 与 4K 下比例一致；
+        //   10px / 24px / 2px ≈ 旧写法在机身宽 397px 时的 2.4% / 6% / 0.5%。
+        boxShadow: `0 10px 24px ${alpha("#000000", 0.55)}, inset 0 0 0 2px ${alpha(PALETTE.fg, 0.12)}`,
         padding: "2.2%",
         boxSizing: "border-box",
         // ❗机身高度由 aspect-ratio 决定，**不许被父级 flex 压扁**。
@@ -124,7 +135,9 @@ export const PhoneFrame: React.FC<PhoneFrameProps> = ({
               justifyContent: "space-between",
               alignItems: "center",
               color: PALETTE.fg,
-              fontSize: "3.6%",
+              // 机身内容宽的 3.6%（机身 397px 时约 13.7px）：容器查询单位，
+              // 为什么不能用百分比见机身 style 里的说明。
+              fontSize: "3.6cqw",
               fontWeight: 700,
               letterSpacing: "0.02em",
               mixBlendMode: "difference", // 深色/浅色界面上都能看清

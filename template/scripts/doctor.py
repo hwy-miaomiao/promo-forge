@@ -3,7 +3,7 @@
 """环境体检：只检查、不安装。有任何 MISSING 就退出码 1。
 
 用途
-    AGENTS.md 阶段 0 / 阶段 3 的闸门。检查 Node、npm、ffmpeg/ffprobe、Python、Python 包、
+    AGENTS.md 阶段 0 / 阶段 3 的闸门。检查 Node、npm、pnpm 版本、npm 依赖、ffmpeg/ffprobe、Python、Python 包、
     Playwright 浏览器、中文字体、src/timing.json 契约、素材目录数量、可选 ELEVENLABS_API_KEY。
     每行给出「项目 / 状态 / 说明 / 修复命令」，缺什么照着修复命令装什么。
 
@@ -24,13 +24,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata as importlib_metadata
+import json
 import os
 import re
 import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common as C  # noqa: E402
@@ -41,6 +42,33 @@ import _common as C  # noqa: E402
 
 #: Node 最低版本。来源：AGENTS.md 第 6 节「Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖」
 MIN_NODE_MAJOR = 18
+#: pnpm 最低版本。来源：`pnpm-workspace.yaml` 里的 `allowBuilds`（esbuild 挂构建脚本的放行名单）
+#: 是 pnpm 10.4 才有的配置项；更老的 pnpm 认不出这一项，esbuild 的 postinstall 会被跳过，
+#: 症状是 `remotion render` 时报 `esbuild: Failed to install correctly, please delete node_modules`
+#: （装依赖的当天看不出来，渲染那天才炸）。低于这个版本一律 MISSING，不做「反正能装」的妥协。
+MIN_PNPM = (10, 4)
+#: `node --version` 的输出必须能从这里解析出主版本号；解析不出来时不要归因成「太老」。
+NODE_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+#: Node 装法（命令缺失时用）。
+NODE_INSTALL_FIX = "winget install OpenJS.NodeJS.LTS / brew install node / sudo apt install nodejs npm"
+#: pnpm 装法（命令缺失时用）。
+PNPM_INSTALL_FIX = "corepack enable pnpm / npm install -g pnpm@11 / winget install pnpm.pnpm"
+#: pnpm 版本要求来源（写进 MISSING / WARN 的说明，方便照着查）。
+PNPM_FIX_HINT = "pnpm-workspace.yaml 的 allowBuilds 需要 pnpm ≥10.4；package.json 的 packageManager 声明了期望版本"
+#: 项目 npm 依赖的关键包（node_modules/<包>/package.json 存在即算装了）。
+#: 来源：template/package.json 的 dependencies —— 渲染、打包、接口全靠它们。
+NODE_DEP_PACKAGES = ("remotion", "@remotion/cli", "@remotion/bundler", "react")
+#: npm 依赖目录（相对项目根）。
+NODE_MODULES_DIR = "node_modules"
+#: 装依赖的命令（仓库默认 pnpm，npm 兜底）。
+NODE_INSTALL_CMD = "pnpm install        # 没装 pnpm 就用 npm install"
+#: 项目真正用到的 ffmpeg 滤镜。来源：各脚本实际拼的 -vf / -af / -filter_complex。
+#: 缺了不是「少个可选功能」，而是对应阶段直接失败或数值口径变化。
+FFMPEG_REQUIRED_FILTERS: List[Tuple[str, str]] = [
+    ("ass", "subtitles.py 烧硬字幕（缺了烧字幕必失败）"),
+    ("afade", "music.py cut 试听段的淡入淡出（缺了 cut 必失败）"),
+    ("ebur128", "check_video.py / mix.py 测响度（缺了退回 loudnorm，数值口径不同）"),
+]
 #: Python 最低版本。来源：AGENTS.md 第 6 节
 MIN_PYTHON = (3, 9)
 #: ffmpeg 三种平台的安装命令。来源：AGENTS.md 阶段 0「缺什么就按脚本给出的命令装什么」
@@ -168,13 +196,24 @@ def _print_table(rows: List[Row]) -> None:
 # ---------------------------------------------------------------------------
 
 def check_node(rows: List[Row]) -> None:
+    """node 版本：分三种情形——命令缺失 / 输出解析不出主版本号 / 版本真的偏低。"""
     ver = C.cmd_version("node", "--version")
     if ver is None:
         rows.append(Row("Node.js", "MISSING", f"没找到 node（需要 ≥ v{MIN_NODE_MAJOR}）",
-                        "winget install OpenJS.NodeJS.LTS / brew install node / sudo apt install nodejs npm"))
+                        NODE_INSTALL_FIX))
         return
-    m = re.search(r"(\d+)", ver)
-    major = int(m.group(1)) if m else 0
+    m = NODE_VERSION_RE.match(ver.strip())
+    if m is None:
+        # 输出不是版本号：可能是 PATH 里排在前面的 shim / 包装脚本抢了 node，也可能只是打印了别的东西。
+        # 这种情况「装/升级 Node」未必有用，所以不给升级建议，先让人看清 node 到底是谁。
+        rows.append(Row("Node.js", "MISSING",
+                        f"`node --version` 的输出不是版本号：{ver}（解析不出主版本号，按不满足 ≥ v{MIN_NODE_MAJOR} 处理）",
+                        "先看 `node --version` 到底打印了什么，再看 node 是谁："
+                        "where node（Windows）/ which -a node（macOS、Linux）；"
+                        "多半是 PATH 里排在前面的 nvm / conda / 包装脚本抢了 node，"
+                        "让 node 指向官方发行版即可"))
+        return
+    major = int(m.group(1))
     if major >= MIN_NODE_MAJOR:
         rows.append(Row("Node.js", "OK", f"{ver}（要求 ≥ v{MIN_NODE_MAJOR}）", ""))
     else:
@@ -190,15 +229,162 @@ def check_npm(rows: List[Row]) -> None:
         rows.append(Row("npm", "OK", f"v{ver}", ""))
 
 
+def _parse_version(text: str) -> Optional[Tuple[int, ...]]:
+    """从 `x.y.z` / `vX.Y.Z` 这类输出里取版本号；取不到返回 None（不归因成「太老」）。"""
+    if not text:
+        return None
+    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", text.strip())
+    if m is None:
+        return None
+    return tuple(int(g) for g in m.groups() if g is not None)
+
+
+def _project_package_manager() -> str:
+    """读 package.json 的 `packageManager`（形如 `pnpm@11.7.0`）；读不到返回空串。
+
+    读不到就返回空串而不是抛错：doctor 是环境体检，package.json 缺失/不合法由别的检查项报，
+    这里只管「有没有声明、声明的够不够新」。
+    """
+    try:
+        raw = (C.PROJECT_ROOT / "package.json").read_text(encoding="utf-8-sig", errors="replace")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("packageManager", "") or "").strip()
+
+
+def check_pnpm(rows: List[Row]) -> None:
+    """pnpm 版本：`pnpm-workspace.yaml` 的 `allowBuilds` 要 pnpm ≥10.4，低于它 esbuild 装不全。
+
+    三种情形与 check_node 同构：命令缺失 / 版本低于下限 / 满足（顺带报出 package.json 声明的期望版本）。
+    没装 pnpm 时按 WARN 报（`npm install` 是文档允许的兜底路径），但说明 pnpm 是模板默认。
+    """
+    declared = _project_package_manager()
+    ver = C.cmd_version("pnpm", "--version")
+    if ver is None:
+        rows.append(Row(
+            "pnpm", "WARN",
+            f"没找到 pnpm（模板默认用它；{PNPM_FIX_HINT}）",
+            f"{PNPM_INSTALL_FIX}；装不上也可以 npm install 兜底"
+            + (f"，但 npm 不认 allowBuilds（package.json 声明的是 {declared}）" if declared else ""),
+        ))
+        return
+
+    parsed = _parse_version(ver)
+    if parsed is None:
+        rows.append(Row(
+            "pnpm", "WARN",
+            f"`pnpm --version` 的输出不是版本号：{ver}"
+            f"（解析不出主版本，无法确认是否满足 ≥{'.'.join(str(n) for n in MIN_PNPM)}）",
+            f"先看 `pnpm --version` 到底打印了什么；再看 pnpm 是谁：where pnpm（Windows）/ which -a pnpm",
+        ))
+        return
+
+    need = MIN_PNPM
+    got = parsed[: len(need)] + (0,) * max(0, len(need) - len(parsed))
+    tail = f"；package.json 声明 {declared}" if declared else ""
+    if got >= need:
+        rows.append(Row("pnpm", "OK",
+                        f"{ver}（要求 ≥{'.'.join(str(n) for n in need)}）{tail}", ""))
+    else:
+        rows.append(Row(
+            "pnpm", "MISSING",
+            f"{ver} 太老（要求 ≥{'.'.join(str(n) for n in need)}）："
+            "更老的 pnpm 认不出 pnpm-workspace.yaml 的 allowBuilds，esbuild 的构建脚本会被跳过，"
+            f"渲染时才炸（`esbuild: Failed to install correctly`）{tail}",
+            PNPM_INSTALL_FIX,
+        ))
+
+
+def _pending_builds(node_modules: Path) -> List[str]:
+    """读 node_modules/.modules.yaml（pnpm 写的，实际是 JSON），返回还没跑过构建脚本的包名。
+
+    读不到 / 解析不了就返回空表 —— 判断不了就别报（npm、yarn 项目本来就没有这个文件）。
+    """
+    try:
+        # utf-8-sig：pnpm 写的文件可能带 BOM，json.loads 认 BOM 会直接报错。
+        text = (node_modules / ".modules.yaml").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        pending = data.get("pendingBuilds")
+        return [str(item) for item in pending if str(item).strip()] if isinstance(pending, list) else []
+    # 老版本 pnpm 写的是 YAML：pendingBuilds:\n  - esbuild
+    m = re.search(r"pendingBuilds\s*:\s*\n((?:\s*-\s*\S+\s*\n)+)", text)
+    if not m:
+        return []
+    return [line.strip().lstrip("-").strip() for line in m.group(1).splitlines() if line.strip()]
+
+
+def check_node_deps(rows: List[Row]) -> None:
+    """npm 依赖是否就位：渲染命令全都跑在 node_modules 上，缺了后面每一步都是 ERR_MODULE_NOT_FOUND。"""
+    node_modules = C.PROJECT_ROOT / NODE_MODULES_DIR
+    if not node_modules.is_dir():
+        rows.append(Row("npm 依赖", "MISSING",
+                        f"没找到 {NODE_MODULES_DIR}/：依赖还没装，render / stills / web 全都会直接报 ERR_MODULE_NOT_FOUND",
+                        NODE_INSTALL_CMD))
+        return
+    lack = [pkg for pkg in NODE_DEP_PACKAGES if not (node_modules / pkg / "package.json").is_file()]
+    if lack:
+        rows.append(Row("npm 依赖", "MISSING",
+                        f"{NODE_MODULES_DIR}/ 在，但缺关键包：{'、'.join(lack)}（多半是上一次安装中途断了）",
+                        NODE_INSTALL_CMD))
+        return
+    pending = _pending_builds(node_modules)
+    if pending:
+        rows.append(Row("npm 依赖", "WARN",
+                        f"{NODE_MODULES_DIR}/ 关键包齐全，但 {'、'.join(pending[:3])} 的构建脚本还没跑"
+                        f"（esbuild 这类包不跑 postinstall 会缺二进制，渲染才会炸）",
+                        "pnpm approve-builds        # 或者 pnpm rebuild"))
+        return
+    rows.append(Row("npm 依赖", "OK",
+                    f"{NODE_MODULES_DIR}/ 关键包齐全（{'、'.join(NODE_DEP_PACKAGES)}）", ""))
+
+
+def _ffmpeg_filters() -> Optional[Set[str]]:
+    """`ffmpeg -filters` 里的滤镜名集合；跑不起来（缺命令、超时、非 0）返回 None。"""
+    try:
+        cp = C.run(["ffmpeg", "-hide_banner", "-filters"], check=False, timeout=30)
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    names: Set[str] = set()
+    for line in (cp.stdout or "").splitlines():
+        # 例：` ... acopy             A->A       (null)`；图例行（`T.. = Timeline support`）不会命中。
+        m = re.match(r"^\s*[A-Z.]{3}\s+(\S+)\s+[AVN|]+->[AVN|]+", line)
+        if m:
+            names.add(m.group(1))
+    return names or None
+
+
 def check_ffmpeg(rows: List[Row]) -> None:
-    """ffmpeg 与 ffprobe 一起查；缺任意一个都算 MISSING。"""
+    """ffmpeg 与 ffprobe 一起查：缺任意一个都算 MISSING；都在时再查本项目必需的滤镜在不在。"""
     fix = f"{FFMPEG_FIX_WIN}  |  {FFMPEG_FIX_MAC}  |  {FFMPEG_FIX_LINUX}"
     have = {name: C.has_cmd(name) for name in ("ffmpeg", "ffprobe")}
     missing = [n for n, ok in have.items() if not ok]
     if not missing:
         ver = C.cmd_version("ffmpeg", "-version") or "ffmpeg"
         short = ver.split()[2] if len(ver.split()) > 2 else ver
-        rows.append(Row("ffmpeg/ffprobe", "OK", f"{short}（音频转换、时长探测、剪段都靠它）", ""))
+        filters = _ffmpeg_filters()
+        if filters is None:
+            rows.append(Row("ffmpeg/ffprobe", "OK",
+                            f"{short}（音频转换、时长探测、剪段都靠它；`ffmpeg -filters` 没跑起来，本次没查滤镜能力）", ""))
+            return
+        lack = [(name, why) for name, why in FFMPEG_REQUIRED_FILTERS if name not in filters]
+        if not lack:
+            rows.append(Row("ffmpeg/ffprobe", "OK", f"{short}（音频转换、时长探测、剪段都靠它）", ""))
+            return
+        detail = (f"{short} 缺 {len(lack)} 个滤镜：" + "、".join(name for name, _ in lack)
+                  + "（" + "；".join(f"{name} → {why}" for name, why in lack) + "）")
+        rows.append(Row("ffmpeg/ffprobe", "WARN", detail,
+                        "换完整版 ffmpeg（这个构建多半是某个工具自带的裁剪版）：" + fix))
         return
     detail = "缺 " + "、".join(missing) + "（AGENTS.md 第 6 节硬依赖，没有它不要往下走）"
     rows.append(Row("ffmpeg/ffprobe", "MISSING", detail, fix))
@@ -441,6 +627,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for fn in (
         check_node,
         check_npm,
+        check_pnpm,
+        check_node_deps,
         check_ffmpeg,
         check_python,
         check_py_packages,

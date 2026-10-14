@@ -53,6 +53,23 @@ const ITEMS: ProofItem[] = [
 /** 卡片出现的节拍索引：前 3 张每 2 拍（1.0 秒），后 3 张每 2 拍但整体右移半拍，形成"加速感"。 */
 const BEAT_INDEX = [0, 2, 4, 6.5, 8.5, 10.5];
 
+/**
+ * 卡片在网格里占几行 —— 从 `span` 的第 1 个数读出来（`span` 写的是 `grid-area` 的
+ * `grid-row-start / grid-column-start` 语法，所以第一个 `span N` 才是行数）。
+ * 行数必须**算**出来：写死 2 行时，6 张卡实际需要 6 行，多出来的行变成隐式行、
+ * 按最小内容高度分配，于是第一张卡（占两行的主卡）从 463px 塌到 105px。
+ */
+const rowSpan = (span: string): number => {
+  const m = /^\s*span\s+(\d+)/.exec(span);
+  return m ? Number(m[1]) : 1;
+};
+
+/** 卡片在网格里占几列 —— 同一串 `span` 的第 2 个数（`span 1 / span 2` 是半宽卡）。 */
+const colSpan = (span: string): number => {
+  const m = /span\s+(\d+)\s*$/.exec(span);
+  return m ? Number(m[1]) : 2;
+};
+
 /** 代码画的占位"作品画面"：用 art 里的矩形拼一张抽象的界面缩略图。 */
 const CodeCardArt: React.FC<{ art: number[][]; bright: boolean }> = ({ art, bright }) => (
   <div style={{ display: "grid", gridTemplateColumns: "repeat(12, 1fr)", gridTemplateRows: "repeat(6, 1fr)", gap: "0.6%", width: "100%", height: "100%" }}>
@@ -86,13 +103,18 @@ const WorkCard: React.FC<{
   hit: number;
   scale: number;
   item: ProofItem;
-}> = ({ width, height, p, hit, scale, item }) => {
+  /** 网格行号（1 起）——显式落位，不靠浏览器自动排布，见 Proof 里 placements 的注释 */
+  rowStart: number;
+  /** 网格列号（1 起）：占满两列的卡恒为 1，半宽卡是 1 或 2 */
+  colStart: number;
+}> = ({ width, height, p, hit, scale, item, rowStart, colStart }) => {
   const type = useType();
   const bright = item.tone === "accent";
   return (
     <div
       style={{
-        gridArea: item.span,
+        gridRow: `${rowStart} / span ${rowSpan(item.span)}`,
+        gridColumn: `${colStart} / span ${colSpan(item.span)}`,
         borderRadius: height * 0.045,
         padding: height * 0.03,
         display: "flex",
@@ -141,12 +163,54 @@ export const Proof: React.FC = () => {
     width * (isVertical(width, height) ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal),
   );
   const gap = height * 0.018;
-  // 卡片区固定成"舞台高度的一半"：竖屏 1920 的一半约 960px，两行两列后每格约 470×470，
-  // 正好是 1:1 的方形卡 —— 真实截图里方形缩略图最耐看，也最容易裁。
+  // 卡片区固定成"舞台高度的一半"：竖屏 1920 的一半约 960px。行数由卡片 span 决定
+  // （见下面的 rows），所以一个网格行高约 215px、【2×2 主卡】约 463px —— 主卡接近 1:1，
+  // 真实截图替换后最好裁成接近这个比例的缩略图。
   const gridW = contentW;
   const gridH = height * 0.5;
   const cellW = (gridW - gap) / 2;
-  const cellH = (gridH - gap) / 2;
+  // 网格行数按卡片的 span **算**出来，不写死：自动排版下每个「1×2 卡」占半格，
+  // 两张并排才凑一行；「2×2 卡」独占一整行。写死 2 行会被撑出隐式行，
+  // 卡片的实际高度就不再是下面算的 cellH（:195-197 的注释要求严格一致）。
+  // 每张卡的落位与网格总行数**一起**显式算出来（不靠浏览器自动排布）：
+  //   占满两列的卡（span 2 / span 2）独占一整行，占 spanRows 行；
+  //   半宽卡（span 1 / span 2）两两并排：第 1 张落 col 1、第 2 张落 col 2，两张占掉一整行。
+  // 为什么不敢交给自动排布：sparse 算法不会回头填前面的空格，第 4 张卡（占两行）会被推到
+  // 第 4~5 行，后面两张紧跟着掉进隐式行 —— 实测 top=925/960、bottom=1002，越过网格底边
+  // 并压到底部进度条上（`grid-auto-flow: dense` 也救不回来，同样量到越界）。
+  // ❗总行数必须由**落位结果**反推，不能写 `占行数之和 / 2`：那个式子假设"两张半宽卡叠起来
+  // 占一行"，而实际是**并排**占一行，半宽卡的实际占行数（ceil(半宽卡数 / 2)）与它自己的
+  // spanRows 之和并不相等。算错就会出现"声明 4 行、实际需要 6 行"→ 后两张卡越出网格盒子。
+  let cursorRow = 1;
+  let halfCol = 1;
+  let usedRows = 1;
+  const placements = ITEMS.map((item) => {
+    const spanRows = rowSpan(item.span);
+    const rowStart = cursorRow;
+    if (colSpan(item.span) === 1) {
+      // 半宽卡：两两并排。第一张落 col 1，第二张落 col 2 并把游标推到下一行
+      const colStart = halfCol;
+      if (halfCol === 2) {
+        cursorRow += 1;
+        halfCol = 1;
+      } else {
+        halfCol = 2;
+      }
+      usedRows = Math.max(usedRows, rowStart);
+      return { rowStart, colStart, spanRows };
+    }
+    const colStart = 1;
+    // 独占一行：游标必须先跳到「半宽卡凑不齐的残留列」之后（halfCol === 2 说明游标那一行
+    // 只坐了一张半宽卡），否则满宽卡会和它挤在同一行、后面的卡再被挤出行数边界。
+    cursorRow += spanRows + (halfCol === 2 ? 1 : 0);
+    halfCol = 1;
+    usedRows = Math.max(usedRows, rowStart + spanRows - 1);
+    return { rowStart, colStart, spanRows };
+  });
+  // 网格行数 = 落位真正用掉的行数（上面的 usedRows）
+  const rows = usedRows;
+  // 一张 1 行卡的高度（= 一个网格行高）。卡片尺寸按行数缩放，见下面 WorkCard 的 height。
+  const cellH = (gridH - gap * (rows - 1)) / rows;
 
   // 换真实截图时的出图尺寸（check_assets.py 要求图片宽度 ≥ 显示宽度 ×2）：
   // 打开下面这行会在渲染日志里打印出来，配图前先跑一次，照着数字用
@@ -192,8 +256,14 @@ export const Proof: React.FC = () => {
           </div>
         </div>
 
-        {/* 卡片区：2×2 网格。行高**写死**成 gridH 而不是让 flex 撑开 ——
-            卡片尺寸必须和上面算出来的 cellW/cellH 严格一致，否则真实截图的
+        {/* 卡片区：列数固定 2，行数**按卡片的 span 算**（rows），每张卡的行列位置也用
+            `placements` 显式落位（见上面的注释）。两个坑叠在一起才会"零素材也看不到卡"：
+              1) 写死 2 行时 6 张卡需要 4 行，多出来的行变成隐式行、按最小内容高度挤进同一个
+                 960px 盒子，第一张卡从 463px 塌到 126px（实测非零行 8 行）；
+              2) 就算行数算对了、交给浏览器自动排布，第 4 张卡（占两行）也会被推到第 4~5 行，
+                 第 5/6 张紧接着掉进隐式行 —— 量到 top=925/960、bottom=1002，越过 960 的网格
+                 底边并压到底部进度条上（`grid-auto-flow: dense` 也救不回来）。
+            卡片尺寸必须和上面算出来的 cellW/每行高严格一致，否则真实截图的
             "图片宽度 ≥ 显示宽度×2" 这条校验就无从谈起（布局一变，需要的出图尺寸就变了）。 */}
         <div
           style={{
@@ -201,7 +271,8 @@ export const Proof: React.FC = () => {
             height: gridH,
             display: "grid",
             gridTemplateColumns: "1fr 1fr",
-            gridTemplateRows: "1fr 1fr",
+            gridTemplateRows: `repeat(${rows}, 1fr)`,
+            gridAutoRows: 0,
             gap,
           }}
         >
@@ -215,7 +286,22 @@ export const Proof: React.FC = () => {
             // 出场瞬间的脉冲：scale 从 1.03 落到 1，模拟"镜头到位"
             const hit = impulse(t, at, 0.26);
             const scale = 1 + hit * 0.028;
-            return <WorkCard key={item.title} width={cellW} height={cellH} p={p} hit={hit} scale={scale} item={item} />;
+            // height 传「占几行 × 一行高」：卡内的圆角/内边距/署名栏都按这个高度缩放，
+            // 直接传一行高会让 2×2 主卡的圆角和内边距按小卡的比例算（视觉上偏小）。
+            const place = placements[i];
+            return (
+              <WorkCard
+                key={item.title}
+                width={cellW}
+                height={cellH * place.spanRows}
+                p={p}
+                hit={hit}
+                scale={scale}
+                item={item}
+                rowStart={place.rowStart}
+                colStart={place.colStart}
+              />
+            );
           })}
         </div>
 

@@ -37,7 +37,8 @@
 退出码
 ------
 0 比较/同步正常完成（**有差异不算失败**——这个脚本的日常工作就是报告差异）；
-1 出错（找不到模板、写入失败等，一律打印 `ERROR: ...`）。
+1 出错（找不到模板、写入失败等），或者 `--apply` 时跳过了「本地比模板新 / 修改时间相同」的文件
+  —— 这两种情况都会打印 `ERROR: ...`：说明这一轮没同步完，看清 WARN 再决定要不要加 `--force`。
 需要提醒的打印 `WARN: ...`。
 """
 
@@ -118,6 +119,9 @@ PROJECT_OWNED = (
     "src/timing.json",
     "src/scenes/**",
     "src/Promo.tsx",
+    # index.css 装着项目自己的底色 / 字体栈，模板不能覆盖它；但它是 check_index_css() 的检查对象，
+    # 所以显式列在这里，让「它的处理方式」在 --diff / --help 里都看得见（见 check_index_css）。
+    "src/index.css",
     "src/lib/theme.ts",
     "fonts.json",
     "web/config.ts",
@@ -269,11 +273,12 @@ def collect_common_files(base: Path):
 
 STATUS_NEW = "新版"
 STATUS_OLD = "旧版"
+STATUS_TIE = "时间相同"
 STATUS_MISSING = "缺失"
 STATUS_SAME = "一致"
 STATUS_EXTRA = "多余"
 
-STATUS_ORDER = (STATUS_NEW, STATUS_OLD, STATUS_MISSING, STATUS_EXTRA, STATUS_SAME)
+STATUS_ORDER = (STATUS_NEW, STATUS_OLD, STATUS_TIE, STATUS_MISSING, STATUS_EXTRA, STATUS_SAME)
 
 
 def compare(template_dir: Path, project_dir: Path):
@@ -294,12 +299,20 @@ def compare(template_dir: Path, project_dir: Path):
                 rows.append((STATUS_SAME, relative, template_path, project_path))
                 continue
             try:
-                newer_in_template = template_path.stat().st_mtime >= project_path.stat().st_mtime
+                template_mtime = template_path.stat().st_mtime
+                project_mtime = project_path.stat().st_mtime
             except OSError:
-                newer_in_template = True
-            rows.append(
-                (STATUS_NEW if newer_in_template else STATUS_OLD, relative, template_path, project_path)
-            )
+                # 拿不到修改时间就别猜（保持旧行为：按模板更新处理）。
+                rows.append((STATUS_NEW, relative, template_path, project_path))
+                continue
+            if template_mtime == project_mtime:
+                # 修改时间一模一样、内容却不同：多半是 cp -r / 同步工具把模板的 mtime 一起带过来了，
+                # 光看时间判断不了谁新谁旧。这时**不许判模板获胜**（那会静默覆盖本地改动）。
+                rows.append((STATUS_TIE, relative, template_path, project_path))
+            elif template_mtime > project_mtime:
+                rows.append((STATUS_NEW, relative, template_path, project_path))
+            else:
+                rows.append((STATUS_OLD, relative, template_path, project_path))
         elif template_path:
             rows.append((STATUS_MISSING, relative, template_path, None))
         else:
@@ -350,7 +363,10 @@ def print_report(rows, template_dir: Path, project_dir: Path, want_diff: bool) -
             log(f"[{status}] {relative}")
             log(f"    模板：{template_desc}")
             log(f"    本地：{project_desc}")
-            if want_diff and status in (STATUS_NEW, STATUS_OLD) and template_path and project_path:
+            if status == STATUS_TIE:
+                log("    注：两侧修改时间完全相同、内容却不一样（多半是复制时把 mtime 一起带过来了），"
+                    "判断不了谁新谁旧；--apply 默认不动它，确认要放弃本地改动再加 --force。")
+            if want_diff and status in (STATUS_NEW, STATUS_OLD, STATUS_TIE) and template_path and project_path:
                 print_diff(relative, template_path, project_path)
         log("")
 
@@ -369,18 +385,20 @@ def apply_changes(rows, template_dir: Path, project_dir: Path, force: bool = Fal
     pending = [
         (status, relative, template_path, project_path)
         for status, relative, template_path, project_path in rows
-        if status in (STATUS_NEW, STATUS_OLD, STATUS_MISSING) and template_path
+        if status in (STATUS_NEW, STATUS_OLD, STATUS_TIE, STATUS_MISSING) and template_path
     ]
     if not pending:
         log("本地通用文件与模板一致，没有需要覆盖的文件。")
         return 0
 
     # [旧版] = 内容不一样、而本地 mtime 比模板晚：多半是你在项目里按需改过它（改脚本、调参数、
-    # 改动画库）。默认不能覆盖（模板会把你的改动冲掉），要覆盖必须显式加 --force。
+    # 改动画库）。[时间相同] = 内容不一样、两侧 mtime 却完全相同：多半是复制时把模板的 mtime 一起
+    # 带过来了，光看时间判断不了谁新谁旧。这两种默认都不能覆盖（模板会把你的改动冲掉），
+    # 要覆盖必须显式加 --force。
     backlog = []
     if not force:
-        backlog = [item for item in pending if item[0] == STATUS_OLD]
-        pending = [item for item in pending if item[0] != STATUS_OLD]
+        backlog = [item for item in pending if item[0] in (STATUS_OLD, STATUS_TIE)]
+        pending = [item for item in pending if item[0] not in (STATUS_OLD, STATUS_TIE)]
     if not pending:
         log("没有需要覆盖的文件。")
 
@@ -423,21 +441,34 @@ def apply_changes(rows, template_dir: Path, project_dir: Path, force: bool = Fal
                 except OSError as exc:
                     warn(f"备份 {relative} 失败：{exc}")
         log("")
-        warn(
-            f"有 {len(backlog)} 个文件**本地比模板新**，已跳过，没有覆盖：\n"
-            + "\n".join(f"       {relative}" for _s, relative, _t, _p in backlog[:10])
-            + (f"\n       …（还有 {len(backlog) - 10} 个）" if len(backlog) > 10 else "")
-            + "\n    这一栏多半是你自己按需改过的（改脚本、调参数、改动画库），"
-              "直接用模板覆盖会把你的改动冲掉，所以默认不动它们。\n"
-              "    先看差异：python scripts/sync_template.py --diff\n"
-              "    确认可以放弃本地改动，再加 --force 覆盖。"
-        )
+        older = [item for item in backlog if item[0] == STATUS_OLD]
+        tied = [item for item in backlog if item[0] == STATUS_TIE]
+        if older:
+            warn(
+                f"有 {len(older)} 个文件**本地比模板新**，已跳过，没有覆盖：\n"
+                + "\n".join(f"       {relative}" for _s, relative, _t, _p in older[:10])
+                + (f"\n       …（还有 {len(older) - 10} 个）" if len(older) > 10 else "")
+                + "\n    这一栏多半是你自己按需改过的（改脚本、调参数、改动画库），"
+                  "直接用模板覆盖会把你的改动冲掉，所以默认不动它们。\n"
+                  "    先看差异：python scripts/sync_template.py --diff\n"
+                  "    确认可以放弃本地改动，再加 --force 覆盖。"
+            )
+        if tied:
+            warn(
+                f"有 {len(tied)} 个文件**修改时间与模板完全相同、内容却不一样**，已跳过，没有覆盖：\n"
+                + "\n".join(f"       {relative}" for _s, relative, _t, _p in tied[:10])
+                + (f"\n       …（还有 {len(tied) - 10} 个）" if len(tied) > 10 else "")
+                + "\n    这种情况多半是 cp -r / 同步工具把模板的修改时间一起带过来了，"
+                  "光看时间判断不了谁新谁旧，所以默认不动它们（以前这里会当成「模板更新」直接覆盖）。\n"
+                  "    先看差异：python scripts/sync_template.py --diff\n"
+                  "    确认可以放弃本地改动，再加 --force 覆盖。"
+            )
         if backed_up_local:
             log("")
             log(f"（本地当前内容已备份 {len(backed_up_local)} 个到 {_rel_to(backup_dir, project_dir)}/，"
                 "真被覆盖了也能从这里回滚）")
         error(
-            f"{len(backlog)} 个文件本地比模板新，默认不覆盖。"
+            f"{len(backlog)} 个文件本地比模板新（或与模板的修改时间完全相同），默认不覆盖。"
             "确认要放弃这些本地改动请加 --force 重跑。"
         )
     return copied
@@ -448,6 +479,8 @@ def apply_changes(rows, template_dir: Path, project_dir: Path, force: bool = Fal
 # ===========================================================================
 
 def check_index_css(project_dir: Path) -> None:
+    log(f"{CSS_PATH}：项目自有文件，不参与同步（列在 PROJECT_OWNED 里）；这里只检查它是否含"
+        f"「{CSS_REQUIRED_SNIPPET}」。")
     path = project_dir / CSS_PATH
     if not path.is_file():
         warn(
@@ -485,7 +518,8 @@ def main(argv=None) -> int:
         epilog=(
             "同步范围：%s、scripts 下的 .py/.mjs/.js\n"
             "永不触碰：%s\n"
-            "退出码：0 正常完成（有差异不算失败）；1 出错。"
+            "退出码：0 正常完成（有差异不算失败）；1 出错，或 --apply 时跳过了"
+            "「本地比模板新 / 修改时间相同」的文件（没同步完，看清 WARN 再加 --force）。"
             % ("、".join(COMMON_FILES), "、".join(PROJECT_OWNED))
         ),
     )
@@ -496,7 +530,8 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help=f"用模板覆盖本地通用文件（先备份到 {BACKUP_ROOT}/<时间戳>/）")
     parser.add_argument("--force", action="store_true",
-                        help="配合 --apply：连「本地比模板新」的文件也覆盖（默认跳过它们，避免冲掉你的改动）")
+                        help="配合 --apply：连「本地比模板新 / 修改时间相同」的文件也覆盖"
+                             "（默认跳过它们，避免冲掉你的改动）")
     args = parser.parse_args(argv)
 
     template_dir, source = locate_template(args.template)
@@ -533,7 +568,7 @@ def main(argv=None) -> int:
     else:
         log("")
         log("这是只读报告，本地文件一个都没改。要真正覆盖请加 --apply（会先备份；"
-            "「本地比模板新」的文件仍会跳过，除非再加 --force）。")
+            "「本地比模板新 / 修改时间相同」的文件仍会跳过，除非再加 --force）。")
 
     log("")
     check_index_css(project_dir)

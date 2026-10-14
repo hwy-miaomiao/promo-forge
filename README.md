@@ -162,7 +162,7 @@ promo-forge/
 
 **怎么知道能不能投抖音 / 小红书？** `python scripts/deliver.py check out/final-1080p.mp4 --platform all`
 会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条按「需人工确认」的 WARN 处理；
-封面用 `python scripts/deliver.py cover --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图。
+封面用 `python scripts/deliver.py cover out/final-1080p.mp4 --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图（`<mp4>` 省略时脚本不报错，会静默套用默认值 `out/final-1080p.mp4`）。
 
 ## 参与贡献
 

@@ -39,7 +39,8 @@
 
 退出码
 ------
-0 成功；1 有 ERROR：缺 ffmpeg、缺音乐文件、boom、人声余量 < 6 dB（AGENTS.md 阶段 8）、母带失败。
+0 成功；1 有 ERROR：缺 ffmpeg、缺音乐文件、boom、人声余量 < 6 dB（AGENTS.md 阶段 8；
+母带 PLR 回落成动态模式时该阈值自动抬到 8 dB，见阶段 8 的「按打印余量再留 2 dB」）、母带失败。
 """
 
 from __future__ import annotations
@@ -94,6 +95,28 @@ LOUDNESS_RANGE = 11.0
 # 与 AGENTS.md 的「≥6 dB」不一致。现已统一：低于 6 dB 直接 ERROR（不再有 WARN 缓冲带）。
 VO_MARGIN_OK_DB = 6.0
 VO_MARGIN_FAIL_DB = VO_MARGIN_OK_DB     # 刻意取同一个值：少一档就是不合格
+# AGENTS.md 阶段 8 的两条路之②：「接受这 1~2 dB 误差，**按打印余量再留 2 dB**
+# （打印 ≥8 dB 才当安全交付）」。母带真的回落成动态模式时，逐句余量按这条判：
+# 打印 8 dB 才等于成片里的 6 dB。
+VO_MARGIN_PLR_FALLBACK_DB = VO_MARGIN_OK_DB + 2.0
+
+# 母带模式只有两种，明确写成状态，别让它只活在一条 WARN 文本里：
+#   "linear"   —— PLR ≤ 13.3 dB，loudnorm 做的是整体增益，打印余量 ≈ 成片余量，按 6 dB 判；
+#   "fallback" —— PLR 超限，loudnorm 静默回落成动态模式，逐段压掉 1~2 dB，按 8 dB 判。
+# （原来这个状态既没有常量也不进总结：回落了照样按 6 dB 判，
+#   于是打印 +7.6 dB 的片子能退 0 交付，而 AGENTS.md 阶段 8 要求这时打印 ≥8 dB。）
+MASTER_MODE_LINEAR = "linear"
+MASTER_MODE_PLR_FALLBACK = "fallback"
+MASTER_MODE_LABEL = {
+    MASTER_MODE_LINEAR: "linear（loudnorm 走线性模式，母带≈整体增益）",
+    MASTER_MODE_PLR_FALLBACK: "fallback（PLR 超限，loudnorm 回落成动态模式）",
+}
+
+
+def _margin_threshold_db(master_mode: str) -> float:
+    """母带模式 → 人声余量阈值。回落时按 AGENTS.md 阶段 8 的「再留 2 dB」用 8 dB。"""
+    return (VO_MARGIN_PLR_FALLBACK_DB if master_mode == MASTER_MODE_PLR_FALLBACK
+            else VO_MARGIN_FAIL_DB)
 
 # AGENTS.md 阶段 8：片头 0.3 秒淡入、片尾 0.6 秒淡出
 FADE_IN_S = 0.3
@@ -154,15 +177,41 @@ def _resolve(path_text: str) -> Path:
     return path if path.is_absolute() else (PROJECT_ROOT / path)
 
 
-def _cfg_num(cfg: dict, key: str, default: float) -> float:
-    """读 timing.json 里的数字配置：**只在缺键或显式 null 时**才用默认值。
+def _num(cfg: dict, key: str, default, where: str) -> float:
+    """取值 + 校验的数字读取工具：坏值一律一行 `ERROR:` + 非零退出，绝不抛裸 traceback。
+
+    代替散落各处的 `float(x.get(...) or 0.0)`：timing.json 里把数字写成 `"10s"`、
+    `"0:00"`、`"0.6s"` 这类字符串时，原来会以未捕获的 `ValueError` 崩掉
+    （stderr 里只有 traceback、没有 `ERROR:` 行，用户看不出是哪个字段写错了）。
+    缺键 / 显式 null / 空串 → 用 default；default 给 None 表示这个字段必填。
+    """
+    if not isinstance(cfg, dict):
+        error(f"{where} 应该是一个对象，现在是 {type(cfg).__name__}：{cfg!r}")
+    value = cfg.get(key, default)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is None:
+            error(f"{where} 缺少必填的数字字段 {key}（单位是秒，例如 {key}: 3.6）")
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        error(f"{where} 的 {key} 不是数字：{value!r}（要数字，不要引号、不要单位后缀，"
+              f"例如 {key}: 3.6）")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        error(f"{where} 的 {key} 不是数字：{value!r}（要数字，不要引号、不要单位后缀，"
+              f"例如 {key}: 3.6）")
+        raise
+
+
+def _cfg_num(cfg: dict, key: str, default: float = 0.0, where: str = "") -> float:
+    """读 timing.json 里的数字配置：**只在缺键、显式 null 或空串时**才用默认值。
 
     原来写的是 `float(cfg.get(key, DEFAULT) or DEFAULT)`，`or` 会把合法的 0 也
     当成「没填」：music.gain=0（不要配乐）、voice.duckDb=0（不压音乐）、
     voice.rmsDb=0 都会被静默换成默认值，日志里看不出用户填过 0。
+    现在统一走 `_num`：非数字（如 "loud"）会变成一行 ERROR + 非零退出，而不是裸 traceback。
     """
-    value = cfg.get(key, default)
-    return float(default if value is None else value)
+    return _num(cfg, key, default, where or "timing.json")
 
 
 def _db_to_gain(db: float) -> float:
@@ -381,23 +430,27 @@ def _find_music_source(timing: dict) -> Path:
     )
 
 
-def _place_with_xfade(np, target, chunk, at_sample: int, xfade_samples: int) -> None:
-    """把 chunk 放到 target 的 at_sample 处，两端各做一段交叉淡化。"""
+def _place_with_xfade(np, target, chunk, at_sample: int, xfade_samples: int) -> bool:
+    """把 chunk 放到 target 的 at_sample 处，两端各做一段交叉淡化。
+
+    返回是否真的放下了内容（调用方用它判断「一段都没摆进去」；原来返回 None，
+    音乐段的循环因此没法知道自己是不是白跑了一圈）。
+    """
     total = target.shape[0]
     if at_sample >= total or chunk.shape[0] == 0:
-        return
+        return False
     if at_sample < 0:
         chunk = chunk[-at_sample:]
         at_sample = 0
         if chunk.shape[0] == 0:
-            return
+            return False
     end = min(at_sample + chunk.shape[0], total)
     seg = chunk[: end - at_sample]
     length = seg.shape[0]
     xf = int(min(xfade_samples, max(0, (length - 1) // 2)))
     if xf <= 0:
         target[at_sample:end] = seg
-        return
+        return True
     ramp_in = np.linspace(0.0, 1.0, xf, dtype=np.float32)[:, None]
     ramp_out = np.linspace(1.0, 0.0, xf, dtype=np.float32)[:, None]
     # 起点：已有内容淡出、新内容淡入
@@ -408,7 +461,10 @@ def _place_with_xfade(np, target, chunk, at_sample: int, xfade_samples: int) -> 
     if body_end > at_sample + xf:
         target[at_sample + xf : body_end] = seg[xf:-xf]
     # 终点：新内容淡出、后续已有内容保留
-    target[body_end:end] = target[body_end:end] * ramp_out + seg[-xf:] * ramp_out
+    # （两个加数不能都乘 ramp_out：那样「已有内容」会跟着新内容一起被淡掉，
+    #   交叠处末尾直接归零 —— 实测段尾 80ms 出现静音缺口、且起点还叠成 2×。）
+    target[body_end:end] = target[body_end:end] * (1.0 - ramp_out) + seg[-xf:] * ramp_out
+    return True
 
 
 def _build_music(np, timing: dict, total_samples: int, music_path: Path):
@@ -423,27 +479,53 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
     segments = music_cfg.get("segments") or []
     if segments:
         log(f"配乐：{_rel(music_path)} · 按 music.segments 剪接（{len(segments)} 段，交叉淡化 {SEGMENT_XFADE_S*1000:.0f}ms）")
+        placed_count = 0
+        skipped = 0
         for index, seg in enumerate(segments):
             if not isinstance(seg, dict):
                 warn(f"music.segments[{index}] 不是对象，已跳过：{seg!r}")
+                skipped += 1
                 continue
-            at = float(seg.get("at", 0.0) or 0.0)
-            start = float(seg.get("from", 0.0) or 0.0)
+            at = _num(seg, "at", 0.0, f"music.segments[{index}]")
+            start = _num(seg, "from", 0.0, f"music.segments[{index}]")
             stop = seg.get("to", None)
             src_start = max(0, int(round(start * SR)))
             src_end = raw.shape[0] if stop in (None, "") else min(
-                raw.shape[0], int(round(float(stop) * SR))
+                raw.shape[0],
+                int(round(_num(seg, "to", 0.0, f"music.segments[{index}]") * SR)),
             )
             if src_end <= src_start:
                 warn(f"music.segments[{index}] 的 from/to 区间为空（from={start}, to={stop}），已跳过")
+                skipped += 1
                 continue
             chunk = raw[src_start:src_end]
             at_sample = int(round(at * SR))
             if at_sample >= total_samples:
                 warn(f"music.segments[{index}] 的 at={at}s 已经超出片长，实际听不到")
+                skipped += 1
                 continue
-            _place_with_xfade(np, out, chunk, at_sample, xfade)
+            if not _place_with_xfade(np, out, chunk, at_sample, xfade):
+                # at_sample < 片长、但内容整段落在片尾之后（chunk 为空的边界）
+                warn(f"music.segments[{index}] 没有内容落在片长以内（at={at}s），已跳过")
+                skipped += 1
+                continue
+            placed_count += 1
             log(f"  段 {index + 1}: 视频 {at:.2f}s ← 音乐 {start:.2f}~{src_end / SR:.2f}s")
+        # 非 segments 分支有 `take <= 0 → error(...)`，这条分支原来什么都没有：
+        # 例如每段的 at 都 ≥ 片长、或 from/to 全填反，脚本会打几条 WARN、然后以 0 退出，
+        # 交出去的成片没有任何配乐。
+        if placed_count == 0:
+            error(
+                f"music.segments 里 {len(segments)} 段一段都没摆进片子（跳过 {skipped} 段）："
+                f"配乐会是整条静音，{total_samples / SR:.2f}s 的成片只有人声和音效。"
+                "请检查每段的 at（视频时间，必须 < 片长）与 from/to（音乐时间，from < to），"
+                "或用 `python scripts/music.py grid` 重新量一遍再写回 timing.json"
+            )
+        if placed_count < len(segments):
+            warn(
+                f"music.segments 有 {len(segments)} 段，只摆进去 {placed_count} 段"
+                f"（跳过 {skipped} 段）：成片里的配乐比你写的少，确认这是想要的剪接"
+            )
     else:
         # 契约：视频时间 = 音乐时间 + offset  →  音乐时间 = 视频时间 - offset
         #
@@ -455,7 +537,7 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
         # 注意：以前 offset > 0 时只打 WARN 然后把音乐夹到 0 秒起播——那会让
         # 「音乐时间 = 视频时间 - offset」整体错位 offset 秒，downbeat 落不到 drop 上。
         music_dur = raw.shape[0] / SR
-        offset = float(music_cfg.get("offset", 0.0) or 0.0)
+        offset = _num(music_cfg, "offset", 0.0, "timing.json 的 music")
 
         if offset < 0.0:
             # 跳过前奏：音乐时间 = 视频时间 + |offset|，即从音乐 |offset| 秒开始读
@@ -520,7 +602,7 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
                 "请换更长的曲子，或用 `python scripts/music.py cut` 剪一段循环填满"
             )
 
-    gain = _cfg_num(music_cfg, "gain", DEFAULT_MUSIC_GAIN)
+    gain = _cfg_num(music_cfg, "gain", DEFAULT_MUSIC_GAIN, "timing.json 的 music")
     if abs(gain - 1.0) > 1e-6:
         out *= gain
         log(f"配乐增益：music.gain={gain}")
@@ -540,7 +622,7 @@ def _build_voice(np, timing: dict, total_samples: int):
       stats     逐句统计，供人声余量检查与总结打印
     """
     voice_cfg = timing.get("voice", {}) or {}
-    target_rms_db = _cfg_num(voice_cfg, "rmsDb", DEFAULT_RMS_DB)
+    target_rms_db = _cfg_num(voice_cfg, "rmsDb", DEFAULT_RMS_DB, "timing.json 的 voice")
     lines = [line for line in (voice_cfg.get("lines") or []) if isinstance(line, dict)]
     vo_dir = PROJECT_ROOT / "audio-src" / "vo"
 
@@ -578,7 +660,7 @@ def _build_voice(np, timing: dict, total_samples: int):
             chunk *= 0.99 / peak
             warn(f"第 {line_id} 句归一化后削波，已整体降 {_gain_to_db(0.99 / peak):.1f} dB")
 
-        at = float(line.get("at", 0.0) or 0.0)
+        at = _num(line, "at", 0.0, f"timing.json 的 voice.lines[id={line_id}]")
         start = int(round(at * SR))
         if start >= total_samples:
             warn(f"第 {line_id} 句 at={at}s 已经超出片长，实际听不到")
@@ -617,9 +699,15 @@ def _build_voice(np, timing: dict, total_samples: int):
 
 
 def _duck_curve(np, total_samples: int, intervals, duck_db: float):
-    """梯形增益曲线（两端余弦羽化），人声区间把音乐压到 duck_db。"""
+    """梯形增益曲线（两端余弦羽化），人声区间把音乐压 duck_db。
+
+    duck_db > 0 表示**反过来**：人声区间把音乐抬 duck_db（有些片子故意这么做）。
+    原来写死 `np.minimum(gain, curve)`，curve > 1 的部分被原样抹平成 1.0（静默
+    no-op），而 main 仍然照抄配置打印「ducking +6.0 dB」——用户以为生效了。
+    """
     gain = np.ones(total_samples, dtype=np.float32)
     target = _db_to_gain(duck_db)
+    boost = duck_db > 0.0
     feather = max(1, int(round(DUCK_FEATHER_S * SR)))
     for start, end, _line_id, _rms in intervals:
         start = max(0, start)
@@ -634,7 +722,12 @@ def _duck_curve(np, total_samples: int, intervals, duck_db: float):
             weight[:ramp] = np.minimum(weight[:ramp], up)
             weight[length - ramp :] = np.minimum(weight[length - ramp :], up[::-1])
         curve = 1.0 - (1.0 - target) * weight
-        gain[start:end] = np.minimum(gain[start:end], curve)
+        if boost:
+            # curve 在 1 以上（duck_db > 0 = 抬升）时只有 maximum 才是抬升；
+            # 写成 minimum 会被 1.0 抹平，成为静默 no-op（本次修的就是这个）。
+            gain[start:end] = np.maximum(gain[start:end], curve)
+        else:
+            gain[start:end] = np.minimum(gain[start:end], curve)
     return gain
 
 
@@ -682,13 +775,32 @@ def _build_sfx(np, timing: dict, total_samples: int):
         try:
             drop_s = float(drop)
         except (TypeError, ValueError):
-            drop_s = -1.0
-        if drop_s > 0:
-            boom = _sfx_boom(np) * amp
-            _place_with_xfade(np, out, boom, int(round(drop_s * SR)), 0)
-            placed.append(f"drop {drop_s:.2f}s 低频下潜")
+            # 原来这里静默把非数字当成「没有 drop」：music.drop 是 AGENTS.md 第 5 节的
+            # 必填字段（第一次爆发的视频时间），写错类型不该一声不吭地少掉一个音效。
+            # 注意不能用哨兵值（如 -1.0）继续往下走：那会让下面「不是正数」的分支对着
+            # 哨兵再报一次，用户看到的是 music.drop=-1 这种他根本没写过的值。
+            warn(
+                f"timing.json 的 music.drop={drop!r} 不是数字，已跳过低频下潜音效。"
+                "music.drop 是 AGENTS.md 第 5 节的必填字段（第一次爆发的**视频时间**，单位秒），"
+                "请用 music.py grid 算出来写进去（例如 3.6）"
+            )
+            drop_s = None
+        if drop_s is not None:
+            if drop_s > 0:
+                boom = _sfx_boom(np) * amp
+                _place_with_xfade(np, out, boom, int(round(drop_s * SR)), 0)
+                placed.append(f"drop {drop_s:.2f}s 低频下潜")
+            else:
+                # 0 / 负数同样静默过：drop 是必填项，填 0 等于把「第一次爆发」定在片头，
+                # 要么是漏填、要么是算错了符号（drop 是视频时间，负数只可能是写反了 offset）。
+                warn(
+                    f"timing.json 的 music.drop={drop_s:g} 不是正数，已跳过低频下潜音效。"
+                    "music.drop 是 AGENTS.md 第 5 节的必填字段（第一次爆发的**视频时间**，应落在片头之后、"
+                    "全片之内）；如果确实不要这个音效，请显式删掉 music.drop 并把这条 WARN 写进交付说明"
+                )
 
     scenes = [s for s in (timing.get("scenes") or []) if isinstance(s, dict)]
+    turn_count = 0
     for index, scene in enumerate(scenes):
         if index == 0:
             continue  # 片头自己不叠转场音，会和 0.3s 淡入打架
@@ -699,9 +811,13 @@ def _build_sfx(np, timing: dict, total_samples: int):
         if start <= 0:
             continue
         tick = _sfx_tick(np) * amp
-        _place_with_xfade(np, out, tick, int(round(start * SR)), 0)
-    if len(scenes) > 1:
-        placed.append(f"{len(scenes) - 1} 个场景转场音")
+        if _place_with_xfade(np, out, tick, int(round(start * SR)), 0):
+            turn_count += 1
+    # 按**实际摆进去的**数量记账：原来写死 len(scenes) - 1。start 非数字 / ≤0 /
+    # 落在片尾之后的场景都会被上面的 continue 跳掉，日志却照旧说「N 个场景转场音」
+    #（实测 5 个场景只有 1 个真出声，日志写 4 个）。
+    if turn_count:
+        placed.append(f"{turn_count} 个场景转场音")
     if placed:
         log(f"音效（numpy 合成，{SFX_LEVEL_DB:.0f} dB）：" + "、".join(placed))
     return out
@@ -723,8 +839,15 @@ def _apply_fades(np, mix):
     return mix
 
 
-def _master(np, premaster_path: Path, out_path: Path) -> None:
-    """两遍 loudnorm：第一遍测量，第二遍按测量值线性母带。"""
+def _master(np, premaster_path: Path, out_path: Path) -> str:
+    """两遍 loudnorm：第一遍测量，第二遍按测量值线性母带。
+
+    返回**母带状态常量**：MASTER_MODE_LINEAR（正常）或 MASTER_MODE_PLR_FALLBACK
+    （素材 PLR 超 13 dB，loudnorm 静默回落成动态模式，成片里的逐句人声余量会比打印值
+    低 1~2 dB）。main() 拿这个状态把「人声余量闸门」的阈值从 6 dB 抬到 8 dB
+    （AGENTS.md 阶段 8 的第二条路：按打印余量再留 2 dB），并把它打印在总结里。
+    """
+    master_mode = MASTER_MODE_LINEAR
     base = f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA={LOUDNESS_RANGE}"
     measure_cmd = [
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(premaster_path),
@@ -745,12 +868,14 @@ def _master(np, premaster_path: Path, out_path: Path) -> None:
             plr = None
         linear_budget = TARGET_TP - TARGET_LUFS
         if plr is not None and plr > linear_budget + 0.3:
+            master_mode = MASTER_MODE_PLR_FALLBACK
             warn(
                 "素材峰值余量不足：母带前 TP %.2f dBFS − 响度 %.2f LUFS = PLR %.1f dB，"
                 "超过 %.1f LUFS / TP %.1f dBFS 允许的 %.1f dB → loudnorm 会回落成动态模式，"
                 "成品里的逐句人声余量会比上面打印的（按母带前总线量的）低 1~2 dB。"
                 "改法：给母带前总线过一遍限制器把真峰值压到 -6 dBFS 以下，"
-                "或接受这 1~2 dB 误差、把打印余量留到 ≥8 dB 再交付。"
+                "或接受这 1~2 dB 误差、把打印余量留到 ≥8 dB 再交付"
+                "（本次已自动改用 %.0f dB 这一档判人声余量，见下面的总结与闸门）。"
                 "（光降 music.gain 不一定有效：峰值大多是人声总线顶上去的——实测 gain 1.0→0.6，"
                 "母带前响度只从 -18.0 变成 -19.25 LUFS，PLR 仍是 19.2 dB。）"
                 % (
@@ -760,6 +885,7 @@ def _master(np, premaster_path: Path, out_path: Path) -> None:
                     TARGET_LUFS,
                     TARGET_TP,
                     linear_budget,
+                    VO_MARGIN_PLR_FALLBACK_DB,
                 )
             )
 
@@ -806,11 +932,66 @@ def _master(np, premaster_path: Path, out_path: Path) -> None:
     )
     if not out_path.is_file() or out_path.stat().st_size == 0:
         error(f"母带写出失败：{_rel(out_path)} 不存在或是空文件")
+    return master_mode
 
 
 # ===========================================================================
 # 报告
 # ===========================================================================
+
+def _check_vo_windows(timing: dict, stats) -> None:
+    """检查同屏人声窗口：声明的窗口按 `_common.line_window` 是否成立 + 实际摆放是否相交。
+
+    背景：本脚本以前**只**用 `voice.lines[].at` 摆放人声，从来不问「这一句的窗口有多长」。
+    于是两种坏情况全都没有任何提示：
+      ① 声明的窗口本身不成立（`at` 落在场景末尾、或和下一句挨得太近，扣掉
+         `LINE_TAIL_GAP` 后窗口 ≤ 0）——`_common.line_window` 会抛 ValueError，
+         而 mix.py 虽然从 `_common` import 了 `line_window`（第 67 行）却一次都没调用；
+      ② 摆放后两句真的**同屏相交**（`at` 填成同一个数、或前一句的音频比窗口长），
+         两句人声叠在一起，听感是「抢话」，脚本一声不吭。
+
+    只在 --no-vo 之外调用；全部是 WARN（不拦交付：tts.py audit 才是硬闸门）。
+    """
+    bad_windows = 0
+    lines = [line for line in ((timing.get("voice") or {}).get("lines") or [])
+             if isinstance(line, dict)]
+    for line in lines:
+        try:
+            line_window(timing, line)
+        except ValueError as exc:
+            bad_windows += 1
+            warn(f"第 {str(line.get('id', '')).strip() or '?'} 句的旁白窗口不成立：{exc}")
+
+    # 实际摆放相交：用【真正的落点】(at, at + 音频长度) 判，而不是声明窗口 ——
+    # 声明窗口由 line_window 兜着，真正会叠的是「音频比窗口长」和「at 填重了」。
+    spans = []
+    for item in (stats or []):
+        try:
+            start = float(item["at"])
+            end = start + float(item["duration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        spans.append((start, end, str(item.get("id", "")).strip()))
+    spans.sort()
+    overlaps = 0
+    last_end, last_id, last_start = None, None, None
+    for start, end, line_id in spans:
+        if last_end is not None and start < last_end - 1e-6:
+            overlaps += 1
+            warn(
+                f"人声同屏相交：第 {line_id} 句在 {start:.2f}s 起播，但第 {last_id} 句"
+                f"（{last_start:.2f}s 起）要到 {last_end:.2f}s 才结束，两句重叠 "
+                f"{last_end - start:.2f}s。同屏两句人声会互相盖住，听感是「抢话」——"
+                "请把 timing.json 的 voice.lines[].at 拉开，或把前一句的稿子改短"
+                "（AGENTS.md 阶段 7：字数超窗口要改稿，不要硬压）"
+            )
+        if last_end is None or end > last_end:
+            last_end, last_id, last_start = end, line_id, start
+    if overlaps:
+        warn(f"本次混音有 {overlaps} 处人声同屏相交（见上），成片里会出现两句人声叠着说。")
+    elif bad_windows:
+        warn(f"有 {bad_windows} 句的窗口不成立（见上）：这几句的摆放位置可能不是你要的。")
+
 
 def _check_vo_margin(np, vo_bus, ducked_music, stats, intervals):
     """逐句算「人声 RMS − 该处音乐 RMS」，返回 (逐句结果, 最差的一条)。
@@ -895,7 +1076,8 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "默认输出：public/<timing.json 的 music.file>（模板里是 public/audio/music.wav）\n"
-            "退出码：0 通过；1 有 ERROR（缺 ffmpeg / 缺配乐 / 人声余量 <6 dB / 母带失败）。"
+            "退出码：0 通过；1 有 ERROR（缺 ffmpeg / 缺配乐 / 人声余量 <6 dB——"
+            "母带 PLR 回落成动态模式时该阈值自动抬到 8 dB / 母带失败）。"
         ),
     )
     parser.add_argument("--no-vo", action="store_true",
@@ -911,7 +1093,7 @@ def main(argv=None) -> int:
     np = _require_numpy()
     timing = load_timing()
 
-    duration = float(timing.get("duration", 0.0) or 0.0)
+    duration = _num(timing, "duration", None, "timing.json")
     if duration <= 0:
         error("timing.json 的 duration 必须 > 0（单位：秒）；它等于最后一个场景的 end")
     total_samples = int(round(duration * SR))
@@ -925,7 +1107,7 @@ def main(argv=None) -> int:
     music = _build_music(np, timing, total_samples, music_path)
 
     voice_cfg = timing.get("voice", {}) or {}
-    duck_db = _cfg_num(voice_cfg, "duckDb", DEFAULT_DUCK_DB)
+    duck_db = _cfg_num(voice_cfg, "duckDb", DEFAULT_DUCK_DB, "timing.json 的 voice")
 
     if args.no_vo:
         vo_bus = np.zeros((total_samples, CHANNELS), dtype=np.float32)
@@ -936,10 +1118,22 @@ def main(argv=None) -> int:
     else:
         vo_bus, intervals, stats = _build_voice(np, timing, total_samples)
         duck_gain = _duck_curve(np, total_samples, intervals, duck_db)
+        if duck_db > 0.0:
+            duck_note = (
+                f"人声区间把音乐**抬升** {duck_db:+.1f} dB（duckDb 填正数 = 不闪避、反向抬升；"
+                f"羽化 {DUCK_FEATHER_S*1000:.0f}ms）"
+            )
+        elif duck_db == 0.0:
+            duck_note = "duckDb=0：人声区间不做闪避，音乐保持原电平"
+        else:
+            duck_note = f"ducking {duck_db:+.1f} dB（羽化 {DUCK_FEATHER_S*1000:.0f}ms）"
         log(
-            f"人声：{len(intervals)} 句，RMS 归一化到 {_cfg_num(voice_cfg, 'rmsDb', DEFAULT_RMS_DB):.1f} dBFS，"
-            f"ducking {duck_db:+.1f} dB（羽化 {DUCK_FEATHER_S*1000:.0f}ms）"
+            f"人声：{len(intervals)} 句，RMS 归一化到 {_cfg_num(voice_cfg, 'rmsDb', DEFAULT_RMS_DB, 'timing.json 的 voice'):.1f} dBFS，"
+            + duck_note
         )
+        # 顺手查一遍「声明的旁白窗口」和「实际摆放是否同屏相交」——两条以前都是盲区
+        # （line_window 从 _common 导进来了却一次没用过）。
+        _check_vo_windows(timing, stats)
 
     ducked_music = music * duck_gain[:, None]
     sfx = (
@@ -984,7 +1178,11 @@ def main(argv=None) -> int:
     if intervals:
         margin_results, worst = _check_vo_margin(np, vo_bus, ducked_music, stats, intervals)
 
-    _master(np, premaster_path, out_path)
+    # 母带会告诉我们 loudnorm 有没有回落成动态模式（PLR 超 13 dB）：回落时成片里的
+    # 逐句余量比这里打印的低 1~2 dB，闸门必须跟着抬到 8 dB（AGENTS.md 阶段 8 的路②）。
+    master_mode = _master(np, premaster_path, out_path)
+    plr_fallback = master_mode == MASTER_MODE_PLR_FALLBACK
+    margin_threshold_db = _margin_threshold_db(master_mode)
     integrated, true_peak = _measure_loudness(out_path)
 
     # 真峰值兜底：loudnorm 的 TP 限制器是「自己的真峰值估计」，与 ebur128 的 4× 过采样测量
@@ -1052,25 +1250,46 @@ def main(argv=None) -> int:
                 f"{item['id']}（{item['note']}）" for item in skipped))
     else:
         log("人声余量：无（本次没有混入人声）")
+    # 母带的两种模式：回落成动态模式时，成片余量比上面打印的低 1~2 dB，
+    # 所以闸门按 8 dB 判（AGENTS.md 阶段 8 的路②：按打印余量再留 2 dB）。
+    log(f"母带模式：{MASTER_MODE_LABEL[master_mode]}")
+    log(
+        "人声余量判据：PLR 回落状态 = "
+        + ("已回落（loudnorm 走动态模式）→ 本次按 %.0f dB 判" % margin_threshold_db
+           if plr_fallback else
+           "未回落（loudnorm 走线性模式）→ 本次按 %.0f dB 判" % margin_threshold_db)
+    )
+    if plr_fallback:
+        log(
+            "  ↑ 素材 PLR 超过 %.0f LUFS / TP %.1f dBFS 允许的 %.1f dB，母带不是整体增益："
+            "成片里每句的实际余量比打印值低 1~2 dB，所以判据从 %.0f dB 抬到 %.0f dB。"
+            "想回到 %.0f dB 判据，就给母带前总线过一遍限制器把真峰值压到 -6 dBFS 以下。"
+            % (TARGET_LUFS, TARGET_TP, TARGET_TP - TARGET_LUFS,
+               VO_MARGIN_FAIL_DB, VO_MARGIN_PLR_FALLBACK_DB, VO_MARGIN_FAIL_DB)
+        )
     log("=" * 72)
 
     # ---- 闸门 ----
     # AGENTS.md 阶段 8：每句人声比该处音乐高 ≥6 dB。低于它就是 ERROR（不再有 3~6 dB 的 WARN 区）。
+    # PLR 回落时阈值抬到 8 dB：打印 8 dB 才等于成片里的 6 dB（阶段 8 的路②）。
     hard_fail = False
     for item in margin_results:
         if item["margin_db"] is None:
             continue
-        if item["margin_db"] < VO_MARGIN_FAIL_DB:
+        if item["margin_db"] < margin_threshold_db:
             sys.stderr.write(
-                "ERROR: 第 %s 句人声只高出音乐 %.1f dB（AGENTS.md 阶段 8 要求 ≥ %.0f dB）\n"
-                % (item["id"], item["margin_db"], VO_MARGIN_FAIL_DB)
+                "ERROR: 第 %s 句人声只高出音乐 %.1f dB（AGENTS.md 阶段 8 要求 ≥ %.0f dB%s）\n"
+                % (item["id"], item["margin_db"], margin_threshold_db,
+                   "；本次母带 PLR 回落成动态模式，按打印余量再留 2 dB" if plr_fallback else "")
             )
             hard_fail = True
     if hard_fail:
         error(
-            "有句子的人声被配乐盖住（余量 < %.0f dB，AGENTS.md 阶段 8 的硬性要求），本次混音不通过。"
+            "有句子的人声被配乐盖住（余量 < %.0f dB，AGENTS.md 阶段 8 的硬性要求%s），本次混音不通过。"
             "改法：调小 timing.json 的 music.gain、把 voice.duckDb 调得更低（例如 -12）、"
-            "或让 tts.py 把音量再抬一点" % (VO_MARGIN_FAIL_DB,)
+            "或让 tts.py 把音量再抬一点"
+            % (margin_threshold_db,
+               "；本次是 PLR 回落后的加严阈值" if plr_fallback else "")
         )
     if integrated is not None and not (TARGET_LUFS - 2.0 <= integrated <= TARGET_LUFS + 2.0):
         warn(

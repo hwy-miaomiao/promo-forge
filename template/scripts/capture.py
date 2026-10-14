@@ -212,6 +212,29 @@ def _parse_at(raw: Optional[str]) -> List[float]:
     return out
 
 
+def _scroll_to(page, y: float) -> None:
+    """滚动到 y，**回读真实位置后**再说话。
+
+    页面不够高、内容在自绘容器里滚、或站点自己接管了滚动时，``window.scrollTo()``
+    不报错但页面根本没动。不回读就会在日志里谎报「已滚动到 y=…」，
+    拿到手的截图其实是另一段内容 —— 所以这里只报读到的事实。
+    """
+    page.evaluate("(y) => window.scrollTo(0, y)", y)
+    try:
+        actual = float(page.evaluate("() => Math.round(window.scrollY)"))
+    except Exception:
+        actual = None
+    if actual is None:
+        C.log(f"    （请求滚动到 y={y:.0f}，没读到实际位置，无法确认）")
+    elif abs(actual - y) <= 1:
+        C.log(f"    （已滚动到 y={actual:.0f}）")
+    else:
+        C.warn(
+            f"    目标 y={y:.0f}，页面实际停在 y={actual:.0f}"
+            "（页面不够高，或者滚动被页面自己接管；这张图可能不是你以为的那一段）"
+        )
+
+
 def _flatten(groups: Optional[Sequence[Sequence[str]]]) -> List[str]:
     out: List[str] = []
     for g in groups or []:
@@ -425,11 +448,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             # ④ --at 逐张
             for idx, y in enumerate(at_list, start=1):
-                page.evaluate("(y) => window.scrollTo(0, y)", y)
+                _scroll_to(page, y)
                 page.wait_for_timeout(SHOT_SETTLE * 1000)
                 apply_hides()
                 shoot(str(idx), f"y={y:.0f}")
-                C.log(f"    （已滚动到 y={y:.0f}）")
 
             # ⑤ --full 长图
             if args.full is not None:

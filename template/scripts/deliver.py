@@ -607,6 +607,11 @@ class Media:
 
         self.width = int((self.video or {}).get("width") or 0)
         self.height = int((self.video or {}).get("height") or 0)
+        #: 有没有视频流。没有视频流的文件（纯音频 mp4、被 ffmpeg -vn 处理过的产物）
+        #: 必须直接判 ERROR：它的 width/height 都是 0，画幅 0.0 会越出所有平台的区间，
+        #: 于是「越界」这件事只能靠副作用偶然被发现——而抖音/小红书/Shorts 的第三方
+        #: 口径只给 WARN，全套检查就会凑出 0 ERROR 并打印「全部平台 0 ERROR」。
+        self.has_video = self.video is not None
         self.codec = str((self.video or {}).get("codec_name") or "?")
         self.pix_fmt = str((self.video or {}).get("pix_fmt") or "?")
         self.audio_codec = str((self.audio or {}).get("codec_name") or "")
@@ -687,6 +692,20 @@ def _fmt_bitrate(bps: Optional[int]) -> str:
     return f"{bps / 1_000_000:.2f} Mbps"
 
 
+def _check_streams(m: Media, p: Dict[str, Any]) -> Check:
+    """有没有视频流。这是「这是个成片吗」的前置判据，先于所有平台口径。
+
+    没有视频流时后面的分辨率 / 画幅 / 帧率 / 码率全部失去意义（读到的是 0），
+    所以这里给 ERROR，其余检查项按「需人工确认」跳过，避免刷出一堆误导性的红字。
+    """
+    if m.video is not None:
+        return _mk("视频流", f"{m.codec} / {m.width}×{m.height}", "必须有", "OK", "official")
+    return _mk("视频流", "无", "必须有", "ERROR", "official",
+               "这个文件里没有视频流（只有音频流或完全是空的），它不是一支能交付的成片。"
+               "常见原因：导出时只写了音频、或误把 mix.py 的产物当成了成片。"
+               "请回到 `npm run render:1080` 重新渲染，产物应是 out/final-1080p.mp4")
+
+
 def _check_duration(m: Media, p: Dict[str, Any]) -> Check:
     lo, hi = p["dur"]
     conf = p["conf"]["dur"]
@@ -709,6 +728,10 @@ def _check_duration(m: Media, p: Dict[str, Any]) -> Check:
 def _check_resolution(m: Media, p: Dict[str, Any]) -> Check:
     res = p.get("res")
     conf = p["conf"].get("res", "unknown")
+    if not m.has_video:
+        # 0×0 是「没有视频流」的症状，不是分辨率问题——真正的 ERROR 由 _check_streams 给出
+        return _mk("分辨率", f"{m.width}×{m.height}", "需人工确认", "INFO", "unknown",
+                   "没有视频流，分辨率无从谈起；先按「视频流」那条 ERROR 重新渲染")
     if not res or not m.width:
         return _mk("分辨率", f"{m.width}×{m.height}", "需人工确认", "INFO", "unknown",
                    "推荐分辨率没查到确切数字，请以投稿页面为准")
@@ -725,14 +748,26 @@ def _check_resolution(m: Media, p: Dict[str, Any]) -> Check:
                    f"竖屏方向对，但推荐值是 {rec_w}×{rec_h}；"
                    "低于它平台会放大（发虚），高于它会被二压。"
                    "建议按 timing.json 的 width/height 重渲（render:1080 出 1080×1920）")
-    return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}", "ERROR", conf,
-               f"这是横屏画面，但 {p['name']} 的主流量是竖屏（{rec_w}×{rec_h}）。"
-               "横屏投稿会被加黑边、算法推荐更差；请改 timing.json 的 aspect 为 9:16 并把 width/height 换成 1080/1920 后重渲")
+    # 横版：AGENTS.md 第 1 节明确允许「可选 1920×1080 横版」，所以它不能是硬 ERROR。
+    # 口径是第三方的（`conf != "official"`）时按 WARN 处理，与本文件 _check_aspect 的
+    # 分级口径保持一致；视频号的竖屏推荐值来自官方帮助页，横版对它是硬伤，仍判 ERROR。
+    # （放宽这里时必须同时有 _check_streams 的判空，否则无视频流的文件会变成 0 ERROR 假绿。）
+    return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}",
+               "ERROR" if conf == "official" else "WARN", conf,
+               f"这是横屏画面，而 {p['name']} 的主流量是竖屏（{rec_w}×{rec_h}）。"
+               + ("横屏投稿会被加黑边、算法推荐更差；" if conf == "official"
+                  else f"这个推荐值来自第三方汇总（非官方），横版发布前请到 {p['name']} 的投稿页确认；")
+               + "横版是规范允许的形态（AGENTS.md 第 1 节：首选竖屏，可选 1920×1080 横版），"
+                 "要竖屏就改 timing.json 的 aspect 为 9:16、width/height 换成 1080/1920 后重渲")
 
 
 def _check_aspect(m: Media, p: Dict[str, Any]) -> Check:
     (lo, hi), note = p["aspect"]
     conf = p["conf"].get("aspect", "unknown")
+    if not m.has_video:
+        # aspect 读到 0.0（height=0），越界只是症状；真 ERROR 在 _check_streams
+        return _mk("画幅", "?", "需人工确认", "INFO", "unknown",
+                   "没有视频流，画幅无从谈起；先按「视频流」那条 ERROR 重新渲染")
     if conf == "unknown":
         return _mk("画幅", f"{m.aspect_label}（{m.aspect:.3f}）", "需人工确认", "INFO", conf,
                    "平台画幅范围没查到确切数字，请以投稿页面为准")
@@ -746,6 +781,9 @@ def _check_aspect(m: Media, p: Dict[str, Any]) -> Check:
 
 def _check_fps(m: Media, p: Dict[str, Any]) -> Check:
     fps = m.fps
+    if not m.has_video:
+        return _mk("帧率", "?", "≥24fps", "INFO", "unknown",
+                   "没有视频流，帧率无从谈起；先按「视频流」那条 ERROR 重新渲染")
     if fps <= 0:
         return _mk("帧率", "?", "≥24fps", "WARN", "thirdparty",
                    "ffprobe 没报出帧率（可能是可变帧率文件）；请重渲成恒定帧率，卡点才会准")
@@ -764,6 +802,9 @@ def _check_fps(m: Media, p: Dict[str, Any]) -> Check:
 def _check_bitrate(m: Media, p: Dict[str, Any]) -> Check:
     spec = p.get("vbitrate")
     conf = p["conf"].get("vbitrate", "unknown")
+    if not m.has_video:
+        return _mk("码率", "?", "需人工确认", "INFO", "unknown",
+                   "没有视频流，码率无从谈起；先按「视频流」那条 ERROR 重新渲染")
     if not spec:
         return _mk("码率", _fmt_bitrate(m.video_bitrate), "需人工确认", "INFO", "unknown",
                    "平台码率建议没查到确切数字；经验值（非官方）：1080p 给 6~16 Mbps，越高越抗二压")
@@ -890,6 +931,7 @@ def run_platform_checks(m: Media, key: str, lufs_min: float, lufs_max: float) ->
     """对一个平台跑全部检查项，返回这次产生的 Check 列表。"""
     p = PLATFORMS[key]
     start = len(ALL_CHECKS)
+    _check_streams(m, p)
     _check_duration(m, p)
     _check_resolution(m, p)
     _check_aspect(m, p)

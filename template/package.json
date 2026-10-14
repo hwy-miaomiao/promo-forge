@@ -4,6 +4,10 @@
   "private": true,
   "description": "promo-forge 视频工程模板：Remotion + 免费配音 + 自动校验闸门",
   "license": "MIT",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "remotion studio src/index.ts",
     "lint": "tsc --noEmit",

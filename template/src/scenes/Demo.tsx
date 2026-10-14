@@ -283,6 +283,12 @@ export const Demo: React.FC = () => {
   const s3 = barSec(8);
   const sections = [s1, s2, s3];
 
+  // ❗下面 vis() 的第二个参数是**场景相对秒**，所以这里必须取「本场景的绝对终点 − 场景起点」：
+  // t = useSceneTime("demo") 从 0 数到 21.5，直接给 vis(s3, TIMING.duration)（=45，全片时长）
+  // 会让第三个假界面永远到不了 end - 0.3，永远不淡出（实测：t=21.5 时 opacity 仍是 1）。
+  const demoSce = TIMING.scenes.find((s) => s.name === "demo");
+  const demoSec = demoSce ? demoSce.end - demoSce.start : TIMING.duration;
+
   const active = t >= s3 ? 2 : t >= s2 ? 1 : 0;
 
   /** 小节可见度：淡入 0.4 秒、退场 0.3 秒，避免两节同时半透明。 */
@@ -364,7 +370,7 @@ export const Demo: React.FC = () => {
                 <ClassifyMock type={type} t={t - s2} w={MOCK_DESIGN_W} h={MOCK_DESIGN_H} />
               </div>
             </div>
-            <div style={{ position: "absolute", inset: 0, opacity: vis(s3, TIMING.duration) }}>
+            <div style={{ position: "absolute", inset: 0, opacity: vis(s3, demoSec) }}>
               <div style={{ width: MOCK_DESIGN_W, height: MOCK_DESIGN_H, transform: `scale(${mockScale})`, transformOrigin: "top left" }}>
                 <ReportMock type={type} t={t - s3} w={MOCK_DESIGN_W} h={MOCK_DESIGN_H} />
               </div>

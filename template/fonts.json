@@ -31,7 +31,8 @@
         "monospace"
       ],
       "weight": 400,
-      "file": "fonts/promo-subset-body.ttf"
+      "file": "fonts/promo-subset-body.ttf",
+      "note": "English on purpose: any CJK added here would enter the subtitle font subset (fonts.json is scanned as on-screen text), so this note stays ASCII to keep the subset at 386 chars. WHY mono reuses the body subset: the mono stack (JetBrains Mono / SF Mono / Consolas) has no CJK coverage, so a separate mono subset would either drop Chinese glyphs or waste bytes; Microsoft YaHei's digits are monospaced (advance 1201/2048), so numeric columns stay aligned. See lib/fonts.ts for how the subset is registered ahead of the stack."
     }
   },
   "check": {
@@ -53,7 +54,7 @@
     "name": "promo-subset",
     "flavor": "sfnt",
     "ext": ".ttf",
-    "chars": 341,
+    "chars": 386,
     "roles": {
       "display": {
         "file": "fonts/promo-subset-display.ttf",
@@ -62,7 +63,7 @@
         "face": "Microsoft YaHei Bold",
         "faceWeight": 700,
         "targetWeight": 800,
-        "bytes": 144632
+        "bytes": 170216
       },
       "body": {
         "file": "fonts/promo-subset-body.ttf",
@@ -71,7 +72,7 @@
         "face": "Microsoft YaHei",
         "faceWeight": 400,
         "targetWeight": 400,
-        "bytes": 161240
+        "bytes": 189244
       },
       "mono": {
         "file": "fonts/promo-subset-body.ttf",
@@ -80,8 +81,9 @@
         "face": "Microsoft YaHei",
         "faceWeight": 400,
         "targetWeight": 400,
-        "bytes": 161240,
-        "reusedFrom": "body"
+        "bytes": 189244,
+        "reusedFrom": "body",
+        "note": "English on purpose: any CJK added here would enter the subtitle font subset (fonts.json is scanned as on-screen text), so this note stays ASCII to keep the subset at 386 chars. WHY mono reuses the body subset: the mono stack (JetBrains Mono / SF Mono / Consolas) has no CJK coverage, so a separate mono subset would either drop Chinese glyphs or waste bytes; Microsoft YaHei's digits are monospaced (advance 1201/2048), so numeric columns stay aligned."
       }
     }
   }

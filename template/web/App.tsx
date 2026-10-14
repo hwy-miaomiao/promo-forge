@@ -14,7 +14,9 @@
  *   1) `aspect-ratio: var(--ratio)` + `container-type: inline-size` + `cqw` 单位：
  *      所有尺寸都相对**容器宽**，手机上字小、桌面上字大，一套数值通吃；
  *   2) 页面本身是纵向 flex，高度不足时滚动，不做固定视口高度（iOS 地址栏会吃掉 vh）；
- *   3) 竖屏视频居中显示并限制最大高度，横屏手机上自动变成"视频在左、文案在右"。
+ *   3) 竖屏视频居中显示并限制最大高度；横屏手机（`orientation: landscape` 且高 ≤560px）
+ *      由 `style.css` 末尾那条 media query 改成"视频在左、文案在右"两栏 ——
+ *      单列布局在 844×390 这类横屏里会把文案和页脚整个挤出首屏。
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Player, type PlayerRef } from "@remotion/player";
@@ -28,6 +30,13 @@ type Phase = "loading" | "poster" | "playing" | "ended";
 
 export const App = () => {
   const playerRef = useRef<PlayerRef>(null);
+  // 播放器**挂上了没有**。<Player> 只在预取完成后才渲染（见下面 `phase !== "loading"`），
+  // 而"注册玩家事件"那个 effect 如果只依赖 []，第一次跑时 playerRef.current 还是 null、
+  // 直接 return，之后**永远不会再跑** —— play / ended / frameupdate 一个都注册不上，
+  // 点封面后 phase 卡在 "poster"：海报层继续盖着、进度条和结束卡片永不出现（播放整体失效）。
+  // 所以用一个回调 ref 把"挂载完成"翻成 state，再把它当 effect 的依赖：挂载时注册、
+  // 卸载时清理，播放器被换掉（null → 新实例）也会重新注册。
+  const [playerReady, setPlayerReady] = useState(false);
   const [phase, setPhase] = useState<Phase>("loading");
   const [progress, setProgress] = useState(0); // 0~1
   const [failed, setFailed] = useState<string | null>(null);
@@ -60,7 +69,17 @@ export const App = () => {
   }, []);
 
   // ---- 2. 玩家事件 → 状态机 ------------------------------------------------
+  // 回调 ref：Player 挂载/卸载时同时更新 playerRef 和 playerReady。
+  // 不能只写 `<Player ref={playerRef}>`：那样没人知道"挂上了没有"，
+  // 下面那个 effect 就只能跑一次，而它跑的时候播放器还没挂载。
+  const handlePlayerRef = useCallback((node: PlayerRef | null) => {
+    playerRef.current = node;
+    setPlayerReady(node !== null);
+  }, []);
+
   useEffect(() => {
+    // playerReady=false：播放器还没挂载（资源预取中），没有可以注册监听的对象
+    if (!playerReady) return;
     const player = playerRef.current;
     if (!player) return;
     const onPlay = () => setPhase("playing");
@@ -75,7 +94,8 @@ export const App = () => {
       player.removeEventListener("ended", onEnded);
       player.removeEventListener("frameupdate", onFrame);
     };
-  }, []);
+    // 依赖 playerReady（而不是 []）：播放器挂载完成后这个 effect 才会真正跑一次（见上）
+  }, [playerReady]);
 
   const play = useCallback(() => {
     setFrame(0);
@@ -116,7 +136,7 @@ export const App = () => {
         <div className="screen">
           {phase !== "loading" ? (
             <Player
-              ref={playerRef}
+              ref={handlePlayerRef}
               component={Promo}
               inputProps={{ withAudio: true }}
               durationInFrames={PLAYER.durationInFrames}
