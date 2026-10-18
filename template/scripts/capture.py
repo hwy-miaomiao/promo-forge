@@ -19,7 +19,8 @@
 
 退出码
     0 = 截图完成（可能有 WARN）
-    1 = 缺 playwright / 浏览器、打不开页面、一张都没截成、有 --eval 执行失败
+    1 = 缺 playwright / 浏览器、打不开页面、一张都没截成、有 --eval 执行失败、
+        --login 在非交互终端里跑（没法等你按回车，见 V5）
 """
 
 from __future__ import annotations
@@ -74,6 +75,15 @@ DEFAULT_QUALITY = 92
 #: 截图宽度低于该值就 WARN。来源：AGENTS.md 阶段 4「1080 宽显示 → 2160 像素」，
 #: 低于 1440 的图放进视频放大后一定糊。
 MIN_USEFUL_WIDTH = 1440
+#: 手机预设的清晰度下限。手机截图在竖屏片子里只占约 300~500 逻辑像素宽（手机模型内），
+#: 2 倍图 600~1000px 就够：iphone 390×3=1170、android 412×2.625=1082，都不该被报警。
+#: 来源：pr-b4#F4（旧实现用固定 1440 把两种手机预设全判成 WARN，还建议换 desktop）。
+MIN_USEFUL_WIDTH_PHONE = 1000
+#: 各设备预设对应的清晰度下限；不在这张表里的（默认视口 / desktop / tablet）用 MIN_USEFUL_WIDTH。
+MIN_USEFUL_WIDTH_BY_DEVICE = {
+    "iphone": MIN_USEFUL_WIDTH_PHONE,
+    "android": MIN_USEFUL_WIDTH_PHONE,
+}
 #: 懒加载滚动：每步等 0.3 秒、最多 60 步（防止无限滚动页面把脚本挂住）。
 #: 来源：AGENTS.md 阶段 4 要求截图前触发懒加载；0.3s 是实测大多数图片解码完成的间隔。
 LAZY_STEP_WAIT = 0.3
@@ -243,17 +253,26 @@ def _flatten(groups: Optional[Sequence[Sequence[str]]]) -> List[str]:
     return out
 
 
-def _report(path: Path, factor: float) -> bool:
-    """打印一张截图的实际像素尺寸；宽度不够返回 False。"""
+def _report(path: Path, factor: float, min_width: int, device: Optional[str]) -> bool:
+    """打印一张截图的实际像素尺寸；宽度不够返回 False。
+
+    ``min_width`` 由设备预设决定（手机预设的下限低得多，见 MIN_USEFUL_WIDTH_PHONE），
+    不再拿统一的 1440 去卡手机截图，WARN 文案也不会一律建议换 desktop（V4）。
+    """
     size = _jpeg_size(path)
     if size is None:
         C.log(f"OK: {C.rel(path)} （截到了，但读不出像素尺寸）")
         return True
     w, h = size
     C.log(f"OK: {C.rel(path)} {w}x{h}（{factor:g} 倍图）")
-    if w < MIN_USEFUL_WIDTH:
-        C.warn(f"{C.rel(path)} 只有 {w}px 宽（< {MIN_USEFUL_WIDTH}）：放进 1080 宽的竖屏再放大就会糊。"
-               f"换 --device desktop，或调大 --factor，或截更窄的容器。")
+    if w < min_width:
+        if device in MIN_USEFUL_WIDTH_BY_DEVICE:
+            C.warn(f"{C.rel(path)} 只有 {w}px 宽（< {min_width}，{device} 预设的清晰度下限）："
+                   "片子里手机截图只占约 300~500 逻辑像素宽，正常不会糊；"
+                   "如果你打算把这张图放大铺满画面，把 --factor 调大（例如 4）再截。")
+        else:
+            C.warn(f"{C.rel(path)} 只有 {w}px 宽（< {min_width}）：放进 1080 宽的竖屏再放大就会糊。"
+                   "换 --device desktop，或调大 --factor，或截更窄的容器。")
         return False
     return True
 
@@ -305,6 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # --login 要等你在真实终端里按回车。非交互终端（CI / IDE 后台 / 管道）里过去
+    # 只 WARN 就继续，最后以退出码 0 交出一整套登录页截图，check_assets 查不出来（V5）。
+    # 这里直接失败：宁可一条都不截，也不要产出「看起来成功、其实是登录页」的素材。
+    if args.login and not sys.stdin.isatty():
+        C.error("标准输入不是交互终端，没法等你按回车登录：--login 需要在真实终端里跑。"
+                "CI / IDE 后台执行请去掉 --login；先在本地终端登录一次，"
+                "登录态会存进 out/.browser-profile，后续命令自动复用。")
+
     # playwright 延迟导入：没装也要能看 --help
     try:
         from playwright.sync_api import TimeoutError as PWTimeout
@@ -327,6 +354,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         factor = float(args.factor) if args.factor is not None else DEFAULT_FACTOR
     if factor <= 0:
         C.error(f"--factor 必须 > 0，现在是 {factor}")
+    # 清晰度下限按设备预设选：手机截图在片子里只占 300~500 逻辑像素宽，
+    # 拿 1440 卡 1170/1082 会误报（V4）。见 MIN_USEFUL_WIDTH_BY_DEVICE。
+    min_width = MIN_USEFUL_WIDTH_BY_DEVICE.get(args.device or "", MIN_USEFUL_WIDTH)
 
     at_list = _parse_at(args.at)
     hides = _flatten(args.hide)
@@ -394,14 +424,37 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.wait > 0:
                 page.wait_for_timeout(args.wait * 1000)
 
-            # ① 懒加载触发
+            # ① --login：先登录，再跑 --eval / --hide / 截图（V2）。
+            # 过去先跑 --eval 再等登录：--eval 在登录页上执行必然抛错，收尾把它判成
+            # exit 1，而截出来又是登录后页面，看起来像成功。登录完成后重新 goto 一次
+            # 目标页：登录流程可能跳到别的 URL，登录后的页面也值得重新等 networkidle。
+            if args.login:
+                print("")
+                print(">>> 浏览器窗口已打开，请手动登录。登录完成后回到这里按回车继续截图。")
+                try:
+                    input()
+                except (EOFError, KeyboardInterrupt):
+                    C.warn("没读到回车，直接继续")
+                C.log("登录完成，重新打开目标页（带上登录态）…")
+                try:
+                    page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+                except PWTimeout:
+                    C.warn(f"{NAV_TIMEOUT_MS // 1000} 秒内页面没 load 完，继续按已渲染的内容截图")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT_MS)
+                except PWTimeout:
+                    C.warn("页面没有进入 networkidle（可能有长轮询/埋点），继续截图")
+                if args.wait > 0:
+                    page.wait_for_timeout(args.wait * 1000)
+
+            # ② 懒加载触发（--login 时是登录后的页面，滚到的才是真实内容）
             try:
                 height = page.evaluate(LAZY_LOAD_JS)
                 C.log(f"OK: 已触发懒加载（页面总高约 {height}px）")
             except Exception as exc:
                 C.warn(f"懒加载脚本执行失败（继续截图）：{type(exc).__name__}: {exc}")
 
-            # ② 用户自定义 JS
+            # ③ 用户自定义 JS（--login 时登录后执行，登录页上执行必然失败）
             for js in evals:
                 try:
                     page.evaluate(js)
@@ -411,18 +464,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     C.warn(msg)
                     eval_failures.append(msg)
 
-            # ③ 隐藏元素
-            if args.login:
-                if sys.stdin.isatty():
-                    print("")
-                    print(">>> 浏览器窗口已打开，请手动登录。登录完成后回到这里按回车继续截图。")
-                    try:
-                        input()
-                    except (EOFError, KeyboardInterrupt):
-                        C.warn("没读到回车，直接继续")
-                else:
-                    C.warn("标准输入不是交互终端，无法等待回车；请改在真实终端里跑 --login，登录态才会完整保存")
-
+            # ④ 隐藏元素
             def apply_hides() -> None:
                 if hides:
                     result = page.evaluate(HIDE_JS, hides)
@@ -442,18 +484,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 path = out_dir / f"{args.name}-{suffix}.jpg"
                 page.screenshot(path=str(path), type="jpeg", quality=args.quality)
                 shots.append(path)
-                if not _report(path, factor):
+                if not _report(path, factor, min_width, args.device):
                     nonlocal too_narrow
                     too_narrow += 1
 
-            # ④ --at 逐张
+            # ⑤ --at 逐张
             for idx, y in enumerate(at_list, start=1):
                 _scroll_to(page, y)
                 page.wait_for_timeout(SHOT_SETTLE * 1000)
                 apply_hides()
                 shoot(str(idx), f"y={y:.0f}")
 
-            # ⑤ --full 长图
+            # ⑥ --full 长图
             if args.full is not None:
                 full_h = int(round(args.full))
                 if full_h < viewport[1]:
@@ -465,7 +507,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 shoot("full", "整页")
                 page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
 
-            # ⑥ 都没指定 -> 首屏一张
+            # ⑦ 都没指定 -> 首屏一张
             if not at_list and args.full is None:
                 page.evaluate("() => window.scrollTo(0, 0)")
                 page.wait_for_timeout(SHOT_SETTLE * 1000)
@@ -489,7 +531,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     C.log("")
     C.log(f"完成：{len(shots)} 张 -> {C.rel(out_dir)}")
     if too_narrow:
-        C.warn(f"其中 {too_narrow} 张宽度不足 {MIN_USEFUL_WIDTH}px，放大后会糊（见上面的 WARN）")
+        C.warn(f"其中 {too_narrow} 张宽度低于该设备预设的清晰度下限 {min_width}px，放大后会糊（见上面的 WARN）")
     if args.login or profile_dir.exists():
         C.log(f"登录态目录：{C.rel(profile_dir)}（下次直接跑同一条命令即可复用，不用再登）")
     C.log(f"下一步：python scripts/media.py info {C.rel(out_dir)}    # 自查清晰度")

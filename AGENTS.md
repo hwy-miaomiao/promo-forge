@@ -143,7 +143,7 @@ python scripts/fonts.py check      # 确认 0 缺字；改了文案或加了场�
 ### 阶段 6 · 分镜制作
 
 - 一个场景 = 一个组件，组件自己按 `timing.json` 的窗口判断显示与否，窗口外必须 `return null`。
-- **时间基准只有两套，混用必翻车**：`timing.json` 里的 `scenes[].start/end`、`voice.lines[].at` 是**全片绝对秒**；场景组件里的 `t = useSceneTime(name)` 是**本场景相对秒**（Promo 的 `<Sequence>` 已经减掉场景起点）。所以在场景里取卡点一律用 `useBeat()`：`beat.now / beat.at(i) / beat.barAt(i) / beat.snap(t, unit)` 全是**场景相对秒**（`energy/phase/onBeat` 也接受相对秒），要绝对秒就显式取 `beat.abs`。把 `snap()` / `beatAt()` 返回的绝对秒直接和 `t` 比大小，症状是**整场只剩字幕、画面全黑且没有任何报错**（示例模板第一版真的这么翻车过）。
+- **时间基准只有两套，混用必翻车**：`timing.json` 里的 `scenes[].start/end`、`voice.lines[].at` 是**全片绝对秒**；场景组件里的 `t = useSceneTime(name)` 是**本场景相对秒**（Promo 的 `<Sequence>` 已经减掉场景起点）。所以在场景里取卡点一律用 `useSceneBeat("<场景名>")`（`const beat = useSceneBeat("proof")`；`useBeat("<场景名>")` 是同一条路径的另一个名字，**两者都必须传场景名**——零参调用会直接编译失败，因为旧版零参 `useBeat()` 的 start 恒为 0，`at/barAt/snap` 返回的是绝对秒，正是下面要警告的陷阱）：`beat.now / beat.at(i) / beat.barAt(i) / beat.snap(t, unit)` 全是**场景相对秒**（`energy/phase/onBeat` 也接受相对秒），要绝对秒就显式取 `beat.abs`。把 `snap()` / `beatAt()` 返回的绝对秒直接和 `t` 比大小，症状是**整场只剩字幕、画面全黑且没有任何报错**（示例模板第一版真的这么翻车过；旧版零参 `useBeat()` 已改为强制签名，不传场景名编译不过）。
 - 所有画面尺寸用相对单位（`useVideoConfig()` 的宽高比、百分比），保证同一套场景在 9:16 与 16:9 下都不破版。
 - 遵循第 4 节的节奏底线与密度要求；每个场景做完用 `npm run stills -- --scenes` 出图自查。
 
@@ -160,6 +160,12 @@ python scripts/tts.py audit      # 检查每句时长是否落在窗口内、有
 - 字幕：竖屏单行 ≤13 字、最多 2 行，屏上大字**最多比旁白早 1.5 秒**出现；停留时长 ≥ `字数 / 6 + 0.35` 秒
   （配音 5.5~6.5 字/秒，**字幕必须活到人声读完**，否则句尾还在念、字幕已经消失）。模板组件取
   `max(字数/8+0.4, 字数/6+0.35)`，并在场景结束前 0.15 秒收掉，避免和下一场景的字幕叠在一起。
+- 字幕字号由脚本按安全区换算，**不许手写死**：`min(画布高 × 0.038, (画布宽 − 左右留白) / captions.maxChars)`。
+  竖屏 1080×1920 时 = min(73, 864/13) = **66px**；只按高度算的 73px 会让 13 个全角字（949px）越过
+  右侧 14% 留白，侵入平台互动按钮区（`subtitles.py` 生成 ASS 时会把字号压到 66 并打日志）。
+- 断行**不许拆词**：优先标点/语义边界，`URL`/英文单词/数字整段不可拆，装不下就整词下移；只有单个词
+  本身比整行还宽才从中间硬切并 WARN。因此一句话若放不进 2 行，`subtitles.py srt/ass/burn` 会**直接
+  ERROR**（不是静默多一行）：回去删字，或调大 `captions.maxChars`、调小字号对应的画面文案。
 - 字幕有两条路：**画面内字幕**（`<Caption>` 组件，跟着画面一起渲染）和**字幕文件 / 硬字幕**
   （`scripts/subtitles.py`，给平台上传用，或平台不认软字幕时烧进画面）：
 
@@ -236,8 +242,8 @@ python scripts/deliver.py check out/final-1080p.mp4 --platform all
 python scripts/deliver.py cover out/final-1080p.mp4 --title "每天记账要花十几分钟？"
 ```
 
-- `check` 按平台给硬限制与推荐值；**抖音、小红书的官方口径脚本抓不到**，那部分按 WARN 处理，
-  交付时必须说清"需人工确认"。
+- `check` 按平台给硬限制与推荐值；**抖音、小红书的官方口径脚本抓不到**，那部分标「需人工确认」
+  （只提示、不参与判定，不会因此刷 WARN）；第三方汇总口径才按 WARN 处理，交付时必须说清"需人工确认"。
 - `cover` 出三张 1080×1920 候选封面 + 联系表：文字自动排进安全区、越界自动缩字号；
   封面文字可能压住画面自带的字，脚本用亮像素比例粗判并提示换 `--position bottom|middle|top`，
   最终**必须逐张看图**再交（`references/校验清单.md` 的 B8）。
@@ -359,8 +365,9 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 | `scripts/subtitles.py` | 字幕：导出 SRT / ASS，烧成硬字幕或软字幕 | `srt [--out out/subtitles/zh.srt]` / `ass [--out out/subtitles/zh.ass]` / `burn [<mp4>] [-o out/final-1080p-hard.mp4] [--soft] [--preview <秒>]` |
 | `scripts/fonts.py` | 字体子集化与内嵌（换机器不缺字） | `subset [--role all\|display\|body\|mono] [--out public/fonts] [--name promo-subset] [--weight 700] [--flavor auto\|woff2\|ttf\|otf]` / `check` |
 | `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` |
-| `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` |
-| `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log]` |
+| `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` / `--selftest`（纯函数自测，不读素材） |
+| `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log]` / `--selftest` |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款） | 无 |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
 | `scripts/sync_template.py` | 用新版模板更新已有项目 | `[--diff] [--apply] [--force]` |
 
@@ -369,12 +376,13 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 | 闸门 | 通过条件 |
 | --- | --- |
 | `doctor.py` | 无 MISSING（WARN 可接受） |
-| `check_assets.py` | 0 ERROR；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 |
-| `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨；响度 -16~-12 LUFS；无 ≥1.0 秒空档；渲染日志无报错 |
-| `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO` 需人工确认） |
+| `scripts/selftest.py` | 3 个脚本的 `--selftest` + Python 3.9 写盘 smoke（真写 SRT）/ API 扫描全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
+| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
+| `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`）；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
+| `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO`：脚本已自动截掉低能量拖音，重跑仍报说明尾巴能量不低，需人工试听确认） |
 | `fonts.py check` | 0 ERROR：片子用到的每个字符都有字形（内嵌子集或系统字体都算） |
-| `deliver.py check` | 目标平台 0 ERROR；码率/体积类 WARN 由人判断（抖音、小红书的官方口径脚本抓不到） |
-| `subtitles.py burn` | 烧完硬字幕的片子仍要过 `check_video.py`（音轨用 `-c:a copy` 保留）；烧之前画面里必须没有自带字幕 |
+| `deliver.py check` | 目标平台 0 ERROR；「需人工确认」项（抖音/小红书的官方码率、体积口径）只提示、不参与判定；第三方汇总口径 WARN 由人逐条判断；音轨/视频流是「本项目规范」不是平台限制 |
+| `subtitles.py srt/ass/burn` | 折行超过 `captions.maxLines` 直接 ERROR（最多 2 行是硬要求，不是 WARN）；字号自动压进左右安全区；burn 完的片子仍要过 `check_video.py`（音轨用 `-c:a copy` 保留）；烧之前画面里必须没有自带字幕 |
 | 人工审图 | 联系表逐张看过，`references/校验清单.md` 全部打勾 |
 
 脚本一律：**发现问题就非零退出并打印 `ERROR: ...` 行**，不要静默通过。

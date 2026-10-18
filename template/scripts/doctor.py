@@ -47,8 +47,10 @@ MIN_NODE_MAJOR = 18
 #: 症状是 `remotion render` 时报 `esbuild: Failed to install correctly, please delete node_modules`
 #: （装依赖的当天看不出来，渲染那天才炸）。低于这个版本一律 MISSING，不做「反正能装」的妥协。
 MIN_PNPM = (10, 4)
-#: `node --version` 的输出必须能从这里解析出主版本号；解析不出来时不要归因成「太老」。
-NODE_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+#: `node --version` 的输出必须**整行**是一个版本号（`v24.16.0` / `24.16`）。
+#: 用整行锚定而不是 `re.search`：`Error: unsupported engine node 20.11.0` 这种报错里
+#: 也含「20.11.0」，用 search 会把失败输出当成版本号（BUGS-REPORT P2-14）。
+NODE_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
 #: Node 装法（命令缺失时用）。
 NODE_INSTALL_FIX = "winget install OpenJS.NodeJS.LTS / brew install node / sudo apt install nodejs npm"
 #: pnpm 装法（命令缺失时用）。
@@ -202,8 +204,8 @@ def check_node(rows: List[Row]) -> None:
         rows.append(Row("Node.js", "MISSING", f"没找到 node（需要 ≥ v{MIN_NODE_MAJOR}）",
                         NODE_INSTALL_FIX))
         return
-    m = NODE_VERSION_RE.match(ver.strip())
-    if m is None:
+    parsed = _parse_version(ver)
+    if parsed is None:
         # 输出不是版本号：可能是 PATH 里排在前面的 shim / 包装脚本抢了 node，也可能只是打印了别的东西。
         # 这种情况「装/升级 Node」未必有用，所以不给升级建议，先让人看清 node 到底是谁。
         rows.append(Row("Node.js", "MISSING",
@@ -213,7 +215,7 @@ def check_node(rows: List[Row]) -> None:
                         "多半是 PATH 里排在前面的 nvm / conda / 包装脚本抢了 node，"
                         "让 node 指向官方发行版即可"))
         return
-    major = int(m.group(1))
+    major = parsed[0]
     if major >= MIN_NODE_MAJOR:
         rows.append(Row("Node.js", "OK", f"{ver}（要求 ≥ v{MIN_NODE_MAJOR}）", ""))
     else:
@@ -225,18 +227,47 @@ def check_npm(rows: List[Row]) -> None:
     ver = C.cmd_version("npm", "--version")
     if ver is None:
         rows.append(Row("npm", "MISSING", "没找到 npm（Remotion 渲染要用）", "随 Node.js 一起装：winget install OpenJS.NodeJS.LTS"))
+        return
+    parsed = _parse_version(ver)
+    if parsed is None:
+        rows.append(Row(
+            "npm", "WARN",
+            f"`npm --version` 的输出不是版本号：{ver}（解析不出主版本，无法确认 npm 是否正常）",
+            "先看 `npm --version` 到底打印了什么；再看 npm 是谁：where npm（Windows）/ which -a npm",
+        ))
     else:
         rows.append(Row("npm", "OK", f"v{ver}", ""))
 
 
+#: `pnpm --version` 这类输出可能带工具名前缀（`pnpm 10.4.0` / `npm v10.9`）。
+#: 两种形态都只认**整串**匹配；解析细节见 `_parse_version` 的 docstring。
+_VERSION_LINE_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+_VERSION_PREFIX_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$")
+
+
 def _parse_version(text: str) -> Optional[Tuple[int, ...]]:
-    """从 `x.y.z` / `vX.Y.Z` 这类输出里取版本号；取不到返回 None（不归因成「太老」）。"""
+    """从 `x.y.z` / `vX.Y.Z` / `工具名 x.y.z` 这类**整行输出**里取版本号；取不到返回 None。
+
+    旧实现用 `re.search`：`pnpm --version` 实际打的是
+    ``Error: unsupported engine node 20.11.0``（pnpm 自己版本不兼容时的报错）时，
+    search 会把报错里的 20.11.0 当成 pnpm 版本，判成「满足 ≥10.4」直接放行；
+    corepack 的 ``Corepack is about to download …/pnpm-11.7.0.tgz`` 同理
+    （BUGS-REPORT P2-14）。现在只认整行版本号（或单个「工具名 + 版本」前缀），
+    解析不出返回 None，调用方按「无法确认」报 WARN/MISSING，而不是误判通过。
+    """
     if not text:
         return None
-    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", text.strip())
-    if m is None:
-        return None
-    return tuple(int(g) for g in m.groups() if g is not None)
+    stripped = text.strip()
+    match = _VERSION_LINE_RE.match(stripped)
+    if match is not None:
+        groups = match.groups()
+    else:
+        match = _VERSION_PREFIX_RE.match(stripped)
+        if match is None:
+            return None
+        groups = match.groups()[1:]  # 去掉「工具名」那一段
+    return tuple(int(g) for g in groups if g is not None)
 
 
 def _project_package_manager() -> str:
@@ -605,18 +636,60 @@ def check_elevenlabs(rows: List[Row]) -> None:
 # main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 自测（--selftest / scripts/selftest.py）：
+# 纯函数级、不需要 node/ffmpeg/网络，覆盖历史上真的误判过的版本解析。
+# ---------------------------------------------------------------------------
+
+def _selftest() -> int:
+    failures = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+
+    cases = (
+        ("24.16.0", (24, 16, 0)),
+        ("v24.16.0", (24, 16, 0)),
+        ("10.4", (10, 4)),
+        ("pnpm 10.4.0", (10, 4, 0)),
+        ("npm v10.9", (10, 9)),
+        # 失败输出里的版本号不能被当成工具版本（BUGS-REPORT P2-14）
+        ("Error: unsupported engine node 20.11.0", None),
+        ("Corepack is about to download https://registry.npmjs.org/pnpm/-/pnpm-11.7.0.tgz", None),
+        ("", None),
+        ("   ", None),
+    )
+    for text, want in cases:
+        check(f"_parse_version({text!r})", _parse_version(text), want)
+
+    if failures:
+        for message in failures:
+            sys.stderr.write(f"ERROR: selftest — {message}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
+        return 1
+    print("OK: selftest — 版本解析（整行锚定，失败输出不误判）全部通过")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="doctor.py",
         description="promo-forge 环境体检：只检查、不安装。有任何 MISSING 就退出码 1（AGENTS.md 阶段 0 闸门）。",
-        epilog="装完缺的东西再跑一次，直到没有 MISSING 再开工。WARN 可以带着走，但要心里有数。",
+        epilog="装完缺的东西再跑一次，直到没有 MISSING 再开工。WARN 可以带着走，但要心里有数。\n"
+               "纯函数自测（不检查环境）：python scripts/doctor.py --selftest",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version="promo-forge doctor 1.0")
+    p.add_argument("--selftest", action="store_true",
+                   help="只跑纯函数自测（版本解析等；不检查环境、不需要 node/ffmpeg）")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    if "--selftest" in raw_argv:
+        return _selftest()
     build_parser().parse_args(argv)
 
     print(f"promo-forge 环境体检")

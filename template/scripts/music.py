@@ -1013,7 +1013,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
         C.error(f"ffmpeg 没有产出文件：{C.rel(dst)}")
     real = C.probe_duration(dst)
     C.log(f"OK: {C.rel(dst)}  {C.human(dst.stat().st_size)}"
-          + (f"  实际时长 {C.fmt_sec(real)}" if real else "（没装 ffprobe，跳过时长复核）"))
+          + (f"  实际时长 {C.fmt_sec(real)}" if real else "（ffprobe 没报出时长，跳过时长复核）"))
     if real is not None and abs(real - dur) > 0.1:
         C.warn(f"实际时长 {C.fmt_sec(real)} 和要求的 {C.fmt_sec(dur)} 差 {abs(real - dur):.2f}s："
                f"是不是 --start 超出了原曲长度？")

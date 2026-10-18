@@ -7,10 +7,11 @@
 按 ``src/timing.json`` 的 ``voice.lines`` 逐句合成旁白：
 
 1. 调 TTS 引擎（默认免费 ``edge-tts``；可选 ElevenLabs）生成原始音频；
-2. 用 ffmpeg 切掉首尾静音；
+2. 用 ffmpeg 切掉首尾静音，并把判为拖音的尾部低能量真正截掉（留 15ms 淡出）；
 3. 测量时长并与该句窗口 ``line_window()`` 比对，超出就最多加速 12%（超过就报 ``TOO_LONG``，
    **必须回 timing.json 删字改稿**，不允许硬压）；
-4. 测量尾部低能量拖音，> 250ms 判 ``ECHO``（需人工试听确认）；
+4. 按 ``references/配音与字幕.md`` 的口径测尾部低能量拖音（人声平均电平 -40 dB），
+   > 250ms 判 ``ECHO`` 并自动截断；截断量写进 report.json 的 ``tail_trimmed_ms``；
 5. 结果写进 ``audio-src/vo/report.json``，缓存写进 ``audio-src/vo/cache.json``。
 
 AI 听不到声音，所以音色必须由用户试听拍板：``preview`` 子命令就是为这件事准备的。
@@ -95,10 +96,13 @@ MAX_TEMPO = 1.12
 # 避免每跑一次 all 都因为零点几毫秒的误差重新合成。
 REUSE_FIT_TOLERANCE = 1.02
 
-# AGENTS.md 阶段 7 / 校验闸门：尾部低能量拖音 > 250ms 判 ECHO，需人工确认。
+# AGENTS.md 阶段 7 / 校验闸门：尾部低能量拖音 > 250ms 判 ECHO。
 TAIL_ECHO_MS = 250.0
-# 判定「低能量」的参考线：低于（峰值帧 - TAIL_REF_DB）即视为拖音。
-TAIL_REF_DB = 25.0
+# 判定「低能量」的参考线：低于**语音帧平均电平** TAIL_REF_DB dB 即视为拖音。
+# 旧实现用「峰值帧 - 25 dB」，比 references/配音与字幕.md 写的「人声平均电平 -40 dB」
+# 严得多：实测峰值 -9.0 / 平均 -14.1 dBFS 的信号，尾音 -36 dB 会被旧线判成 1000ms
+# 拖音并报 ECHO（按文档线 -54.1 dB 根本不算）。现在与文档对齐。
+TAIL_REF_DB = 40.0
 
 # RMS 包络的帧长（毫秒）。10ms 足够分辨拖音，又不会太慢。
 FRAME_MS = 10
@@ -199,9 +203,20 @@ def _sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-def _cache_key(text: str, engine: str, voice: str, rate: str) -> str:
-    """AGENTS.md 阶段 7：文本/音色/引擎/语速任一变化都要重生成。"""
-    return _sha1("\x00".join([text or "", engine or "", voice or "", rate or ""]))
+def _cache_key(text: str, engine: str, voice: str, rate: str,
+               settings=None, model: str = "") -> str:
+    """AGENTS.md 阶段 7：文本/音色/引擎/语速任一变化都要重生成。
+
+    ElevenLabs 还要把 ``voice.settings`` 与 ``model`` 算进去：它们和音色一样决定声音，
+    不进键的话改 stability / similarity_boost / model 后仍会静默复用旧音频（用户以为
+    参数生效了，实际听到的还是上一版；eleven 是付费接口，白花一次调用钱）。
+    edge 的键保持旧算法不变——否则已有项目升级后缓存全部失效、被无谓地重跑一遍。
+    """
+    parts = [text or "", engine or "", voice or "", rate or ""]
+    if (engine or "").strip().lower() == "eleven":
+        parts.append(json.dumps(settings or {}, sort_keys=True, ensure_ascii=False))
+        parts.append(model or "")
+    return _sha1("\x00".join(parts))
 
 
 def _load_dotenv() -> None:
@@ -320,11 +335,22 @@ def _rms_envelope(path: Path):
     return levels
 
 
+def _speech_avg_db(levels):
+    """语音帧（高于静音门限 SILENCE_DB）的平均电平；没有语音帧返回 None。"""
+    speech = [level for level in levels if level > SILENCE_DB]
+    if not speech:
+        return None
+    return sum(speech) / float(len(speech))
+
+
 def _tail_ms(path: Path) -> float:
     """尾部低能量拖音时长（毫秒）。
 
-    做法：取峰值帧为参考，找最后一个「不低于 峰值 - TAIL_REF_DB」的帧，
-    它之后的全部帧都算拖音。正常 TTS 收尾只有几十毫秒，带混响/回声的会明显更长。
+    做法：先算语音帧平均电平，参考线 = 平均电平 - TAIL_REF_DB（40 dB，与
+    references/配音与字幕.md 的「人声平均电平 -40 dB」一致）；找最后一个「不低于参考线」
+    的帧，它之后的全部帧都算拖音。正常 TTS 收尾只有几十毫秒，带混响/回声的会明显更长。
+
+    旧实现用「峰值帧 - 25 dB」，比文档严 15 dB：稍微正常一点的收尾就可能被判 ECHO。
     """
     levels = _rms_envelope(path)
     if not levels:
@@ -332,7 +358,10 @@ def _tail_ms(path: Path) -> float:
     peak = max(levels)
     if peak <= -60.0:
         return 0.0
-    ref = peak - TAIL_REF_DB
+    speech_avg = _speech_avg_db(levels)
+    if speech_avg is None:
+        return 0.0
+    ref = speech_avg - TAIL_REF_DB
     last_loud = -1
     for index, level in enumerate(levels):
         if level >= ref:
@@ -342,8 +371,17 @@ def _tail_ms(path: Path) -> float:
     return float((len(levels) - 1 - last_loud) * FRAME_MS)
 
 
-def _trim_silence(src: Path, dst: Path) -> None:
-    """切掉首尾静音。用 areverse 把尾部静音变成头部静音，语义最直白。"""
+def _trim_silence(src: Path, dst: Path) -> float:
+    """切掉首尾静音，并把「判为拖音」的尾部低能量真正截掉；返回截掉的毫秒数。
+
+    流程：
+      1. ``silenceremove`` + ``areverse`` 切掉低于 -45dB 的首尾静音（与旧实现一致）；
+      2. 用 ``_tail_ms`` 再量一遍：> ``TAIL_ECHO_MS`` 的尾部低能量用 ``atrim`` 截掉，
+         并留 10~20ms 淡出避免"啪"的爆音，最后 ``os.replace`` 原子替换。
+
+    旧实现只做第 1 步：文档承诺的「切掉并标记」实际只做到"标记"（ECHO），拖音一直留在
+    音频里；而且 -45dB 绝对门限切不掉"低于平均电平 40dB、又高于 -45dB"的那一段拖音。
+    """
     chain = (
         f"silenceremove=start_periods=1:start_duration=0.02:start_threshold={SILENCE_DB}dB,"
         "areverse,"
@@ -360,6 +398,39 @@ def _trim_silence(src: Path, dst: Path) -> None:
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip() or "（ffmpeg 没有输出错误信息）"
         raise RuntimeError(f"ffmpeg 切静音失败：{detail}")
+
+    duration = _duration_of(dst)
+    tail_ms = _tail_ms(dst)
+    if duration <= 0.0 or tail_ms <= TAIL_ECHO_MS or tail_ms >= duration * 1000.0:
+        return 0.0
+    keep = max(0.05, duration - tail_ms / 1000.0)
+    if keep >= duration - 0.005:
+        return 0.0
+    fade = min(0.015, max(0.005, keep * 0.2))
+    af = "atrim=0:%.4f,afade=t=out:st=%.4f:d=%.4f" % (
+        keep, max(0.0, keep - fade), fade)
+    cut_path = dst.with_name(dst.stem + ".tailcut" + dst.suffix)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(dst), "-af", af,
+        "-ac", "1", "-ar", "48000", "-b:a", VO_BITRATE,
+        str(cut_path),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "（ffmpeg 没有输出错误信息）"
+        try:
+            cut_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        warn("尾部拖音 %.0fms 截断失败（ffmpeg：%s），保留原音频" % (tail_ms, detail))
+        return 0.0
+    try:
+        os.replace(str(cut_path), str(dst))
+    except OSError as exc:
+        warn("尾部拖音截断后替换文件失败（%s），保留原音频" % (exc,))
+        return 0.0
+    return tail_ms
 
 
 def _apply_tempo(src: Path, factor: float) -> None:
@@ -411,7 +482,7 @@ def _window_status(needed: float) -> str:
 
 def _read_json(path: Path, default):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return default
 
@@ -636,6 +707,7 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
         "status": "OK",
         "took_speedup": False,
         "tail_ms": 0,
+        "tail_trimmed_ms": 0.0,   # 本轮自动截掉的尾部拖音（0 = 没截）
         "file": _rel(out_path),
     }
 
@@ -669,7 +741,10 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
             "窗口太窄，请检查 timing.json 的 at 与场景边界"
         )
 
-    key = _cache_key(text, engine.name, engine.voice, engine.rate)
+    key = _cache_key(
+        text, engine.name, engine.voice, engine.rate,
+        getattr(engine, "settings", None), getattr(engine, "model", ""),
+    )
     cached = cache.get(line_id) if isinstance(cache, dict) else None
     reusable = (
         not force
@@ -710,7 +785,7 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
     raw_path = tmp_dir / f"{line_id}.raw.mp3"
     try:
         engine.synth(text, raw_path)
-        _trim_silence(raw_path, out_path)
+        tail_trimmed_ms = _trim_silence(raw_path, out_path)
         duration = _duration_of(out_path)
         took_speedup = False
         needed = _needed_ratio(duration, window)
@@ -720,6 +795,12 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
             duration = _duration_of(out_path)
             took_speedup = True
         tail_ms = _tail_ms(out_path)
+        entry["tail_trimmed_ms"] = round(tail_trimmed_ms, 1)
+        if tail_trimmed_ms > 0:
+            warn(
+                f"第 {line_id} 句尾部拖音 {tail_trimmed_ms:.0f}ms 已自动截掉（留 15ms 淡出）："
+                "句长因此变短，字幕停留时间会跟着变，请试听确认截得自然"
+            )
         base_status = _window_status(needed)
         if base_status == "TOO_LONG":
             cut = max(1, int(math.ceil(len(text) - CHARS_PER_SEC * window)))
@@ -738,6 +819,7 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
             "took_speedup": took_speedup,
             "duration": round(duration, 3),
             "tail_ms": round(tail_ms, 1),
+            "tail_trimmed_ms": round(tail_trimmed_ms, 1),
             "text": text,
             "engine": engine.name,
             "voice": engine.voice,
@@ -768,11 +850,14 @@ def _process_line(timing: dict, line: dict, engine, force: bool, cache: dict) ->
     return entry
 
 
-def _write_report(entries, timing: dict) -> None:
+def _write_report(entries, timing: dict, engine_name: str = "") -> None:
     vo_dir = PROJECT_ROOT / VO_DIRNAME
+    # engine 写**本次实际用的**引擎（CLI --engine 可以覆盖 timing.json 的 voice.engine）：
+    # 旧实现照抄 timing.json，用 `--engine eleven` 生成的音频在报告里仍写 edge，
+    # 复盘/交付说明会被误导。
     report = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "engine": (timing.get("voice", {}) or {}).get("engine", "edge"),
+        "engine": engine_name or (timing.get("voice", {}) or {}).get("engine", "edge"),
         "voice": (timing.get("voice", {}) or {}).get("voice", ""),
         "slug": timing.get("slug", ""),
         "lines": entries,
@@ -799,13 +884,14 @@ def _err_line(msg: str) -> None:
     error(msg, code=0)
 
 
-def _merge_into_report(entries: list, timing: dict, new_first: bool = False) -> None:
+def _merge_into_report(entries: list, timing: dict, engine_name: str = "",
+                       new_first: bool = False) -> None:
     """把本次生成的记录**合并**进已有 report.json，保留别的句子。
 
     ``tts.py all --only 02`` 只重做 02：如果直接整份覆盖，01/03 的记录就没了，
     之后 ``audit`` 和交付说明会以为那两句从来没生成过（旧版本就是这么丢的）。
     ``cmd_one`` 复用同一条路径（``new_first=True``：报告里原本没有这一句时放到最前面，
-    保持它以前的位置）。
+    保持它以前的位置）。``engine_name`` 透传给 _write_report，保证 engine 写实际引擎。
     """
     previous, _ = _read_report()
     merged: list = []
@@ -818,7 +904,7 @@ def _merge_into_report(entries: list, timing: dict, new_first: bool = False) -> 
             else:
                 merged.append(item)
     rest = list(fresh.values())
-    _write_report(rest + merged if new_first else merged + rest, timing)
+    _write_report(rest + merged if new_first else merged + rest, timing, engine_name)
 
 
 # ===========================================================================
@@ -854,7 +940,7 @@ def cmd_all(args) -> int:
 
     # 合并进已有报告：`all --only 01,03` 这种局部重生成以前会整份覆盖，
     # 把没重做的句子从 report.json 里抹掉（audit 只看得到本次这几句）。
-    _merge_into_report(entries, timing)
+    _merge_into_report(entries, timing, engine.name)
     _write_json(cache_path, cache)
 
     ok = sum(1 for e in entries if e["status"] == "OK")
@@ -905,7 +991,7 @@ def cmd_one(args) -> int:
     _write_json(cache_path, cache)
 
     # 合并进已有报告（保留其它句子的记录，audit 才有全貌）
-    _merge_into_report([entry], timing, new_first=True)
+    _merge_into_report([entry], timing, engine.name, new_first=True)
 
     if entry["status"] in ("ERROR", "TOO_LONG"):
         if entry["status"] == "TOO_LONG":
@@ -915,6 +1001,36 @@ def cmd_one(args) -> int:
     if entry["status"] == "ECHO":
         warn(f"尾部拖音 {entry['tail_ms']:.0f}ms，请人工试听确认")
     return 0
+
+
+def _audit_tip(rows, window_details) -> str:
+    """审核不通过时给出「先改哪里」的提示。
+
+    旧实现只挑 ``window/real`` 余量最大的那一句（TOO_LONG 或 MISSING 都算）给
+    「删 N 个字」：MISSING 的余量是负数（窗口 < 0），永远排不到第一 → 只有 MISSING
+    时会算出 ``cut = max(1, 负数)`` 的「删约 1 个字」。但 MISSING 的根因是「还没生成
+    音频」，删字完全无效，正确动作是先跑 ``python scripts/tts.py all``。
+    现在 TOO_LONG 与 MISSING 分开提示，各自给对的改法。
+    """
+    tips = []
+    too_long = [r for r in rows if r[5] == "TOO_LONG"]
+    if too_long:
+        longest = max(too_long, key=lambda r: r[3] - r[2])
+        cut = max(1, int(math.ceil(len(longest[1]) - CHARS_PER_SEC * longest[2])))
+        tips.append(f"TOO_LONG 从第 {longest[0]} 句改起（建议删掉约 {cut} 个字）")
+    missing = [r for r in rows if r[5] == "MISSING"]
+    if missing:
+        ids = "、".join(str(r[0]) for r in missing[:5])
+        more = " 等" if len(missing) > 5 else ""
+        tips.append(
+            f"MISSING（第 {ids}{more} 句）是还没生成音频，先跑 `python scripts/tts.py all`，"
+            "删字对 MISSING 无效"
+        )
+    if window_details:
+        tips.append("窗口非法先改 at（太密）或把这段文案挪到更长的场景")
+    if not tips:
+        return ""
+    return "改稿建议：" + "；".join(tips) + "。"
 
 
 def cmd_audit(args) -> int:
@@ -1005,11 +1121,6 @@ def cmd_audit(args) -> int:
     log("")
 
     if errors or window_errors:
-        longest = max((r for r in rows if r[5] in ("TOO_LONG", "MISSING")), key=lambda r: r[3] - r[2], default=None)
-        tip = ""
-        if longest is not None:
-            cut = max(1, int(math.ceil(len(longest[1]) - CHARS_PER_SEC * longest[2])))
-            tip = f"例如第 {longest[0]} 句建议删掉约 {cut} 个字。"
         if window_details:
             # 把每一句的窗口原因都打在 ERROR 汇总里（上面只有 WARN 逐句行，
             # 有些 CI 只抓 stderr 的 ERROR 行看，所以这里必须带全）。
@@ -1021,7 +1132,8 @@ def cmd_audit(args) -> int:
             f"（共 {errors + window_errors} 句，上面每句都有对应行）。"
             f"字数超窗口必须改稿删字（AGENTS.md 阶段 7），不允许靠加速硬压；"
             f"窗口非法说明 at 太密或排到了场景结束 / 下一句之后。"
-            f"{tip}改完重跑 `python scripts/tts.py all`"
+            f"{_audit_tip(rows, window_details)}"
+            f"改完重跑 `python scripts/tts.py all`"
         )
     # 走到这里说明 0 ERROR / 0 窗口非法。（error() 已经 sys.exit，不会再往下走。）
     if echoes:

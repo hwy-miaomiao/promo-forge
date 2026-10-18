@@ -1,5 +1,7 @@
 # promo-forge · 一句话做一支竖屏宣传片
 
+![闸门](https://github.com/hwy-miaomiao/promo-forge/actions/workflows/ci.yml/badge.svg)
+
 **把产品名或网址丢给 AI 编程工具，它会自己调研、提问、出样帧让你挑、截真实界面、按拍卡点、配音配乐、逐项校验，最后交给你一支 1080×1920 的竖屏宣传片和一个能在浏览器里播放的网页版。**
 
 写给抖音 / 小红书 / 视频号 / B站竖屏 / YouTube Shorts 这类**竖屏短视频**：30~60 秒、最晚第 4 秒完成第一次能量爆发、真实产品画面必须占主角。
@@ -127,10 +129,30 @@ promo-forge/
 | `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格，并出三张候选封面 |
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口 |
 | `scripts/check_video.py` | 成片闸门：规格、音轨、响度、空档、渲染日志报错 + 逐场景抽帧联系表 |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：三个闸门的 `--selftest` + Python 3.9 写盘/API 兼容检查） |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖） |
 
 `timing.json` 是整支片子的唯一事实来源：帧率、画幅、时长、场景窗口、beat/bar/drop、旁白逐句配置、品牌配色全在里面，TypeScript 与 Python 两侧共读它，改一处全链路生效。
+
+## 本地自测与 CI
+
+脚本里那些容易写错的纯函数逻辑（注释剥离、渲染日志强信号、时间/响度解析、字幕折行、版本解析等）有一组自测，不依赖素材、不需要 ffmpeg、不联网，一条命令全跑：
+
+```bash
+python template/scripts/selftest.py    # 三个脚本的 --selftest + Python 3.9 写盘/API smoke；全过退出码 0
+```
+
+每个脚本也能单独跑：`python scripts/check_assets.py --selftest`、`python scripts/check_video.py --selftest`、`python scripts/doctor.py --selftest`。失败会打印 `ERROR: selftest — ...` 并以非零退出。
+
+除三个脚本自测外，`selftest.py` 还会做两项 Python 3.9 兼容检查：真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径），再用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）。它们必须由 CI 的 3.9 格真正跑过才算数。
+
+CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
+
+- Python 3.9 / 3.12 矩阵：`compileall` + `selftest.py` + 行尾必须 LF；
+- Node 22：`npm install` + `tsc --noEmit`（只做类型检查）。
+
+渲染、成片规格、响度、抽帧审图这些重活仍在本地按 AGENTS.md 第 7 节的闸门跑。
 
 ## 常见问题
 
@@ -161,7 +183,7 @@ promo-forge/
 直接烧会把画面自带的字幕和烧进去的字幕叠成两行糊字。只要字幕文件的话用 `python scripts/subtitles.py srt`（SRT）或 `ass`（带样式）。
 
 **怎么知道能不能投抖音 / 小红书？** `python scripts/deliver.py check out/final-1080p.mp4 --platform all`
-会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条按「需人工确认」的 WARN 处理；
+会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条标「需人工确认」——只提示、不参与判定，不会因此刷 WARN；
 封面用 `python scripts/deliver.py cover out/final-1080p.mp4 --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图（`<mp4>` 省略时脚本不报错，会静默套用默认值 `out/final-1080p.mp4`）。
 
 ## 参与贡献

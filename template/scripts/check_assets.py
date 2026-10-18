@@ -14,8 +14,11 @@
    每句旁白的 ``at`` 落在所属场景窗口内；
 3. **旁白字数**：按 6.5 字/秒预估，超窗口的给出「删掉 N 个字」的建议（WARN，AGENTS.md 阶段 7）；
 4. **图片尺寸**：``public/img/`` 下宽度 < 1000px 会发虚、> 3000px 吃内存（WARN）；
-5. **字体缺字**：用 ``fonts.json`` 的 ``check.systemCandidates`` 找第一个存在的字体，
-   检查 timing.json 全部文案的每个字符是否都被 cmap 覆盖，缺字 → ERROR（会渲染成方块）；
+5. **字体缺字**：用 ``fonts.json`` 的 ``check.systemCandidates`` 找第一个存在的字体
+   （内嵌子集存在就只查子集，都不存在才退回系统字体栈），检查**片子里会上屏的文本**每个字符
+   是否都被 cmap 覆盖，缺字 → ERROR（会渲染成方块）。上屏文本 = ``timing.json`` 的文案 +
+   ``src/``、``web/`` 等源文件里剥掉注释后的文本（复用 ``fonts.py`` 的字符集口径，含 JSX
+   文本节点里写死的中文），不然只查 timing.json 会漏掉一多半屏上字；
 6. **音频**：``public/<music.file>`` 与 ``audio-src/vo/<id>.mp3`` 是否齐全；
 7. **真实素材配额**：``public/img/`` 图片数 < 6 → WARN（AGENTS.md 阶段 4 要求 ≥6 张）；
    总数达标后再按场景分段核「每个功能段落 ≥1 张真实截图」「有一段 ≥6 张真实作品的快切蒙太奇」
@@ -192,7 +195,9 @@ JSON_MISSING = "文件不存在"
 
 def _read_json_file(path: Path):
     try:
-        return json.loads(path.read_text(encoding="utf-8")), None
+        # utf-8-sig：允许 BOM，否则 BOM 会让 json.loads 在第一列就抛「Expecting value」，
+        # 两个闸门都硬 ERROR，而文件内容实际是合法的（V26/V9 同根因）。
+        return json.loads(path.read_text(encoding="utf-8-sig")), None
     except FileNotFoundError:
         return None, JSON_MISSING
     except UnicodeDecodeError as exc:
@@ -250,16 +255,37 @@ def _positive_number(value):
 # 1. 素材引用（staticFile / assetUrl / src="..."）
 # ===========================================================================
 
+#: 正则字面量只可能出现在这些 token 之后（JS/TS 语法）：`= ( , : [ ! & | ? { } ;`。
+#: 用来区分「正则字面量开头的 /」和「除法 / JSX 闭标签 </div> 的 /」。
+_REGEX_START_PUNCT = frozenset("=(,:[!&|?{};")
+
+
+def _prev_significant(out) -> str:
+    """已输出内容里最后一个非空白字符（判断 `/` 是不是正则起点用）。"""
+    for char in reversed(out):
+        if not char.isspace():
+            return char
+    return ""
+
+
 def _strip_ts_comments(text: str) -> str:
     """把 TS/TSX 里的注释挖掉（保留换行，行号不变）。
 
     必须做这一步：模板的场景文件里大量示例代码写在注释里
     （例如 ``*   <Shot src="img/work-01.png" />``），不挖掉会把示例当真实引用误报缺图。
+
+    V34：还要认**正则字面量**。以前状态机只认字符串引号，遇到
+    ``const re = /https?:\\/\\//;`` 这类正则时把里面的 ``//`` 当成行尾注释，
+    同一行后面的引用（``const p = staticFile('img/x.png')``）就被静默吃掉、
+    漏报「引用存在但文件不存在」。判据：`/` 前一个非空白 token 属于
+    ``= ( , : [ ! & | ? { } ;`` 时视为正则起点，一直扫到未转义的 `/`；
+    字符类 ``[...]`` 里的 `/` 不算结束。除法与 JSX ``</div>`` 不会命中（前一个 token 不是这些符号）。
     """
     out = []
     index = 0
     length = len(text)
-    state = None  # None | "'" | '"' | '`' | "//" | "/*"
+    state = None  # None | "'" | '"' | '`' | "//" | "/*" | "regex"
+    in_class = False
     while index < length:
         char = text[index]
         nxt = text[index + 1] if index + 1 < length else ""
@@ -271,6 +297,12 @@ def _strip_ts_comments(text: str) -> str:
             if char == "/" and nxt == "*":
                 state = "/*"
                 index += 2
+                continue
+            if char == "/" and _prev_significant(out) in _REGEX_START_PUNCT:
+                state = "regex"
+                in_class = False
+                out.append(char)
+                index += 1
                 continue
             if char in "\"'`":
                 state = char
@@ -290,6 +322,23 @@ def _strip_ts_comments(text: str) -> str:
                 continue
             if char == "\n":
                 out.append(char)
+            index += 1
+            continue
+        if state == "regex":
+            # 正则字面量原样保留（内容不是注释）：转义吞两个字符，字符类里 / 不算结束。
+            out.append(char)
+            if char == "\\" and nxt:
+                out.append(nxt)
+                index += 2
+                continue
+            if char == "[":
+                in_class = True
+            elif char == "]":
+                in_class = False
+            elif char == "/" and not in_class:
+                state = None
+            elif char == "\n":  # 正则不跨行；写坏了也别吞掉后面的代码
+                state = None
             index += 1
             continue
         # 在字符串里：原样保留，这样正则还能看到 staticFile("img/x.png")
@@ -418,6 +467,12 @@ def check_asset_refs(report: Report) -> None:
     )
 
 
+def _flush_brand_problems(report: Report, item: str, problems) -> None:
+    """把已经算出来的 brand.logo 问题先打出来（V25：提前 return 别把它们吞掉）。"""
+    for text in problems:
+        report.warn(item, text)
+
+
 def check_brand_and_font_files(report: Report, timing: dict) -> None:
     """timing.json 的 brand.logo 与 fonts.json 的 roles.*.file 也是 public/ 下的素材。"""
     item = "品牌与字体文件"
@@ -437,6 +492,8 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     fonts_cfg, err = _read_json_file(fonts_path)
     roles_checked = 0
     if fonts_cfg is None:
+        # V25：brand.logo 的问题已经算出来了，不能因为 fonts.json 读不到就一起吞掉。
+        _flush_brand_problems(report, item, problems)
         if err == JSON_MISSING:
             report.warn(item, f"读不到 fonts.json（{err}），跳过字体文件检查")
         else:
@@ -446,8 +503,37 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
                 "等于没查「字体 404 / 回退系统字体」，修好这个文件再重跑",
             )
         return
+    # V28：结构异常（顶层不是对象 / roles 不是对象 / 某个角色不是对象）必须是干净的
+    # ERROR: 行，而不是在下面 `.get()` 上抛 AttributeError traceback。
+    if not isinstance(fonts_cfg, dict):
+        _flush_brand_problems(report, item, problems)
+        report.fail(
+            item,
+            f"fonts.json 的顶层必须是 JSON 对象，现在是 {type(fonts_cfg).__name__}："
+            f"{fonts_cfg!r}。修成 {{\"roles\": {{…}}, \"check\": {{…}}}} 再重跑",
+        )
+        return
+    roles = fonts_cfg.get("roles")
+    if roles is None:
+        roles = {}
+    elif not isinstance(roles, dict):
+        _flush_brand_problems(report, item, problems)
+        report.fail(
+            item,
+            f"fonts.json 的 roles 必须是对象（display/body/mono），现在是 "
+            f"{type(roles).__name__}：{roles!r}。roles 缺失是合法的（用系统字体栈），但写成 [] 不行",
+        )
+        return
     for role in FONT_ROLES:
-        role_cfg = (fonts_cfg.get("roles") or {}).get(role) or {}
+        role_cfg = roles.get(role) or {}
+        if not isinstance(role_cfg, dict):
+            _flush_brand_problems(report, item, problems)
+            report.fail(
+                item,
+                f"fonts.json 的 roles.{role} 必须是对象（{{stack, weight, file}}），现在是 "
+                f"{type(role_cfg).__name__}：{role_cfg!r}",
+            )
+            return
         file_value = str(role_cfg.get("file") or "").strip()
         if not file_value:
             continue
@@ -461,8 +547,7 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
             )
 
     if problems:
-        for text in problems:
-            report.warn(item, text)
+        _flush_brand_problems(report, item, problems)
         return
     if logo or roles_checked:
         report.ok(
@@ -556,6 +641,40 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         )
     elif last_end is not None:
         report.ok(item, f"duration={duration:g} 秒 = 最后一个场景的 end")
+
+    # 画幅契约（AGENTS.md 第 5 节）：aspect 只有 "9:16" / "16:9" 两个取值，且必须和
+    # width/height 一致。V24：以前两个闸门都不读 aspect —— 一份 aspect="16:9" 但
+    # width/height=1080×1920 的工程会一路绿灯，成片投出去按 16:9 处理才发现。
+    aspect = timing.get("aspect")
+    allowed_aspects = {"9:16": (9.0, 16.0), "16:9": (16.0, 9.0)}
+    if not isinstance(aspect, str) or aspect not in allowed_aspects:
+        report.fail(
+            item,
+            f"aspect={aspect!r} 不合法：契约只允许 \"9:16\" 或 \"16:9\"（AGENTS.md 第 5 节）。"
+            "竖屏成片用 9:16，横版用 16:9；自定义比例不在契约里",
+        )
+    else:
+        try:
+            width = float(timing.get("width"))
+            height = float(timing.get("height"))
+        except (TypeError, ValueError):
+            width = height = None
+        want_w, want_h = allowed_aspects[aspect]
+        if width is None or height is None or width <= 0 or height <= 0:
+            report.fail(
+                item,
+                f"aspect={aspect} 但 width/height 缺失或不是正数（现在是 "
+                f"{timing.get('width')!r}×{timing.get('height')!r}）：契约要求两者一致",
+            )
+        elif abs(height - width * want_h / want_w) > 1.0:
+            report.fail(
+                item,
+                f"aspect={aspect} 与 width×height={width:g}×{height:g} 矛盾："
+                f"{aspect} 要求宽高比 {want_w:g}:{want_h:g}（1080 宽时高应为 "
+                f"{width * want_h / want_w:g}，允许 ±1px）。改尺寸忘改 aspect，或反过来",
+            )
+        else:
+            report.ok(item, f"aspect={aspect} 与 width×height={width:g}×{height:g} 一致")
 
     # 字幕安全区：单行 ≤13 字、最多 2 行（AGENTS.md 阶段 7）
     captions = _sub_dict(timing, "captions", report, item, "{enabled, maxChars, maxLines, bottom}")
@@ -1034,7 +1153,12 @@ def check_scene_assets(report: Report, timing: dict) -> None:
 # ===========================================================================
 
 def _collect_texts(timing: dict):
-    """收集所有会渲染到画面上的文字（缺字会变方块，必须全查）。"""
+    """收集 timing.json 里会渲染到画面上的文字（缺字会变方块，必须全查）。
+
+    注意：这里只是**契约字段**里的文案。模板场景里还有大量屏上文字写死在 JSX 文本节点
+    （Demo.tsx 的「本月账目」、Cta.tsx 的「免费下载」等），只查本函数会漏掉它们 ——
+    源码文本由 `_collect_source_chars()` 补齐（V22）。
+    """
     texts = []
     title = timing.get("title")
     if title:
@@ -1053,6 +1177,48 @@ def _collect_texts(timing: dict):
     return texts
 
 
+def _collect_source_chars(report: Report, item: str):
+    """收集 src/、web/ 等「会上屏的文本文件」里的非 ASCII 字符（剥注释后）。
+
+    V22：以前缺字闸门只扫 timing.json 的文案，OK 行却写「覆盖了片子里全部字符」——
+    模板场景里大量中文写在 JSX 文本节点里，闸门根本看不见（实测 timing.json 口径 95 字，
+    真正会上屏的 TSX 文本 207 字，147 个字在闸门视野之外）。
+
+    这里直接复用 fonts.py 的字符集口径（`_src_texts()`：TEXT_SUFFIXES 白名单 + 注释剥离 +
+    跳过 out/public/audio-src/scripts），保证 `fonts.py subset` 与 `check_assets.py` 两边
+    对「片子里用到哪些字」的结论一致；缩小/扩大扫描面只改 fonts.py 一处。
+
+    返回 (chunks, 扫描文件数)；导入或扫描失败时返回 ([], 0) 并给一条 WARN
+    （闸门不能因为工具模块坏了就静默变成「全绿」）。
+    """
+    try:
+        import fonts  # type: ignore  # 延迟导入：fonts.py 也复用本脚本的 _strip_ts_comments
+    except Exception as exc:  # noqa: BLE001 - 任何导入失败都只降级，不让闸门崩
+        report.warn(
+            item,
+            f"导入 fonts.py 失败（{exc}），只检查 timing.json 的文案："
+            "src/web 里写死在 JSX 的屏上文字可能漏检",
+        )
+        return [], 0
+    try:
+        # fonts.py 的 _src_texts 需要 check_assets 模块本身作为「注释剥离器」，
+        # 这样两边剥注释用的是同一份实现（V34 的正则字面量分支也一起生效）。
+        chunks, scanned = fonts._src_texts(sys.modules[__name__])
+    except Exception as exc:  # noqa: BLE001
+        report.warn(item, f"扫 src/web 上屏文本失败（{exc}），只检查 timing.json 的文案")
+        return [], 0
+    return chunks, scanned
+
+
+def _is_project_subset(chosen: Path) -> bool:
+    """chosen 是不是项目自己产出的内嵌子集（public/fonts/ 下）。"""
+    try:
+        chosen.resolve().relative_to((PROJECT_ROOT / "public" / "fonts").resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def check_fonts(report: Report, timing: dict) -> None:
     item = "字体缺字"
     fonts_path = PROJECT_ROOT / "fonts.json"
@@ -1068,8 +1234,43 @@ def check_fonts(report: Report, timing: dict) -> None:
             )
         return
 
-    check_cfg = fonts_cfg.get("check", {}) or {}
-    candidates = list(check_cfg.get("systemCandidates", []) or [])
+    check_cfg = fonts_cfg.get("check") if isinstance(fonts_cfg, dict) else None
+    if not isinstance(fonts_cfg, dict):
+        # V28：结构异常必须是干净的 ERROR: 行，而不是在下面 .get() 上抛 AttributeError traceback。
+        report.fail(
+            item,
+            f"fonts.json 的顶层必须是 JSON 对象，现在是 {type(fonts_cfg).__name__}：{fonts_cfg!r}。"
+            "修成 {\"roles\": {…}, \"check\": {…}} 再重跑",
+        )
+        return
+    if check_cfg is None:
+        check_cfg = {}
+    elif not isinstance(check_cfg, dict):
+        report.fail(
+            item,
+            f"fonts.json 的 check 必须是对象（{{systemCandidates, extraChars}}），现在是 "
+            f"{type(check_cfg).__name__}：{check_cfg!r}",
+        )
+        return
+    raw_candidates = check_cfg.get("systemCandidates")
+    if raw_candidates is None:
+        candidates = []
+    elif not isinstance(raw_candidates, list) or not all(
+        isinstance(candidate, str) for candidate in raw_candidates
+    ):
+        report.fail(
+            item,
+            "fonts.json 的 check.systemCandidates 必须是字符串数组，现在是 "
+            f"{raw_candidates!r}：这里放字体文件路径（相对项目根或绝对路径），"
+            "类型写坏会导致缺字检查静默跳过",
+        )
+        return
+    else:
+        candidates = list(raw_candidates)
+
+    # 口径（V22）：内嵌子集存在就只查子集；所有子集都不存在才退回系统字体栈。
+    # 子集存在却缺字时**不能**悄悄换成系统字体再查一遍 —— 那会掩盖「文案改了没重跑
+    # fonts.py subset」，正是 AGENTS.md 阶段 3 反复警告的方块字场景。
     chosen = None
     for candidate in candidates:
         path = Path(str(candidate)).expanduser()
@@ -1126,9 +1327,17 @@ def check_fonts(report: Report, timing: dict) -> None:
         return
 
     texts = _collect_texts(timing)
+    timing_chars = {ch for _source, text in texts for ch in text if not ch.isspace()}
     extra = str(check_cfg.get("extraChars", "") or "")
     if extra:
         texts.append(("fonts.json check.extraChars", extra))
+    extra_chars = {ch for ch in extra if not ch.isspace()}
+    source_chunks, source_files = _collect_source_chars(report, item)
+    source_chars = set()
+    if source_chunks:
+        joined_sources = "".join(source_chunks)
+        source_chars = {ch for ch in joined_sources if not ch.isspace()}
+        texts.append((f"src/web 上屏文本（{source_files} 个文件，注释已剥）", joined_sources))
 
     missing_map = {}
     checked = 0
@@ -1148,15 +1357,35 @@ def check_fonts(report: Report, timing: dict) -> None:
             f"「{char}」(来自 {missing_map[char][0]})" for char in sorted(missing_map)[:12]
         )
         more = "" if len(missing_map) <= 12 else f" 等共 {len(missing_map)} 个"
+        if _is_project_subset(chosen):
+            advice = (
+                "这是项目内嵌子集：改了文案/加了场景之后必须重跑 "
+                "`python scripts/fonts.py subset` 重新生成（缺字会在片子里渲染成方块 □）"
+            )
+        else:
+            advice = (
+                "这是系统字体：改用覆盖它们的字体（Noto Sans CJK SC / 思源黑体 / 微软雅黑），"
+                "或把文案换成不缺字的写法"
+            )
         report.fail(
             item,
-            f"{chosen.name} 缺少这些字符：{detail}{more} —— 缺字：「{chars}」。"
-            "它们在片子里会渲染成方块（□）。请改用覆盖它们的字体"
-            "（Noto Sans CJK SC / 思源黑体 / 微软雅黑），或把文案换成不缺字的写法",
+            f"{_rel(chosen)} 缺少这些字符：{detail}{more} —— 缺字：「{chars}」。"
+            f"它们会渲染成方块（□）。{advice}",
         )
         return
 
-    report.ok(item, f"{chosen.name} 覆盖了片子里全部 {checked} 个不重复字符（含标点数字）")
+    extras_note = f" + check.extraChars {len(extra_chars)} 个" if extra_chars else ""
+    source_note = (
+        f" + src/web 上屏文本 {len(source_chars)} 个（{source_files} 个文件，注释已剥）"
+        if source_chars
+        else ""
+    )
+    kind = "项目内嵌子集" if _is_project_subset(chosen) else "系统字体"
+    report.ok(
+        item,
+        f"{_rel(chosen)}（{kind}）覆盖了片子里 {checked} 个不重复字符"
+        f"（timing.json {len(timing_chars)} 个{extras_note}{source_note}，含标点数字）",
+    )
 
 
 # ===========================================================================
@@ -1204,23 +1433,116 @@ def check_audio(report: Report, timing: dict) -> None:
 
 
 # ===========================================================================
+# 自测（--selftest / scripts/selftest.py）
+# ===========================================================================
+#
+# 纯函数级自测：不读素材、不跑 ffmpeg、不依赖网络；CI 里当确定性检查跑。
+
+def _selftest() -> int:
+    failures = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+
+    # --- 注释剥离（V34：正则字面量、除法、JSX 闭标签都不能吞掉后续代码） ---
+    cases = (
+        (
+            'const a = staticFile("img/a.png"); // 注释 staticFile("img/b.png")',
+            ("img/a.png", None),
+            "行尾注释里的引用要挖掉",
+        ),
+        (
+            '/* old */\nconst p = staticFile("img/new.png");',
+            ("img/new.png", None),
+            "块注释里的引用要挖掉",
+        ),
+        (
+            'const re = /https?:\\/\\//;\nconst p = staticFile("img/x.png");',
+            ('img/x.png', 'https?:\\/\\/'),
+            "正则字面量里的 // 不是注释",
+        ),
+        (
+            'const q = a / b;\nconst p = staticFile("img/y.png");',
+            ("img/y.png", None),
+            "除法 / 不是正则起点",
+        ),
+        (
+            'return <div>{staticFile("img/z.png")}</div>;',
+            ("img/z.png", None),
+            "JSX 闭标签的 / 不能当注释起点",
+        ),
+    )
+    for source, (must_have, also_keep), label in cases:
+        stripped = _strip_ts_comments(source)
+        check(f"注释剥离保留引用（{label}）", must_have in stripped, True)
+        if also_keep:
+            check(f"注释剥离保留正则原文（{label}）", also_keep in stripped, True)
+    check(
+        "注释剥离挖掉行尾注释",
+        "img/b.png" in _strip_ts_comments('staticFile("img/a.png"); // staticFile("img/b.png")'),
+        False,
+    )
+
+    # --- 字面量是不是 public/ 素材路径 ---
+    for value, want in (
+        ("img/a.png", True),
+        ("audio/music.wav", True),
+        ("fonts/x.ttf", True),
+        ("https://example.com/a.png", False),
+        ("src/App.tsx", False),
+        ("img/{name}.png", False),
+        ("", False),
+    ):
+        check(f"_looks_like_public_asset({value!r})", _looks_like_public_asset(value), want)
+
+    # --- 本地窗口兜底实现（和 _common.line_window 同语义） ---
+    timing = {
+        "scenes": [{"name": "s1", "start": 0, "end": 10}],
+        "voice": {"lines": [
+            {"id": "1", "at": 2.0, "scene": "s1"},
+            {"id": "2", "at": 5.0, "scene": "s1"},
+        ]},
+    }
+    start, end = _local_window(timing, {"at": 2.0, "scene": "s1"})
+    check("_local_window 起点", round(start, 3), 2.0)
+    check("_local_window 终点（下一句 at 5.0 减 0.15）", round(end, 3), 4.85)
+    last_start, last_end = _local_window(timing, {"at": 5.0, "scene": "s1"})
+    check("_local_window 最后一句终点（场景 end 10 减 0.15）", round(last_end, 3), 9.85)
+
+    if failures:
+        for message in failures:
+            sys.stderr.write(f"ERROR: selftest — {message}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
+        return 1
+    print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 全部通过")
+    return 0
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
 def main(argv=None) -> int:
     _force_utf8()
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    if "--selftest" in raw_argv:
+        return _selftest()
     parser = argparse.ArgumentParser(
         prog="check_assets.py",
         description="promo-forge 渲染前闸门（AGENTS.md 阶段 9）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "输出格式：OK/WARN/ERROR: <检查项> — <说明>；最后一行统计。\n"
-            "退出码：0 通过（0 ERROR）；1 有 ERROR。"
+            "退出码：0 通过（0 ERROR）；1 有 ERROR。\n"
+            "纯函数自测（不读素材/不需要 ffmpeg）：python scripts/check_assets.py --selftest"
         ),
     )
+    parser.add_argument("--selftest", action="store_true",
+                        help="只跑纯函数自测（注释剥离/字面量判定/窗口兜底；不检查项目）")
     parser.add_argument("--strict", action="store_true",
                         help="把所有 WARN 也当 ERROR（交付前的严格模式）")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     report = Report(strict=args.strict)
     log(f"渲染前检查：{PROJECT_ROOT}")

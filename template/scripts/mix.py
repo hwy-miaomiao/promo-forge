@@ -40,7 +40,8 @@
 退出码
 ------
 0 成功；1 有 ERROR：缺 ffmpeg、缺音乐文件、boom、人声余量 < 6 dB（AGENTS.md 阶段 8；
-母带 PLR 回落成动态模式时该阈值自动抬到 8 dB，见阶段 8 的「按打印余量再留 2 dB」）、母带失败。
+母带 PLR 回落成动态模式时该阈值自动抬到 8 dB，见阶段 8 的「按打印余量再留 2 dB」）、
+母带响度偏离 -14 LUFS 超过 2 dB、母带失败。
 """
 
 from __future__ import annotations
@@ -101,16 +102,85 @@ VO_MARGIN_FAIL_DB = VO_MARGIN_OK_DB     # 刻意取同一个值：少一档就�
 VO_MARGIN_PLR_FALLBACK_DB = VO_MARGIN_OK_DB + 2.0
 
 # 母带模式只有两种，明确写成状态，别让它只活在一条 WARN 文本里：
-#   "linear"   —— PLR ≤ 13.3 dB，loudnorm 做的是整体增益，打印余量 ≈ 成片余量，按 6 dB 判；
-#   "fallback" —— PLR 超限，loudnorm 静默回落成动态模式，逐段压掉 1~2 dB，按 8 dB 判。
-# （原来这个状态既没有常量也不进总结：回落了照样按 6 dB 判，
-#   于是打印 +7.6 dB 的片子能退 0 交付，而 AGENTS.md 阶段 8 要求这时打印 ≥8 dB。）
+#   "linear"   —— 素材线性母带可行（PLR 与 LRA 都在预算内），loudnorm 做整体增益，
+#                 打印余量 ≈ 成片余量，按 6 dB 判；
+#   "fallback" —— 素材动态超线性上限，loudnorm 静默回落成动态模式，逐段压掉 1~2 dB，按 8 dB 判。
+# 「超线性上限」有两条：① PLR（真峰值 − 响度）> 13 dB；② LRA（响度范围）> 目标 LRA=11 LU。
+# 旧代码只看 ①，且留了 +0.3 dB 的正容差：实测 LRA=13.60 的素材 PLR 只有 6.03 dB，
+# loudnorm 实际选了 Dynamic，脚本却以为线性、仍按 6 dB 判余量；PLR=13.05 也同样漏判。
+# 现在预测只看这两个值（向下 0.05 dB 噪声容差，方向偏保守），第二遍再拿 loudnorm 自报的
+# Normalization Type 覆盖预测——那才是 ffmpeg 真正走了哪种模式。
 MASTER_MODE_LINEAR = "linear"
 MASTER_MODE_PLR_FALLBACK = "fallback"
 MASTER_MODE_LABEL = {
     MASTER_MODE_LINEAR: "linear（loudnorm 走线性模式，母带≈整体增益）",
-    MASTER_MODE_PLR_FALLBACK: "fallback（PLR 超限，loudnorm 回落成动态模式）",
+    MASTER_MODE_PLR_FALLBACK: "fallback（PLR>13 dB 或 LRA>11 LU，loudnorm 回落成动态模式）",
 }
+
+# loudnorm 第二遍 print_format=summary 会打印实际选的模式；第一遍测量值只能预测。
+_NORMALIZATION_TYPE_RE = re.compile(r"Normalization Type:\s*(Linear|Dynamic)", re.IGNORECASE)
+
+# 预测回落时的噪声容差：旧代码是「PLR > 上限 + 0.3」，等于 PLR 13.05 这种真回落也判线性；
+# 现在改为「超过上限 − 0.05」就按回落处理（保守方向），第二遍拿到自报结果后还会再纠正。
+PLR_FALLBACK_EPS_DB = 0.05
+
+# 母带响度偏离目标超过 2 dB 直接 ERROR：-14 LUFS 是 AGENTS.md 阶段 8 的硬要求，
+# 只打 WARN 的话成片能带着 3 dB 偏差退 0 交付（check_video 的 -16~-12 窗口也会漏）。
+LOUDNESS_DEVIATION_FAIL_DB = 2.0
+
+
+def _as_float_or_nan(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _parse_normalization_type(stderr_text: str):
+    """从 loudnorm 第二遍的 summary 里读实际模式；返回 MASTER_MODE_* 或 None。"""
+    match = _NORMALIZATION_TYPE_RE.search(stderr_text or "")
+    if not match:
+        return None
+    return (MASTER_MODE_LINEAR if match.group(1).lower() == "linear"
+            else MASTER_MODE_PLR_FALLBACK)
+
+
+def _predict_master_mode(measured):
+    """第一遍测量值 → (预测模式, 回落原因)。原因空串表示预测线性。
+
+    回落条件有两条（任一命中）：
+      ① PLR（measured_tp − measured_i）> 13 dB（-14 LUFS / TP -1 dBFS 的线性预算）；
+      ② LRA（measured_lra）> 目标 LRA=11 LU —— ffmpeg 的 loudnorm 在响度范围超目标时
+         同样会选 Dynamic（实测 I=-6.95 / TP=-0.92 / LRA=13.60 的素材 PLR 只有 6.03 dB，
+         第二遍实际是 Dynamic，输出 -17.6 LUFS 而不是线性模式的 -14.0）。
+    """
+    if not measured:
+        return MASTER_MODE_LINEAR, ""
+    try:
+        plr = float(measured["measured_tp"]) - float(measured["measured_i"])
+    except (KeyError, TypeError, ValueError):
+        plr = None
+    try:
+        lra = float(measured["measured_lra"])
+    except (KeyError, TypeError, ValueError):
+        lra = None
+    linear_budget = TARGET_TP - TARGET_LUFS
+    if plr is not None and plr > linear_budget - PLR_FALLBACK_EPS_DB:
+        return (MASTER_MODE_PLR_FALLBACK,
+                "PLR %.1f dB 超过线性模式上限 %.1f dB" % (plr, linear_budget))
+    # LRA 用严格大于：实测 measured_LRA=11.0（正好等于目标）时 loudnorm 选的是 Linear，
+    # 再把 0.05 的噪声容差加到这里会白白误报回落（PLR 那边才需要向下的容差）。
+    if lra is not None and lra > LOUDNESS_RANGE:
+        return (MASTER_MODE_PLR_FALLBACK,
+                "LRA %.1f LU 超过目标 LRA %.1f LU（响度范围超标的素材同样会回落成动态模式）"
+                % (lra, LOUDNESS_RANGE))
+    return MASTER_MODE_LINEAR, ""
+
+
+def _loudness_deviation_fail(integrated) -> bool:
+    """母带响度是否偏离 -14 LUFS 超过 2 dB（None 表示测不出来，交给上层 WARN）。"""
+    return (integrated is not None
+            and abs(float(integrated) - TARGET_LUFS) > LOUDNESS_DEVIATION_FAIL_DB + 1e-9)
 
 
 def _margin_threshold_db(master_mode: str) -> float:
@@ -244,8 +314,13 @@ def _require_ffmpeg() -> None:
         )
 
 
-def _run_ffmpeg(args, desc: str, want_stdout: bool = False):
-    """跑一次 ffmpeg。want_stdout=True 时返回 bytes，否则只关心成功与否。"""
+def _run_ffmpeg(args, desc: str, want_stdout: bool = False, want_stderr: bool = False):
+    """跑一次 ffmpeg。want_stdout=True 时返回 stdout bytes，否则只关心成功与否。
+
+    want_stderr=True 时返回 stderr（bytes）：母带第二遍要用它读 loudnorm 自报的
+    ``Normalization Type: Linear / Dynamic``——第一遍测量值只能「预测」回不回落，
+    ffmpeg 真正选了哪种模式只有这行自报说了算（LRA 超目标也会触发动态回落）。
+    """
     cmd = ["ffmpeg", "-hide_banner", "-nostats"] + [str(item) for item in args]
     try:
         proc = subprocess.run(
@@ -258,6 +333,8 @@ def _run_ffmpeg(args, desc: str, want_stdout: bool = False):
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
         error(f"{desc} 失败（ffmpeg 退出码 {proc.returncode}）：{stderr[-800:]}")
+    if want_stderr:
+        return proc.stderr or b""
     return proc.stdout
 
 
@@ -861,33 +938,31 @@ def _master(np, premaster_path: Path, out_path: Path) -> str:
     # 回落成动态模式，母带就不再是"整体增益"：逐句人声余量会被逐段压掉 1~2 dB。
     # 而 _check_vo_margin 量的是**母带前**总线，所以这里必须明确提醒，
     # 否则"mix.py 报 +6.3 dB、成品里其实只有 +4.4 dB"这种偏差永远查不出来。
-    if measured:
-        try:
-            plr = float(measured["measured_tp"]) - float(measured["measured_i"])
-        except (KeyError, TypeError, ValueError):
-            plr = None
-        linear_budget = TARGET_TP - TARGET_LUFS
-        if plr is not None and plr > linear_budget + 0.3:
-            master_mode = MASTER_MODE_PLR_FALLBACK
-            warn(
-                "素材峰值余量不足：母带前 TP %.2f dBFS − 响度 %.2f LUFS = PLR %.1f dB，"
-                "超过 %.1f LUFS / TP %.1f dBFS 允许的 %.1f dB → loudnorm 会回落成动态模式，"
-                "成品里的逐句人声余量会比上面打印的（按母带前总线量的）低 1~2 dB。"
-                "改法：给母带前总线过一遍限制器把真峰值压到 -6 dBFS 以下，"
-                "或接受这 1~2 dB 误差、把打印余量留到 ≥8 dB 再交付"
-                "（本次已自动改用 %.0f dB 这一档判人声余量，见下面的总结与闸门）。"
-                "（光降 music.gain 不一定有效：峰值大多是人声总线顶上去的——实测 gain 1.0→0.6，"
-                "母带前响度只从 -18.0 变成 -19.25 LUFS，PLR 仍是 19.2 dB。）"
-                % (
-                    float(measured["measured_tp"]),
-                    float(measured["measured_i"]),
-                    plr,
-                    TARGET_LUFS,
-                    TARGET_TP,
-                    linear_budget,
-                    VO_MARGIN_PLR_FALLBACK_DB,
-                )
+    # 注意：LRA 超过目标 LRA=11 也会让 loudnorm 回落成动态模式，判据里两条都算。
+    predicted_mode, fallback_reason = _predict_master_mode(measured)
+    if predicted_mode == MASTER_MODE_PLR_FALLBACK:
+        master_mode = MASTER_MODE_PLR_FALLBACK
+        warn(
+            "素材动态超出线性母带上限：%s → loudnorm 会回落成动态模式，"
+            "成品里的逐句人声余量会比上面打印的（按母带前总线量的）低 1~2 dB。"
+            "（母带前读数：I %.1f LUFS / TP %.1f dBFS / LRA %.1f LU，"
+            "目标 %.1f LUFS / TP %.1f dBFS / LRA %.1f LU）"
+            "改法：给母带前总线过一遍限制器把真峰值压到 -6 dBFS 以下、把 LRA 压进目标，"
+            "或接受这 1~2 dB 误差、把打印余量留到 ≥8 dB 再交付"
+            "（本次已自动改用 %.0f dB 这一档判人声余量，见下面的总结与闸门）。"
+            "（光降 music.gain 不一定有效：峰值大多是人声总线顶上去的——实测 gain 1.0→0.6，"
+            "母带前响度只从 -18.0 变成 -19.25 LUFS，PLR 仍是 19.2 dB。）"
+            % (
+                fallback_reason,
+                _as_float_or_nan(measured.get("measured_i")),
+                _as_float_or_nan(measured.get("measured_tp")),
+                _as_float_or_nan(measured.get("measured_lra")),
+                TARGET_LUFS,
+                TARGET_TP,
+                LOUDNESS_RANGE,
+                VO_MARGIN_PLR_FALLBACK_DB,
             )
+        )
 
     codec_args = []
     if out_path.suffix.lower() in (".wav", ".wave"):
@@ -924,12 +999,29 @@ def _master(np, premaster_path: Path, out_path: Path) -> str:
         warn("第一遍 loudnorm 没测出有效响度（输入可能近乎静音或太短），退化为单遍母带")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(
+    second_stderr = _run_ffmpeg(
         ["-y", "-i", str(premaster_path), "-af", af, "-ar", str(SR), "-ac", str(CHANNELS)]
         + codec_args
         + [str(out_path)],
         f"母带写出 {_rel(out_path)}",
+        want_stderr=True,
     )
+    # 第一遍预测之外，再用 loudnorm 第二遍自报的模式纠正一次：ffmpeg 真正走 Linear 还是
+    # Dynamic 只有 print_format=summary 里的这行是事实（LRA 超目标也会触发动态回落）。
+    actual_mode = _parse_normalization_type((second_stderr or b"").decode("utf-8", "replace"))
+    if actual_mode is not None:
+        if actual_mode != master_mode:
+            if actual_mode == MASTER_MODE_PLR_FALLBACK:
+                warn("loudnorm 第二遍实际回落成动态模式（第一遍测量预测是线性模式）："
+                     "成片逐句余量会略低于打印值，已按回落口径把人声余量阈值抬到 "
+                     "%.0f dB。" % VO_MARGIN_PLR_FALLBACK_DB)
+            else:
+                warn("第一遍测量预测会回落成动态模式，但 loudnorm 第二遍实际走的是线性模式："
+                     "以第二遍自报为准，仍按 %.0f dB 判人声余量。" % VO_MARGIN_FAIL_DB)
+        master_mode = actual_mode
+        log("母带模式（loudnorm 第二遍自报）：%s" % MASTER_MODE_LABEL[master_mode])
+    else:
+        log("母带模式（第一遍测量预测，loudnorm 未自报）：%s" % MASTER_MODE_LABEL[master_mode])
     if not out_path.is_file() or out_path.stat().st_size == 0:
         error(f"母带写出失败：{_rel(out_path)} 不存在或是空文件")
     return master_mode
@@ -1291,10 +1383,13 @@ def main(argv=None) -> int:
             % (margin_threshold_db,
                "；本次是 PLR 回落后的加严阈值" if plr_fallback else "")
         )
-    if integrated is not None and not (TARGET_LUFS - 2.0 <= integrated <= TARGET_LUFS + 2.0):
-        warn(
-            f"母带响度 {integrated:.1f} LUFS 偏离目标 {TARGET_LUFS:.0f} LUFS 超过 2 dB；"
-            "素材本身动态太大时 loudnorm 线性模式会有偏差，可考虑压缩后再母带"
+    if _loudness_deviation_fail(integrated):
+        error(
+            f"母带响度 {integrated:.1f} LUFS 偏离目标 {TARGET_LUFS:.0f} LUFS 超过 "
+            f"{LOUDNESS_DEVIATION_FAIL_DB:.0f} dB：loudnorm 没把响度拉到位，"
+            "交付后平台会再压一次，成片声音会明显偏小或忽大忽小。"
+            "改法：先给母带前总线过一遍限制器/压缩把动态压小，或调低 music.gain、"
+            "抬高 voice.rmsDb 后重跑 mix.py；仍不行就检查配音/配乐是否过短或近乎静音"
         )
     log("混音完成。下一步：python scripts/check_assets.py")
     return 0

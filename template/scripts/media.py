@@ -24,7 +24,8 @@
 
 退出码
     0 = 成功（可能有 WARN）
-    1 = 缺依赖 / 路径不存在 / 一张图都没找到 / 有下载失败 / 全部图片读不出来
+    1 = 缺依赖 / 路径不存在 / 一张图都没找到 / 有下载失败 / 有图片读不出来
+        （info 里任意一张读不出来就退 1，不让坏素材混进成片；不是“全部读不出来”才退）
     2 = 命令行参数写错（argparse 的标准行为）
 """
 
@@ -94,7 +95,12 @@ MIN_USEFUL_PX = 1000
 MAX_RENDER_PX = 3000
 
 #: Markdown 图片：![alt](url) / ![alt](<url with space>) / ![alt](url "title")
-MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+[\"'][^\"']*[\"'])?\s*\)")
+#: URL 里允许成对的圆括号（例如 Wikimedia 的 `Foo_(bar).png`）：先按平衡括号整段吃掉，
+#: 否则 `([^\s)]+)` 会在第一个 `)` 处停下，把 URL 截成半截后静默去下载（见 V1）。
+MD_IMG_RE = re.compile(
+    r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|((?:[^\s()]|\([^\s()]*\))+))"
+    r"(?:\s+[\"'][^\"']*[\"'])?\s*\)"
+)
 #: HTML 图片：<img src="url"> / <img src='url'> / <img src=url>
 HTML_IMG_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>"']+))""", re.I)
 #: Markdown 标题（用来在 index.txt 里记“哪一节引用的这张图”）
@@ -398,8 +404,13 @@ def _extract_urls(text: str) -> List[str]:
     out = []
     for u in urls:
         u = html_mod.unescape(u or "").strip().strip("<>")
-        if u:
-            out.append(u)
+        if not u:
+            continue
+        # 括号不配对的 URL 多半是正则/手工写半截，别再拿去下载（会静默下错图或 404）。
+        if u.count("(") != u.count(")"):
+            C.warn(f"图 URL 的括号不配对，已跳过（避免拿半截 URL 去下载）：{u}")
+            continue
+        out.append(u)
     return out
 
 

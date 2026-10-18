@@ -60,7 +60,8 @@ export const WEB: WebConfig = {
     fg: timing.brand.colors?.fg || "#ffffff",
     accent: timing.brand.colors?.accent || "#33e1a1",
   },
-  posterNote: "一句话做一支竖屏宣传片 —— 这是用 promo-forge 模板渲出来的成品。",
+  // 画幅文案从 timing.json 推导，别写死"竖屏"：横版项目（1920×1080）会显示成错的
+  posterNote: `一句话做一支${timing.height >= timing.width ? "竖屏" : "横版"} ${timing.aspect} 宣传片 —— 这是用 promo-forge 模板渲出来的成品。`,
   endNote: "想给自己的产品也做一支？从这里开始。",
   // 没填 brand.url 时保持空串（App.tsx 里 url 为空就不渲染这个按钮），
   // 而不是拼出一个 "https://" 的死链
@@ -79,6 +80,8 @@ export const PLAYER = {
   durationInFrames: Math.round(timing.duration * timing.fps),
   width: timing.width,
   height: timing.height,
+  /** 画幅文案（"9:16" / "16:9"），页面提示语和海报文案共用，避免各自写死 */
+  aspect: timing.aspect,
   /** CSS 用的宽高比，给容器撑出正确高度，避免加载完成后页面跳动 */
   ratio: `${timing.width} / ${timing.height}`,
 } as const;

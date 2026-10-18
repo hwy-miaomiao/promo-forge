@@ -11,7 +11,8 @@
    ``字数 / 6 + 0.35`` 秒（两者取较大），且**不得越过该句所属场景的窗口末端**
    （``scene_window()``：字幕活到下一场景开始就是「串场」，是审图时最容易被抓的错）。
 2. ``ass`` —— 生成 ASS（Advanced SubStation）。``PlayResX/PlayResY`` 取 timing.json 的
-   width/height，字体取 ``fonts.json`` 的 ``roles.body``，字号按画布高度换算，
+   width/height，字体取 ``fonts.json`` 的 ``roles.body``，字号按画布高度换算、并受
+   「左右安全区可用宽度 / captions.maxChars」压上限，
    ``MarginV`` 由 ``captions.bottom`` 换算并压进竖屏安全区（上 10% / 下 18% / 左 6% / 右 14%）。
 3. ``burn`` —— 用 ffmpeg 把 ASS 烧成硬字幕（``-vf ass=...``），或 ``--soft`` 封装成软字幕
    （``-c:s mov_text``）。``--preview N`` 只处理前 N 秒，方便先看 8 秒再决定要不要整片跑。
@@ -107,8 +108,10 @@ SAFE_TOP = 0.10
 SAFE_LEFT = 0.06
 SAFE_RIGHT = 0.14
 
-# ASS 字号 = 画布高度 × 这个系数。1080×1920 竖屏 -> 约 73（约合屏高的 3.8%），
-# 13 个字大约占屏宽 86%，正好卡在左右安全区内。
+# ASS 字号 = min(画布高度 × 这个系数, 左右安全区可用宽度 / captions.maxChars)。
+# 只按高度算会在 13 个全角字时出界：1080×1920 上字号 73，13 × 73 = 949px，
+# 而 MarginL 6% + MarginR 14% 之后只剩 864px（实测记录见 references/配音与字幕.md §6）。
+# 所以 _build_ass 还会按宽度公式再压一次，两个上限取小——画面字幕与硬字幕同一口径。
 FONT_SCALE = 0.038
 FONT_SIZE_MIN = 12
 
@@ -250,8 +253,12 @@ def fmt_srt_time(seconds: float) -> str:
 
 
 def fmt_ass_time(seconds: float) -> str:
-    """ASS 时间戳：``H:MM:SS.cc``（ASS 只到厘秒，用截断而不是四舍五入以免超出视频时长）。"""
-    total_cs = int(max(0.0, float(seconds)) * 100.0)
+    """ASS 时间戳：``H:MM:SS.cc``（ASS 只到厘秒，四舍五入到最近厘秒）。
+
+    以前用截断（``int(seconds * 100)``），``fmt_ass_time(1.15)`` 会写成 0:00:01.14，
+    比 SRT 的毫秒四舍五入早最多 10ms；现在两种格式统一取整，逐帧比对不会再差一个厘秒。
+    """
+    total_cs = int(round(max(0.0, float(seconds)) * 100.0))
     hours, rest = divmod(total_cs, 360_000)
     minutes, rest = divmod(rest, 6_000)
     secs, centis = divmod(rest, 100)
@@ -294,6 +301,9 @@ def _valid_break(tokens: Sequence[str], cut: int) -> bool:
       「……管理开支 / 。」，一个孤零零的句号独占一行；
     * 本行以起始标点结尾 —— ``点击「开始记账」按钮（在右下角）。`` 会切出「点击 / 「」，
       左引号被甩在行尾。
+
+    ``tokens`` 既可以是逐字的字符列表，也可以是 ``_split_atoms()`` 的折行原子列表；
+    多字的拉丁词 / URL 原子不会命中标点判断，所以切点不会落进词内部（V35）。
     """
     if cut <= 0 or cut >= len(tokens):
         return False
@@ -302,49 +312,159 @@ def _valid_break(tokens: Sequence[str], cut: int) -> bool:
     return True
 
 
-def _wrap(text: str, width: float) -> Tuple[int, float]:
-    """从 text 头部取一行，返回 ``(切点token数, 超宽字数)``。
+#: 拉丁词 / URL / 数字：字母数字开头结尾，内部允许 URI 里常见的连接符。
+#: 折行时整段不可拆——否则 ``xiaozhangben.app`` 会被切成两行各半个域名（V35）。
+LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._\-/:@#?=&%][A-Za-z0-9]+)*")
 
-    先贪心装到 ``width`` 拿到一个**上界**，再在它之前找**最后一个合法切点**；
-    找不到就容许放行 1~2 个收尾标点（``FOLD_OVERFLOW_GRACE``），
-    宁可这行多装一个字，也不要下一行以标点开头。宽限内仍找不到就退回上界，
-    由调用方 WARN。**绝不丢字**：切点永远 ≥1 且 < 长度。
+#: 平衡折行时在平衡点附近往回找标点边界的搜索半径（字）。
+BALANCE_LOOKBACK = 2
+
+
+def _split_atoms(text: str) -> List[str]:
+    """把文本拆成折行原子：CJK / 标点 / 空格逐字，拉丁词与 URL 整段一个原子。"""
+    atoms: List[str] = []
+    i = 0
+    while i < len(text):
+        match = LATIN_TOKEN_RE.match(text, i)
+        if match and match.end() > i:
+            atoms.append(match.group(0))
+            i = match.end()
+        else:
+            atoms.append(text[i])
+            i += 1
+    return atoms
+
+
+def _atom_w(atom: str) -> float:
+    """原子的字数宽度（东亚洲宽 1、半角 0.5，与 ``_char_w`` 同一口径）。"""
+    return sum(_char_w(ch) for ch in atom)
+
+
+def _atoms_chars(atoms: Sequence[str], upto: int) -> int:
+    """前 ``upto`` 个原子一共占多少个字符。"""
+    return sum(len(atom) for atom in atoms[:upto])
+
+
+def _char_cut_atom(atoms: Sequence[str], char_cut: int) -> int:
+    """字符下标 -> 原子下标；char_cut 不在原子边界上时返回 -1。"""
+    acc = 0
+    for index, atom in enumerate(atoms):
+        if acc == char_cut:
+            return index
+        acc += len(atom)
+    return len(atoms) if acc == char_cut else -1
+
+
+def _wrap(text: str, width: float, warn_hard: bool = True) -> Tuple[int, float]:
+    """从 text 头部取一行，返回 ``(切点字符数, 超宽字数)``。
+
+    折行单位是**原子**：CJK 逐字、拉丁词 / URL 整段不可拆（V35）。先贪心装到
+    ``width`` 拿到一个**上界**，再在它之前找**最后一个合法切点**；找不到就容许放行
+    1~2 个收尾标点（``FOLD_OVERFLOW_GRACE``），宁可这行多装一个字，也不要下一行以
+    标点开头。唯一允许硬切的情况是「单个拉丁词本身比整行还宽」，这时打 WARN 建议
+    改短；**绝不丢字**：切点永远 ≥1 且 < ``len(text)``。
     """
-    tokens = list(text)
+    atoms = _split_atoms(text)
     consumed = 0.0
-    limit = 0
-    while limit < len(tokens):
-        consumed += _char_w(tokens[limit])
-        if consumed > width:
+    fit = 0
+    while fit < len(atoms):
+        atom_w = _atom_w(atoms[fit])
+        if consumed + atom_w > width:
             break
-        limit += 1
-    limit = max(1, min(limit, len(tokens) - 1))
+        consumed += atom_w
+        fit += 1
+
+    if fit <= 0:
+        # 第一个原子就比整行还宽：只能在这一个词内部硬切，并提醒改稿（V35）。
+        hard = 0
+        acc = 0.0
+        while hard < len(atoms[0]) and acc + _char_w(atoms[0][hard]) <= width:
+            acc += _char_w(atoms[0][hard])
+            hard += 1
+        if warn_hard:
+            warn(
+                f"「{atoms[0]}」这段比一行（{width:g} 字）还宽，只能从中间硬切；"
+                "建议把 URL / 英文改短，或调大 timing.json 的 captions.maxChars"
+            )
+        return max(1, min(hard, len(text) - 1)), 0.0
+
+    # 全部原子都装得下时（平衡分支的 mid 可能给得比整行还宽），退一个保证有剩余。
+    fit = min(fit, len(atoms) - 1)
 
     # 主选：上界以内的最后一个合法切点。
-    cut = limit
-    while cut > 0 and not _valid_break(tokens, cut):
+    cut = fit
+    while cut > 0 and not _valid_break(atoms, cut):
         cut -= 1
     if cut > 0:
-        return cut, 0.0
+        return _atoms_chars(atoms, cut), 0.0
 
     # 退让：上界之后最近的合法切点，只要多装的都是收尾标点、且不超宽容度。
-    over = limit
+    over = fit
     extra = 0.0
-    while over < len(tokens) - 1 and extra < FOLD_OVERFLOW_GRACE:
-        if tokens[over] not in CLOSING_PUNCT:
+    while over < len(atoms) - 1 and extra < FOLD_OVERFLOW_GRACE:
+        if atoms[over] not in CLOSING_PUNCT:
             break
-        extra += _char_w(tokens[over])
+        extra += _char_w(atoms[over])
         over += 1
-        if _valid_break(tokens, over):
-            return over, extra
-    return limit, 0.0
+        if _valid_break(atoms, over):
+            return _atoms_chars(atoms, over), extra
+    return _atoms_chars(atoms, fit), 0.0
+
+
+#: 第二行以「单个字 + 收尾标点」开头 = 中文词被拆开的指纹（V39），例如「小 / 票，」。
+LONELY_HEAD_RE = re.compile(r"^[^\s，。、；：！？,.;:!?…—]\s*[，。、；：！？,.;:!?…—]")
+
+
+def _lonely_head(tail: str) -> bool:
+    """第二行是不是以「单个字 + 收尾标点」开头？"""
+    return bool(LONELY_HEAD_RE.match(tail))
+
+
+def _balance_cut(rest: str, center: int, width: float) -> int:
+    """在中心切点附近的原子边界里挑「两行最均衡」的合法切点（V39）。
+
+    均衡优先（两行字数差最小），标点边界只作为同分时的加分项——这样「小票」这类
+    中文词不会为了凑标点被拆开，下一个「单字 + 标点」规则再兜底。
+    返回 0 表示 ``center`` 附近没有合法切点。
+    """
+    atoms = _split_atoms(rest)
+    boundaries = [0]
+    acc = 0
+    for atom in atoms:
+        acc += len(atom)
+        boundaries.append(acc)
+    index = _char_cut_atom(atoms, center)
+    if index < 0:
+        return 0
+    best_score = (10 ** 9, 10 ** 9)  # (两行字数差, 非标点边界的罚分)
+    best_cut = 0
+    for offset in range(-BALANCE_LOOKBACK, BALANCE_LOOKBACK + 1):
+        atom_cut = index + offset
+        if atom_cut <= 0 or atom_cut >= len(atoms) or not _valid_break(atoms, atom_cut):
+            continue
+        cand = boundaries[atom_cut]
+        head = _vis_len(rest[:cand])
+        tail = _vis_len(rest[cand:])
+        if head > width or tail > width:
+            continue
+        if rest[cand - 1] in CLOSING_PUNCT or rest[cand - 1] == " ":
+            score = (abs(head - tail), 0)
+        else:
+            score = (abs(head - tail), 1)
+        if score < best_score:
+            best_score = score
+            best_cut = cand
+    return best_cut
 
 
 def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
-    """按字数折行：优先在标点后断，其次硬断；总行数不够时只 WARN 不丢字。
+    """按字数折行：优先在标点后断，其次整词下移（V35/V39）。
 
-    返回的行数可能超过 ``max_lines`` —— 那种情况调用方会打 WARN：
-    丢字会让字幕和配音对不上，比多占一行更严重（改稿才是正解）。
+    * 折行单位是原子：CJK 逐字、拉丁词 / URL 整段不可拆，装不下就整词下移；
+      只有单个词本身比整行宽才硬切并 WARN；
+    * 平衡分支在平衡点 ±2 字内优先找标点边界，且第二行不能以「单字 + 标点」开头；
+    * 本函数**不丢字**，返回行数可能超过 ``max_lines``——超行由
+      ``_check_fold_lines()`` 直接 error（AGENTS.md 阶段 7「最多 2 行」是硬要求，V42）。
     """
     cleaned = _clean_text(text)
     if not cleaned:
@@ -354,7 +474,7 @@ def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
     rest = cleaned
     while rest:
         if _vis_len(rest) <= width:
-            lines.append(rest)
+            lines.append(rest.strip(" "))
             break
         cut, overflow = _wrap(rest, width)
         cut = max(1, min(cut, len(rest) - 1))
@@ -364,16 +484,36 @@ def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
         # 判据只用「尾巴一行装得下」：原来的 len(lines) + 1 == max_lines 只有在
         # 「这一刀切完正好是最后一行」时才成立，maxLines=2 时那一刀落在第二行上，
         # 于是平衡分支永远进不来（13 字 + 3 字尾巴照样输出）。
+        # 平衡点按**可见字数**算一半，不按字符下标：含拉丁词时字符数会骗人
+        #（``xiaozhangben.app`` 16 个字符只占 8 个字宽），V39。
         if tail and _vis_len(tail) <= width and cut > len(rest) / 2:
-            mid = len(rest) // 2
-            mid_cut, mid_overflow = _wrap(rest, float(mid))
-            if 0 < mid_cut < len(rest) and _valid_break(list(rest), mid_cut):
-                mid_tail = rest[mid_cut:]
-                # 平衡后的两行仍然都要 ≤ max_chars（避头尾会把切点撑宽 1~2 个字），
-                # 撑超了就保持原来的切点：宁可「满行 + 短尾巴」也不能破单行字数上限。
-                if _vis_len(rest[:mid_cut]) <= width and _vis_len(mid_tail) <= width:
-                    cut, overflow, tail = mid_cut, mid_overflow, mid_tail
-        lines.append(rest[:cut])
+            atoms = _split_atoms(rest)
+            half = sum(_atom_w(atom) for atom in atoms) / 2.0
+            acc = 0.0
+            center = 0
+            for atom in atoms:
+                if acc >= half:
+                    break
+                acc += _atom_w(atom)
+                center += len(atom)
+            mid_cut = _balance_cut(rest, center, width)
+            # 平衡后的两行仍然都要 ≤ max_chars（避头尾会把切点撑宽 1~2 个字），
+            # 撑超了就保持原来的切点：宁可「满行 + 短尾巴」也不能破单行字数上限。
+            if (
+                0 < mid_cut < len(rest)
+                and _vis_len(rest[:mid_cut]) <= width
+                and _vis_len(rest[mid_cut:]) <= width
+            ):
+                cut, overflow, tail = mid_cut, 0.0, rest[mid_cut:]
+        # 第二行以「单字 + 收尾标点」开头时切点左移 1 字（V39）。
+        if _lonely_head(tail) and cut > 1 and _vis_len(rest[cut - 1:]) <= width:
+            atoms = _split_atoms(rest)
+            atom_cut = _char_cut_atom(atoms, cut - 1)
+            if atom_cut > 0 and _valid_break(atoms, atom_cut):
+                cut -= 1
+                tail = rest[cut:]
+        # 断行处的空格是排版垃圾：SRT/ASS 里行首行尾的空格肉眼看不见，删掉更干净。
+        lines.append(rest[:cut].strip(" "))
         rest = tail
         if overflow:
             # 只为避行首标点才撑宽，且最多 2 个字；说清楚免得看起来像折行失败。
@@ -381,13 +521,22 @@ def _fold_text(text: str, max_chars: int, max_lines: int) -> List[str]:
                 f"「{cleaned}」首行多含了 {overflow:g} 个标点（>{max_chars} 字）以避免把标点切到行首："
                 "这是有意的避头尾处理，不是折行失败"
             )
-    if max_lines > 0 and len(lines) > max_lines:
-        warn(
-            f"「{cleaned}」折成 {len(lines)} 行，超过 captions.maxLines={max_lines}"
-            f"（每行 ≤{max_chars} 字）。这里**不丢字**（丢字=字幕和配音对不上），"
-            "请回 timing.json 改稿删字，或调大 captions.maxChars/maxLines"
-        )
     return lines
+
+
+def _check_fold_lines(line_id: str, text: str, lines: List[str], max_chars: int, max_lines: int) -> None:
+    """字幕超过 ``captions.maxLines`` 就硬失败（V42）。
+
+    AGENTS.md 阶段 7 把「最多 2 行」定成硬要求，但原来只 WARN 并原样写进 SRT/ASS；
+    现在 srt / ass / burn 三条路径都走 ``build_cues()``，在这里统一拦下，让作者改稿。
+    """
+    if max_lines > 0 and len(lines) > max_lines:
+        error(
+            f"第 {line_id} 句「{_clean_text(text)}」折成 {len(lines)} 行，"
+            f"超过 captions.maxLines={max_lines}（每行 ≤{max_chars} 字）。"
+            "字幕最多 2 行是 AGENTS.md 阶段 7 的硬要求：请回 timing.json 改稿删字/拆句，"
+            "或调大 captions.maxChars / maxLines"
+        )
 
 
 # --- 字体 -----------------------------------------------------------------
@@ -876,7 +1025,7 @@ def _load_vo_report() -> Tuple[Dict[str, Dict[str, Any]], Path]:
     if not path.is_file():
         return {}, path
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}, path
     if not isinstance(data, dict) or not isinstance(data.get("lines"), list):
@@ -1005,6 +1154,7 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
                 end = max(start + 0.2, scene_end)
 
         lines = _fold_text(text, max_chars, max_lines)
+        _check_fold_lines(line_id, text, lines, max_chars, max_lines)
         cues.append(Cue(line_id, scene, text, lines, start, end, vo_s, min_s, source))
 
     if not cues:
@@ -1108,7 +1258,10 @@ def _write_srt(cues: List[Cue], path: Path) -> None:
     text = "\r\n".join(blocks)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="")
+        # Path.write_text(newline=...) 是 Python 3.10+ 的参数；本仓库下限 3.9（见
+        # AGENTS.md §6 与 fonts.py 的同款注释），所以用 open() 来指定换行符。
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
     except OSError as exc:
         error(f"字幕写不进 {path}：{exc}")
 
@@ -1164,9 +1317,24 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
 
     play_w = max(1, _int(timing.get("width"), 1080))
     play_h = max(1, _int(timing.get("height"), 1920))
+    margin_l = int(round(play_w * SAFE_LEFT))
+    margin_r = int(round(play_w * SAFE_RIGHT))
+    max_chars = max(1, _int(captions.get("maxChars"), 13))
+    avail_w = max(1, play_w - margin_l - margin_r)
 
-    # 字号按画布高度换算，保证 9:16 与 16:9 用同一套 timing.json 都不破版。
-    size = float(fontsize) if fontsize else max(FONT_SIZE_MIN, round(play_h * FONT_SCALE))
+    # 字号按画布高度换算，保证 9:16 与 16:9 用同一套 timing.json 都不破版；
+    # 再用「左右安全区可用宽度 / maxChars」压一次上限（V36）：只按高度算时
+    # 13 个全角字 × 73px = 949px，会超出 6% + 14% 留白后的 864px，侵入两侧安全区。
+    if fontsize:
+        size = float(fontsize)
+    else:
+        size_by_height = round(play_h * FONT_SCALE)
+        size = float(max(FONT_SIZE_MIN, min(size_by_height, int(avail_w // max_chars))))
+        if size < size_by_height:
+            log(
+                f"字号压到 {size:g}：{max_chars} 字要落在左右安全区"
+                f"（{margin_l}+{margin_r} 留白后剩 {avail_w}px）内，按画布高度会到 {size_by_height}"
+            )
 
     # MarginV 由 captions.bottom（相对高度）换算：ASS 里 Alignment=2 的 MarginV 是
     # 「文字底边离画面底边的距离」，所以直接乘画布高；这样烧出来的字幕与画面里
@@ -1226,8 +1394,8 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
             f"{DEFAULT_OUTLINE:g}",
             f"{DEFAULT_SHADOW:g}",
             "2",
-            f"{int(round(play_w * SAFE_LEFT))}",
-            f"{int(round(play_w * SAFE_RIGHT))}",
+            f"{margin_l}",
+            f"{margin_r}",
             f"{margin_v}",
             "1",
         ]
@@ -1254,14 +1422,18 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # 用 UTF-8 **不带 BOM** 写：libass 对 BOM 开头的 [Script Info] 会解析失败。
-        path.write_text(text, encoding="utf-8", newline="\n")
+        # newline="\n" 经 open() 传（Path.write_text(newline=) 要 Python 3.10+，下限 3.9）。
+        with path.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
     except OSError as exc:
         error(f"字幕写不进 {path}：{exc}")
 
     log(
-        f"ASS 样式：字体 {family}，字号 {size:g}（画布 {play_w}×{play_h} 的 {size / play_h:.1%}），"
+        f"ASS 样式：字体 {family}，字号 {size:g}"
+        f"（画布 {play_w}×{play_h} 的 {size / play_h:.1%}；上限 = min(高度×{FONT_SCALE:g}, "
+        f"{avail_w}px / {max_chars} 字)），"
         f"MarginV {margin_v}（离底边，对应 captions.bottom={margin_v / play_h:.3f}），"
-        f"左右留白 {int(round(play_w * SAFE_LEFT))}/{int(round(play_w * SAFE_RIGHT))}"
+        f"左右留白 {margin_l}/{margin_r}"
     )
     return text
 

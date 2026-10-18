@@ -203,8 +203,11 @@ export const App = () => {
         </div>
 
         <p className="caption-note">
-          {/* 竖屏片子在桌面浏览器里会被压得很高，提示一句，减少"怎么这么小"的疑惑 */}
-          竖屏 9:16 · 建议用手机全屏观看
+          {/* 画幅从 timing.json 推导：竖屏在桌面浏览器里会被压得很高、横版在手机里会被压得很小，
+              提示一句，减少"怎么这么小 / 这么大"的疑惑。别写死"竖屏 9:16"（横版项目会显示错）。 */}
+          {PLAYER.height >= PLAYER.width
+            ? `竖屏 ${PLAYER.aspect} · 建议用手机全屏观看`
+            : `横版 ${PLAYER.aspect} · 建议用桌面全屏观看`}
         </p>
       </main>
 

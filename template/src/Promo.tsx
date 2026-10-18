@@ -44,22 +44,33 @@ export type PromoProps = {
  * 所以：文件不存在就不挂音轨 —— 渲染照样出无声成片，而"缺混音"由渲染前的
  * `check_assets.py`（ERROR: 混音文件）和渲染后的 `check_video.py`（无音轨）明确报出来。
  *
- * 拿不到清单时按"存在"处理（宁可让渲染报错，也不要静默丢音轨）。
+ * 拿不到清单（或清单为空）时按"存在"处理（宁可让渲染报错，也不要静默丢音轨）。
+ * ❗网页播放器里 `getStaticFiles()` 返回的是空数组而不是抛错，见下面的注释。
  */
 const MUSIC_FILE_EXISTS: boolean = (() => {
   const want = TIMING.music.file.replace(/\\/g, "/");
   if (want.trim() === "") {
     return false;
   }
+  let files: ReturnType<typeof getStaticFiles>;
   try {
-    return getStaticFiles().some((file) => {
-      const name = String(file.name).replace(/\\/g, "/").replace(/^\/?public\//, "");
-      const src = String(file.src).replace(/\\/g, "/");
-      return name === want || src.endsWith("/" + want) || src.endsWith("/public/" + want);
-    });
+    files = getStaticFiles();
   } catch {
     return true;
   }
+  // ❗<Player>（网页播放版）里 getStaticFiles() 返回**空数组**而不是抛错：
+  // 见 node_modules/remotion/dist/cjs/get-static-files.js —— window.remotion_isPlayer 为真时直接 return []，
+  // 而 Player 会在渲染场景组件前把 isPlayer 置为 true。空清单的含义是"不知道 public/ 里有什么"，
+  // **不是"文件不存在"** —— 这里必须按未知处理（返回 true），否则网页版会悄悄丢掉音轨。
+  // 真正缺文件时由渲染前的 check_assets.py（ERROR: 混音文件）和渲染后的 check_video.py（无音轨）报出来。
+  if (files.length === 0) {
+    return true;
+  }
+  return files.some((file) => {
+    const name = String(file.name).replace(/\\/g, "/").replace(/^\/?public\//, "");
+    const src = String(file.src).replace(/\\/g, "/");
+    return name === want || src.endsWith("/" + want) || src.endsWith("/public/" + want);
+  });
 })();
 
 /**

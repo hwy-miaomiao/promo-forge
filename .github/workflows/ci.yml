@@ -1,0 +1,63 @@
+name: ci
+
+# 只跑确定性检查：不渲染、不跑 ffmpeg、不下载素材、不联网打外部 API。
+# 渲染/成片校验在本地做（见 AGENTS.md 第 7 节），CI 只守住「脚本别写坏」这条线。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法编译（template/scripts）
+        run: python -m compileall -q template/scripts
+
+      - name: 脚本纯函数自测（不渲染、不需要 ffmpeg）
+        run: python template/scripts/selftest.py
+
+      - name: 行尾检查（仓库要求 LF；CRLF / 混合行尾直接失败）
+        run: |
+          offenders="$(git ls-files --eol | grep -E '^i/(crlf|mixed)' || true)"
+          if [ -n "$offenders" ]; then
+            echo "ERROR: 这些文件的索引里是 CRLF 或混合行尾（仓库要求 LF）："
+            echo "$offenders"
+            exit 1
+          fi
+          echo "OK: 所有跟踪文件都是 LF 行尾"
+
+  node:
+    name: node / tsc
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: template
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 安装模板依赖（不跑渲染）
+        run: npm install --no-audit --no-fund
+
+      - name: 类型检查
+        run: npx tsc --noEmit

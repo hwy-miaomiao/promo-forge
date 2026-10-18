@@ -25,9 +25,11 @@
 1. ``check_assets.py`` 的 ``_collect_texts()``（``title`` / ``brand.name`` / ``brand.url`` /
    ``voice.lines[].text`` / ``scenes[].note``）—— 直接 import 复用，保证两边结论不打架；
 2. ``src/timing.json`` 里**所有**字符串（含 ``slug`` / 场景 ``name`` 等第 1 条没覆盖的字段）；
-3. ``src/**/*.{ts,tsx}`` 挖掉注释后的**全部非 ASCII 字符**。这里比「只收字符串字面量」更严：
+3. 项目内**全部上屏文本文件**（``src/**`` 与 ``web/**`` 的 ts/tsx/js/jsx/mjs/cjs、css/html/svg、
+   以及 json）挖掉注释后的**全部非 ASCII 字符**。这里比「只收字符串字面量」更严：
    模板场景里大量中文写在 JSX 文本节点里（例如 ``src/scenes/Demo.tsx`` 的「本月账目」），
-   只扫字面量会漏掉它们，渲染时就是方块；
+   只扫字面量会漏掉它们，渲染时就是方块；注释（``//`` / ``/* */`` / ``<!-- -->`` / JSON 的
+   ``_comment`` 键）必须先剥掉，否则注释里的装饰字会进子集、让 subset 因缺字形误报 ERROR；
 4. ``fonts.json`` 的 ``check.extraChars``；
 5. 可打印 ASCII（英文、数字、半角标点、网址）；
 6. 联系表标签兜底字符：``media.py`` / ``check_video.py`` 画在联系表上的中文标题，
@@ -90,15 +92,20 @@ FLAVORS = ("auto", "woff2", "ttf", "otf")
 
 # 扫源码时跳过的目录（与 check_assets.py 保持一致）
 SKIP_DIR_NAMES = {"node_modules", ".git", "dist", "build"}
-#: 需要挖掉注释再收字的后缀（TS/JS 有 `//` 与 `/* */`，CSS/HTML 有块注释，JSON 有 `_comment` 键）。
+#: 需要挖掉注释再收字的后缀（TS/JS 有 `//` 与 `/* */`，CSS/HTML/SVG 有块注释，JSON 有 `_comment` 键）。
+#: TS 与普通 JS 的注释语法完全相同（含 JSX 里的 `{/* ... */}`），所以共用同一个剥离器：
+#: 之前只有 `.ts`/`.tsx` 参与剥注释，`.js`/`.jsx`/`.mjs`/`.cjs`/`.svg` 虽然被扫到却原样收字，
+#: 注释里的装饰字（emoji、生僻字）就会让子集化因「源字体覆盖不了这个字符」直接 ERROR。
 TS_SUFFIXES = (".ts", ".tsx")
+#: 有 `//` 与 `/* */` 注释、需要先剥注释再收字的源码后缀（TS/TSX 与 JS 同语法）。
+SCRIPT_SUFFIXES = TS_SUFFIXES + (".js", ".jsx", ".mjs", ".cjs")
 #: 会出现在屏幕上的文本文件后缀：TS/TSX 之外的 JSON（timing.json / props-*.json）、
 #: CSS（web/style.css 的界面文案）、HTML（web/index.html 的标题）、SVG（矢量图里的 text）。
 #: 原来只扫 `src/**/*.{ts,tsx}`，`web/**`（同一套子集 webfont 的网页版）与
 #: `src/*.css` 里的中文全漏 —— 子集里没有这些字，网页版就会出方块。
 #: 注：`scripts/` 整个目录不扫（见 `_src_texts`）：`stills.mjs` 这类工具脚本的中文只打在
 #: 终端上，不进画面，收进来只会白白撑大子集。
-TEXT_SUFFIXES = TS_SUFFIXES + (".js", ".jsx", ".mjs", ".cjs", ".json", ".css", ".html", ".svg")
+TEXT_SUFFIXES = SCRIPT_SUFFIXES + (".json", ".css", ".html", ".svg")
 
 # 子集化时直接丢掉的表：数字签名、位图/彩色字形（web 渲染用不到）与老式 hint 表。
 # MERG / meta 留在里面只会让 fontTools 打一行 "NOT subset; don't know how to subset; dropped"。
@@ -150,7 +157,9 @@ INVISIBLE_CHARS = frozenset("\ufeff\u200b\u200c\u200d\u2060")
 def _read_fonts_cfg() -> Dict[str, Any]:
     """读 fonts.json（不存在或不是合法 JSON 都是 ERROR：它是字体角色表的唯一来源）。"""
     try:
-        raw = C.FONTS_PATH.read_text(encoding="utf-8")
+        # utf-8-sig：记事本/某些编辑器存 UTF-8 时会带 BOM，BOM 留在字符串里会让
+        # json.loads 报「Expecting value: line 1 column 1」，整条链直接 abort。
+        raw = C.FONTS_PATH.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         C.error(f"读不到 {C.rel(C.FONTS_PATH)}：文件不存在（模板里必须有这个文件）")
     except OSError as exc:
@@ -327,10 +336,10 @@ def _json_comment_stripped(text: str) -> str:
 
 
 def _source_text(raw: str, suffix: str, checker: Any) -> str:
-    """按后缀选注释剥离器：ts/tsx 走 check_assets 的公共实现，css/html 走本地实现。"""
-    if suffix in TS_SUFFIXES:
+    """按后缀选注释剥离器：JS/TS 系走 check_assets 的公共实现，css/html/svg 走本地实现。"""
+    if suffix in SCRIPT_SUFFIXES:
         return _strip_ts_comments(raw, checker)
-    if suffix in (".css", ".html"):
+    if suffix in (".css", ".html", ".svg"):
         return _strip_style_comments(raw)
     if suffix == ".json":
         return _json_comment_stripped(raw)
@@ -416,7 +425,7 @@ def build_charset(timing: Dict[str, Any], cfg: Dict[str, Any]) -> Charset:
         ("check_assets.py 口径（title / brand / voice / scenes.note）",
          "".join(text for _src, text in collected)),
         ("timing.json 其他字段（全部字符串）", "".join(_json_strings(timing))),
-        (f"项目内上屏文本（{scanned} 个文件，注释已挖掉：ts/tsx、css/html、json 的 _comment）",
+        (f"项目内上屏文本（{scanned} 个文件，注释已挖掉：ts/tsx/js/jsx/mjs/cjs、css/html/svg、json 的 _comment）",
          "".join(src_chunks)),
     ]
     if extra:
@@ -949,7 +958,11 @@ def cmd_subset(args: argparse.Namespace) -> int:
         detail = _describe_missing(charset, seen_chars)
         C.error(
             f"源字体覆盖不了片子里这 {len(seen_chars)} 个字符：{detail}。"
-            "它们在片子里会渲染成方块（□）。换一个覆盖它们的字体"
+            "它们在片子里会渲染成方块（□）。先按每个字后面的「来自 …」核对来源："
+            "如果来自注释或示例代码，说明它根本不上屏——把那段装饰字删掉，"
+            "或改成脚本能剥干净的写法（本脚本会剥 ts/tsx/js/jsx/mjs/cjs 的 `//`、`/* */`，"
+            "css/html/svg 的块注释，以及 json 的 `_comment` 键；字符串字面量里的假文案剥不掉，"
+            "要手动挪走）；如果确实是上屏文案，再换一个覆盖它们的字体"
             "（`--font C:/Windows/Fonts/msyh.ttc` / Noto Sans CJK SC / 思源黑体），"
             "或把文案换成不缺字的写法后重跑"
         )

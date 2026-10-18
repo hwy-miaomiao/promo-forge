@@ -37,6 +37,11 @@
     **没查到确切数字，脚本不编造**：只打印一行「需人工确认」，不参与判定，
     也不会因此让脚本非零退出。
 
+``project``
+    **本项目自己的规范**（AGENTS.md），不是任何平台的参数：例如「成片必须有音轨」
+    「必须有视频流」。闸门按硬规矩处理（违反就是 ERROR），但输出里标「本项目规范」
+    而不是「平台硬限制（官方文档）」，避免把我们的规矩说成平台要求。
+
 实际查到的来源（2026-10，本机可访问的只有下列这些）：
 
 * 视频号官方帮助中心「视频号发表的素材有什么要求？」
@@ -198,6 +203,9 @@ COVER_MIDDLE_ANCHOR = 0.56
 COVER_SCRIM_ALPHA = 210
 #: 压暗后仍不满意时可读性兜底：文字描边宽度（px）
 COVER_STROKE_PX = 4
+#: 封面品牌名的默认强调色（RGB）。来源：模板 timing.json 的 brand.colors.accent（#33E1A1）；
+#: 模板把它做成可配置项后，这里只当**缺省兜底**——命令行不再硬编码这个颜色。
+DEFAULT_BRAND_ACCENT = (51, 225, 161)
 #: 封面标题的行数硬上限。默认 2，与 AGENTS.md 阶段 7「竖屏字幕最多 2 行」一致；
 #: 运行时用 timing.json 的 captions.maxLines 覆盖（缺失时用这个值）。
 CAPTION_MAX_LINES = 2
@@ -699,8 +707,8 @@ def _check_streams(m: Media, p: Dict[str, Any]) -> Check:
     所以这里给 ERROR，其余检查项按「需人工确认」跳过，避免刷出一堆误导性的红字。
     """
     if m.video is not None:
-        return _mk("视频流", f"{m.codec} / {m.width}×{m.height}", "必须有", "OK", "official")
-    return _mk("视频流", "无", "必须有", "ERROR", "official",
+        return _mk("视频流", f"{m.codec} / {m.width}×{m.height}", "必须有", "OK", "project")
+    return _mk("视频流", "无", "必须有", "ERROR", "project",
                "这个文件里没有视频流（只有音频流或完全是空的），它不是一支能交付的成片。"
                "常见原因：导出时只写了音频、或误把 mix.py 的产物当成了成片。"
                "请回到 `npm run render:1080` 重新渲染，产物应是 out/final-1080p.mp4")
@@ -716,8 +724,14 @@ def _check_duration(m: Media, p: Dict[str, Any]) -> Check:
     if lo <= m.duration <= hi:
         return _mk("时长", f"{m.duration:.2f}s", rule, "OK", conf)
     if m.duration < lo:
-        return _mk("时长", f"{m.duration:.2f}s", rule, "ERROR", conf,
-                   f"短于平台下限 {lo:g}s，投稿会被拒；回到 timing.json 把 duration 与最后一个场景的 end 一起加长")
+        # 只有官方硬限制才判 ERROR；第三方汇总的「下限」只是参考（V13：2 秒的片子
+        # 曾被按「推荐值（第三方汇总，非官方）」判 ERROR，等于把非官方口径当硬失败）。
+        return _mk("时长", f"{m.duration:.2f}s", rule,
+                   "ERROR" if conf == "official" else "WARN", conf,
+                   f"短于{lo:g}s 下限："
+                   + ("这是官方硬限制，投稿会被拒；" if conf == "official"
+                      else "这个下限来自第三方汇总（非官方），投稿前请以平台页面提示为准；")
+                   + "回到 timing.json 把 duration 与最后一个场景的 end 一起加长")
     return _mk("时长", f"{m.duration:.2f}s", rule,
                "ERROR" if conf == "official" else "WARN", conf,
                f"超过 {hi:g}s（{hi / 60:.0f} 分钟）："
@@ -736,29 +750,34 @@ def _check_resolution(m: Media, p: Dict[str, Any]) -> Check:
         return _mk("分辨率", f"{m.width}×{m.height}", "需人工确认", "INFO", "unknown",
                    "推荐分辨率没查到确切数字，请以投稿页面为准")
     rec_w, rec_h = res
-    if (m.width, m.height) == (rec_w, rec_h):
-        return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}", "OK", conf)
-    if (m.width, m.height) == (rec_w * 2, rec_h * 2):
-        return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}", "OK", conf,
-                   "2 倍图（render:4k 的产物）会走平台的下采样，正常；"
-                   "非必要不必传这么大的文件，1080×1920 就够")
-    # 竖屏但尺寸不是 1080×1920（例如 720×1280）：能发，但清晰度吃亏
+    value = f"{m.width}×{m.height}"
+    rule = f"{rec_w}×{rec_h} / {rec_h}×{rec_w}"
+    # 平台表里写的是一组「推荐宽×高」，但竖版与横版是同一组标准比例的两个方向：
+    # 视频号官方原文是「建议上传标准比例的视频（16:9 或者 9:16）」，抖音/小红书的
+    # 推荐值同样只是 9:16 那一档。所以 1080×1920 与 1920×1080（以及它们的 2 倍图）
+    # 都算命中推荐尺寸——横版不能判 ERROR（AGENTS.md 第 1 节明确允许 1920×1080 横版），
+    # 否则「官方允许横版」与「脚本对横版报错」自相矛盾。
+    variants = {
+        (rec_w, rec_h): "",
+        (rec_h, rec_w): "横版是 16:9，平台同样认可；主流量仍是竖屏，投稿前确认清楚即可",
+        (rec_w * 2, rec_h * 2): "2 倍图（render:4k 的产物）会走平台的下采样，正常；"
+                                "非必要不必传这么大的文件，1080×1920 就够",
+        (rec_h * 2, rec_w * 2): "横版 2 倍图（render:4k 的产物）会走平台的下采样，正常",
+    }
+    if (m.width, m.height) in variants:
+        return _mk("分辨率", value, rule, "OK", conf, variants[(m.width, m.height)])
+    # 竖屏但尺寸不是推荐值（例如 720×1280）：能发，但清晰度吃亏
     if m.height > m.width:
-        return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}", "WARN", conf,
+        return _mk("分辨率", value, rule, "WARN", conf,
                    f"竖屏方向对，但推荐值是 {rec_w}×{rec_h}；"
                    "低于它平台会放大（发虚），高于它会被二压。"
                    "建议按 timing.json 的 width/height 重渲（render:1080 出 1080×1920）")
-    # 横版：AGENTS.md 第 1 节明确允许「可选 1920×1080 横版」，所以它不能是硬 ERROR。
-    # 口径是第三方的（`conf != "official"`）时按 WARN 处理，与本文件 _check_aspect 的
-    # 分级口径保持一致；视频号的竖屏推荐值来自官方帮助页，横版对它是硬伤，仍判 ERROR。
-    # （放宽这里时必须同时有 _check_streams 的判空，否则无视频流的文件会变成 0 ERROR 假绿。）
-    return _mk("分辨率", f"{m.width}×{m.height}", f"{rec_w}×{rec_h}",
-               "ERROR" if conf == "official" else "WARN", conf,
-               f"这是横屏画面，而 {p['name']} 的主流量是竖屏（{rec_w}×{rec_h}）。"
-               + ("横屏投稿会被加黑边、算法推荐更差；" if conf == "official"
-                  else f"这个推荐值来自第三方汇总（非官方），横版发布前请到 {p['name']} 的投稿页确认；")
-               + "横版是规范允许的形态（AGENTS.md 第 1 节：首选竖屏，可选 1920×1080 横版），"
-                 "要竖屏就改 timing.json 的 aspect 为 9:16、width/height 换成 1080/1920 后重渲")
+    # 横屏但不是标准 16:9（例如 1280×720 仍是标准比例、只是分辨率低于推荐值）：
+    # 推荐值只是推荐值，横版又明确被 AGENTS.md 允许，所以这里一律 WARN，不判 ERROR。
+    return _mk("分辨率", value, rule, "WARN", conf,
+               f"这是横屏画面，{p['name']} 的推荐值是竖版 {rec_w}×{rec_h}，对应横版 {rec_h}×{rec_w}。"
+               "横版是规范允许的形态（AGENTS.md 第 1 节：首选竖屏，可选 1920×1080 横版），"
+               "要竖屏就改 timing.json 的 aspect 为 9:16、width/height 换成 1080/1920 后重渲")
 
 
 def _check_aspect(m: Media, p: Dict[str, Any]) -> Check:
@@ -811,10 +830,13 @@ def _check_bitrate(m: Media, p: Dict[str, Any]) -> Check:
     lo, hi = spec
     value = _fmt_bitrate(m.video_bitrate)
     if conf == "unknown":
-        # 有经验值但没有可引用的来源：规则列写成经验值，避免和「需人工确认」自相矛盾
-        rule = f"经验值 ≥{lo / 1_000_000:g} Mbps"
-    else:
-        rule = f"≥{lo / 1_000_000:g} Mbps" + (f"（≤{hi / 1_000_000:g}）" if hi else "")
+        # conf=unknown 按本文件 docstring 的口径「只提示、不参与判定」：这里只有一个
+        # 经验值，没有可引用的来源，不能既说「需人工确认」又拿经验值判 WARN
+        # （V11：1.26 Mbps 的成片曾因此每平台刷 1 条 WARN，且 advice 写成「符合建议值」式口吻）。
+        return _mk("码率", value, "需人工确认", "INFO", conf,
+                   "平台码率建议没查到确切数字，不参与判定；经验值（非官方，仅供参考）："
+                   f"1080p 给 {lo / 1_000_000:g}~16 Mbps，码率越高越抗平台二压")
+    rule = f"≥{lo / 1_000_000:g} Mbps" + (f"（≤{hi / 1_000_000:g}）" if hi else "")
     if m.video_bitrate >= lo:
         if hi and m.video_bitrate > hi:
             return _mk("码率", value, rule, "WARN", conf,
@@ -823,14 +845,18 @@ def _check_bitrate(m: Media, p: Dict[str, Any]) -> Check:
         return _mk("码率", value, rule, "OK", conf,
                    "码率给足能少被压糊" if conf == "thirdparty" else "符合官方建议")
     shortfall = lo - m.video_bitrate
+    if conf == "thirdparty":
+        low_note = (f"比第三方汇总的建议值低 {shortfall / 1_000_000:.1f} Mbps"
+                    "（非官方口径，只做方向参考）；")
+    else:
+        low_note = f"比官方建议值低 {shortfall / 1_000_000:.1f} Mbps；"
     if m.video_bitrate >= lo * 0.6:
         return _mk("码率", value, rule, "WARN", conf,
-                   f"比建议值低 {shortfall / 1_000_000:.1f} Mbps。"
-                   + ("官方建议 ≥10 Mbps（视频号二压后细节掉得明显）；" if conf == "official" else "第三方建议值；")
-                   + "从 out/final-1080p.mp4 直接传通常够，确实偏低就在 remotion.config.ts 里调高码率重渲")
+                   low_note + "从 out/final-1080p.mp4 直接传通常够，"
+                   "确实偏低就在 remotion.config.ts 里调高码率重渲")
     return _mk("码率", value, rule, "WARN", conf,
-               f"明显偏低（差 {shortfall / 1_000_000:.1f} Mbps），平台二压后画面会糊；"
-               "核对该 mp4 是不是预览版或经过二次压缩，建议拿渲染原始产物投稿")
+               low_note + "平台二压后画面会糊；核对该 mp4 是不是预览版或经过二次压缩，"
+               "建议拿渲染原始产物投稿")
 
 
 def _check_size(m: Media, p: Dict[str, Any]) -> Check:
@@ -864,7 +890,7 @@ def _check_audio(m: Media, p: Dict[str, Any]) -> Check:
     # 「有没有音轨」是我们自己的硬规矩（AGENTS.md 阶段 10：别把无声片交出去），不是平台参数；
     # 「用哪种音频编码」则多半是第三方汇总，统一按 thirdparty 标，避免把推荐值说成硬限制。
     if m.audio is None:
-        return _mk("音轨", "无", "必须有", "ERROR", "official",
+        return _mk("音轨", "无", "必须有", "ERROR", "project",
                    "这支 mp4 没有音轨（AGENTS.md 阶段 10 明确：别把无声片当成品交出去）。"
                    "先跑 python scripts/mix.py 生成 public/audio/music.wav，确认 Remotion 里用 "
                    "staticFile 挂到了 <Audio> 上，再重新渲染")
@@ -1054,7 +1080,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     log("")
     log("  说明：「平台硬限制（官方文档）」= 官方帮助页写明的数字，超了会被拒收；")
     log("        「推荐值（第三方汇总，非官方）」= 只做方向参考，脚本按 WARN 处理，投稿前请到平台页面复核；")
-    log("        「需人工确认（没查到确切数字）」= 脚本不编数字，不参与判定。")
+    log("        「需人工确认（没查到确切数字）」= 脚本不编数字，不参与判定；")
+    log("        「本项目规范（AGENTS.md）」= 我们自己的硬规矩（如必须有音轨/视频流），不是平台参数。")
 
     log("")
     log("=" * 78)
@@ -1556,6 +1583,22 @@ def _parse_frames(raw: Optional[str], duration: float) -> List[float]:
     return out
 
 
+def _brand_accent_rgb(brand_cfg: Dict[str, Any]) -> Tuple[int, int, int]:
+    """取 ``timing.json`` 里品牌强调色 ``brand.colors.accent`` 的 RGB。
+
+    模板把品牌色写进 timing.json（``#33E1A1`` 是默认值），封面上的品牌名应该跟着它走，
+    而不是在脚本里硬编码一个绿色——换了配色（例如 #FF6B35）的片子，封面品牌名还是绿的。
+    允许 ``#RRGGBB`` / ``RRGGBB``，大小写不敏感；缺失或写错时回退 ``DEFAULT_BRAND_ACCENT``。
+    """
+    colors = brand_cfg.get("colors") if isinstance(brand_cfg.get("colors"), dict) else {}
+    raw = str(colors.get("accent") or "").strip()
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", raw)
+    if not match:
+        return DEFAULT_BRAND_ACCENT
+    hex6 = match.group(1)
+    return (int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16))
+
+
 def cmd_cover(args: argparse.Namespace) -> int:
     _pil()
     if not has_cmd("ffmpeg"):
@@ -1576,6 +1619,7 @@ def cmd_cover(args: argparse.Namespace) -> int:
         max_chars = 13
     brand_cfg = timing.get("brand") if isinstance(timing.get("brand"), dict) else {}
     brand = str(brand_cfg.get("name") or "").strip()
+    accent = _brand_accent_rgb(brand_cfg)
     title = (args.title if args.title else str(timing.get("title") or "")).strip()
     if not title:
         error("没有标题可排版：timing.json 里没有 title，也没有传 --title。"
@@ -1604,6 +1648,8 @@ def cmd_cover(args: argparse.Namespace) -> int:
 
     log(f"封面候选：{rel(mp4)} → {rel(out_dir)}/")
     log(f"品牌名：{brand or '（timing.json 的 brand.name 为空，封面只放标题）'}")
+    log(f"品牌色：#{accent[0]:02X}{accent[1]:02X}{accent[2]:02X}"
+        "（timing.json 的 brand.colors.accent；缺失时回退 #33E1A1）")
     log(f"标题：{title}（按 captions.maxChars={max_chars} 折行，最多 {max_lines} 行）")
     log(f"文字位置：{args.position}"
         + {"bottom": "（贴安全区底边，成片底部字幕会被压暗层盖住）",
@@ -1663,7 +1709,7 @@ def cmd_cover(args: argparse.Namespace) -> int:
             y += chosen["line_h"]
         if brand:
             ldraw.text((safe_l + COVER_STROKE_PX, block_top), brand, font=chosen["brand_font"],
-                       fill=(51, 225, 161, 255), stroke_width=max(2, COVER_STROKE_PX - 2),
+                       fill=accent + (255,), stroke_width=max(2, COVER_STROKE_PX - 2),
                        stroke_fill=(0, 0, 0, 255))
 
         ink = _ink_bbox(layer)
@@ -1794,7 +1840,8 @@ check —— 平台交付预检
   是否有音轨 / 响度是否在 -16~-12 LUFS。每个平台给 OK / WARN / ERROR 与「怎么改」。
   有 ERROR 时非零退出（AGENTS.md 第 7 节）。
   平台参数区分「平台硬限制（官方文档）」与「推荐值（第三方汇总，非官方）」；
-  没查到确切数字的标「需人工确认」，脚本不编数字。
+  没查到确切数字的标「需人工确认」，脚本不编数字；「本项目规范（AGENTS.md）」标记的是
+  我们自己的硬规矩（必须有音轨/视频流），不是平台限制。
 
 cover —— 生成 3 张封面候选
   从成片里抽 3 帧（默认 3.6s hook 爆发 / 21.7s demo 图表 / 43.2s CTA），每帧生成一张

@@ -28,8 +28,13 @@ import { EASE, clamp, impulse, loop, ramp, riseIn, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
 import { useSceneBeat } from "../lib/beats";
 
-/** 小节索引 → 场景相对秒。切换点全部落在小节线上，换歌也不用改这里。 */
-const barSec = (i: number): number => i * TIMING.music.bar;
+/**
+ * ❗小节切换点不要自己拿 `i × TIMING.music.bar` 算：那个式子算的是「场景里的第 i 小节」，
+ * 而不是音乐里的第 i 条小节线 —— 两者差一个场景起点相位（demo 从 4.5 秒才开始，音乐却从 0 秒就在走），
+ * 算出来会比真小节线晚半个小节（8.0 / 16.0 ≠ 真小节线 7.5 / 15.5）。
+ * 切换点一律用 `beat.barAt(i)`（返回**场景相对秒**，内部按「音乐时间 / bar 取整 + i × bar」换算），
+ * 换歌、换 offset 都不用改这里。
+ */
 
 /** 顶部三步进度条：让观众知道"还有几步"。 */
 const Steps: React.FC<{ type: ReturnType<typeof useType>; active: number; small: boolean }> = ({ type, active, small }) => (
@@ -276,11 +281,14 @@ export const Demo: React.FC = () => {
   const { width, height } = useVideoConfig();
   const beat = useSceneBeat("demo");
 
-  // ---- 三小节：入口全部落在小节线（bar）上，每节 2 小节 ≈ 4 秒 ----------
-  // 场景 4.5 秒开始，所以绝对时间分别是 12.5 / 20.5 秒（小节线 12.5 = 4.5 + 4×2.0）。
+  // ---- 三小节：入口全部落在**音乐小节线（bar）**上，每节 2 小节 ≈ 4 秒 ----------
+  // barAt(i) 返回的是**场景相对秒**（不是绝对秒）：场景 4.5 秒开始、bar = 2.0，
+  // 第 4 条小节线在音乐时间 12.0 秒（全片绝对 12.0，因为 offset = 0），减掉场景起点 4.5 → 7.5 秒；
+  // 第 8 条同理 = 20.0 绝对 / 15.5 相对。旧写法 i × bar 算成场景内第 4 小节 = 8.0 秒（绝对 12.5），
+  // 比真小节线晚半拍，画面切在拍子缝里。
   const s1 = 0;
-  const s2 = barSec(4);
-  const s3 = barSec(8);
+  const s2 = beat.barAt(4);
+  const s3 = beat.barAt(8);
   const sections = [s1, s2, s3];
 
   // ❗下面 vis() 的第二个参数是**场景相对秒**，所以这里必须取「本场景的绝对终点 − 场景起点」：
@@ -306,10 +314,28 @@ export const Demo: React.FC = () => {
     width - safe.left - safe.right,
     Math.round(width * (isVertical(width, height) ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal)),
   );
-  // 0.46 不是随便定的：标题 + 手机 + 小结要整块待在**字幕带之上**（字幕占底部约 0.18~0.25 屏高，
-  // 见 Caption.tsx 的 captions.bottom），机身高了就一定会被字幕压住。见下面 Stage 的 paddingBottom。
-  const phoneWRatio = 0.46;
-  const phoneW = stageW * phoneWRatio;
+  // 0.46 只是**宽度基准**：标题 + 手机 + 小结要整块待在**字幕带之上**（见 Caption.tsx 的 captions.bottom），
+  // 机身高了就一定会被字幕压住。只按宽度算会在横版 16:9 上翻车：1920 宽时 0.46 × 1305.6 ≈ 600.8px，
+  // 机身高 600.8 ÷ (9/19.5) ≈ 1301.7px，而 Stage 的内容高只有 1080 − 上 6% − 下 8% ≈ 929px ——
+  // 机身被上下各裁掉 300 多 px（pr-b5 横版 13.1s 帧）。所以必须再按**可用高**夹一次：
+  // 手机高度不能超过「内容盒高 − 标题 − 小结 − 三步条 − 字幕带」。
+  // 字幕带高度按 Caption.tsx 的尺寸公式算（底边 captions.bottom + maxLines 行 + 行距），不再写死 0.3 屏高。
+  const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
+  const capLine = type.caption.size * (type.caption.lineHeight + 0.44); // 行高 + 上下 padding（0.22 × 2）
+  const capBand = TIMING.captions.enabled
+    ? captionBottom + TIMING.captions.maxLines * capLine + (TIMING.captions.maxLines - 1) * type.caption.size * 0.18
+    : 0;
+  // 字幕带顶边已经在安全区内时不再额外让位；+1.2% 屏高是字幕与内容之间的呼吸位。
+  const bottomExtra = Math.max(0, Math.round(capBand - safe.bottom + height * 0.012));
+  const stageGap = height * 0.024; // 与下面 <Stage style={{ gap }}> 一致
+  const titleH = type.title.size * 1.3; // 与标题的 minHeight 一致
+  const bodyH = type.body.size * 1.6; // 与小结的 minHeight 一致
+  const stepsH = type.tiny.size * 1.4;
+  const availH = height - safe.top - safe.bottom - bottomExtra - titleH - bodyH - stepsH - stageGap * 3;
+  const phoneW = Math.min(stageW * 0.46, (availH * 9) / 19.5);
+  // PhoneFrame 把 widthRatio 取整到 1%，这里按取整后的真实宽度换算 mock 的缩放比（否则内屏会差几个像素）
+  const phoneWRatio = phoneW / stageW;
+  const phoneWActual = stageW * (Math.round(phoneWRatio * 100) / 100);
 
   // 假界面按"设计尺寸"排版，再整体缩放到手机壳的真实内屏（scale 见下面的 mockScale）：
   // 三块 mock 里的字号是定值（type.tiny.size = 22px），padding/gap 才是按 h 缩放的 ——
@@ -318,7 +344,7 @@ export const Demo: React.FC = () => {
   const MOCK_DESIGN_W = 536;
   const MOCK_DESIGN_H = 1161;
   // PhoneFrame 机身有 2.2% 的内边距 → 内屏宽 = 机身宽 × (1 − 2 × 2.2%)
-  const mockScale = (phoneW * 0.956) / MOCK_DESIGN_W;
+  const mockScale = (phoneWActual * 0.956) / MOCK_DESIGN_W;
 
   return (
     <SceneFrame name="demo">
@@ -331,10 +357,10 @@ export const Demo: React.FC = () => {
         }}
       />
 
-      {/* paddingBottom 特意加大：给底部字幕带让位。字幕底边 = 0.18 屏高、两行约 0.07 屏高，
-          字幕带顶到约 0.25 屏高，而 Stage 默认只留 0.18 —— 直接用默认值，字幕会盖住手机下半部和
-          最下面那行小结（13.8s / 22.5s 抽帧都拍到了）。这里把内容整块上移，字幕带就空出来了。 */}
-      <Stage align="center" style={{ gap: height * 0.024, paddingBottom: height * 0.3 }}>
+      {/* bottomExtra 给底部字幕带让位（数值按上面 capBand 算）。❗不要再写成 style={{ paddingBottom }}：
+          Stage 的 style 是在安全区 padding 之后展开的，那样等于把安全区**替换**掉而不是叠加，
+          横版 16:9 下内容区高度会算错（pr-b5 横版帧里机身被裁 300px 就是这么来的）。 */}
+      <Stage align="center" bottomExtra={bottomExtra} style={{ gap: stageGap }}>
         {/* 标题：随小节换，让"新信息"每 2 秒内必到（AGENTS.md 密度要求） */}
         <div style={{ display: "flex", alignItems: "center", gap: type.tiny.size * 0.8 }}>
           <Steps type={type} active={active} small={false} />

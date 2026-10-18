@@ -12,15 +12,25 @@
    一致（±0.2 秒）、编码与像素格式、必须存在音轨；
 2. **渲染日志**：``out/render.log`` 里出现 ``cannot be decoded`` / ``Error:`` /
    ``failed to load`` / ``Timeout`` / ``ERROR`` 一律按失败处理（AGENTS.md 阶段 9）。
-   日志文件**不存在**时不是「跳过」而是 ``WARN``（``--strict`` 时升为 ``ERROR``）：
-   没有日志这条闸门等于不存在，交付前必须能挡住。模板的三条 render script 会把
-   stdout+stderr 重定向到 ``out/render.log``，正常流程下这个文件本来就有；
+   日志文件**不存在**时默认就是 ``ERROR`` —— 没有日志这条闸门等于不存在，交付前必须
+   能挡住；确实不需要检查时显式传 ``--no-log``（打在命令里不留歧义）。模板的三条 render
+   script 会把 stdout+stderr 重定向到 ``out/render.log``，正常流程下这个文件本来就有；
+   零错误汇总行两种语序都认（``0 errors`` 与 ``Errors: 0``），但同一行出现强失败信号时
+   强信号优先（顺序：强信号 > AGENTS 三词 > 零值 > 计数 > error 词）；
 3. **响度**：``ebur128=peak=true`` 测 Integrated loudness 与 True peak，
    不在 ``[--lufs-min, --lufs-max]`` 区间 → ERROR；真峰值 > -0.5 dBTP → WARN；
-4. **空档**：``silencedetect=noise=-45dB:d=<--silence>``，忽略片头 0.3 秒与片尾 0.6 秒
-   （AGENTS.md 阶段 8 规定这两处本来就是淡入淡出），中间任何 ≥ 阈值的静音段 → ERROR；
+4. **空档**：``silencedetect=noise=-45dB:d=<--silence>``，片头 0.3 秒与片尾 0.6 秒是
+   淡入淡出区；只有**整段**落在豁免区里的静音才跳过，跨进正片区间的按原始长度判（两个
+   豁免不叠加），任何 ≥ 阈值的静音段 → ERROR。没有音轨时响度/空档两条明确 WARN 跳过，
+   不会误归因成「ffmpeg 缺滤镜」；
 5. **抽帧审图**：每个场景取 40% 与 80% 两个时刻抽帧，拼成 4 列带标签联系表
-   ``out/check-<slug>.jpg``，提示人工逐张审图（AGENTS.md 阶段 9 的人工闸门）。
+   ``out/check-<slug>.jpg``，提示人工逐张审图（AGENTS.md 阶段 9 的人工闸门）。部分抽帧
+   失败会按「实际抽出的帧数 / 期望帧数」判 ERROR，联系表标题与 OK 行都带帧数。
+
+自测
+----
+``python scripts/check_video.py --selftest``：不依赖 ffmpeg / 素材 / 网络，纯函数级
+自测日志判定、解析函数与抽帧期望，失败打印 ``ERROR:`` 并以非零码退出（CI 里跑）。
 
 典型调用
 --------
@@ -142,9 +152,15 @@ _RX_LOG_ERROR = re.compile(r"errors?\s*:", re.IGNORECASE)
 #: 「后面不许跟字母」的前瞻（`errored` / `erroring` 不算 error 词），实现见文件下方。
 #: 带数量的汇总行：`2 errors:` / `1 error`
 _RX_LOG_ERROR_COUNT = re.compile(r"(?<!\d)(\d+)\s+errors?\b", re.IGNORECASE)
-#: 「零错误」汇总行：`Finished: 0 errors, 0 warnings` / `no errors` / `without errors`
-#: （`error` 单数也认：`0 error` / `no error` 同样是自称没出错）
-_RX_LOG_ZERO = re.compile(r"(?:\b0\b|\bno\b|\bwithout\b|\bnone\b)\s+errors?\b", re.IGNORECASE)
+#: 「零错误」汇总行，**两种语序都认**（旧实现只认数字在前，于是 `Errors: 0` 这种
+#: 最常见写法反而被 `_RX_LOG_ERROR` 当成报错，见 BUGS-REPORT P2-8）：
+#:   数字在前：`Finished: 0 errors, 0 warnings` / `no errors` / `without errors` / `0 fatal errors`
+#:   标签在前：`Errors: 0` / `errors: 0`（Playwright / Chromium 工具链、很多 CLI 都是这种格式）
+_RX_LOG_ZERO = re.compile(
+    r"(?:\b(?:0|no|without|none)\b(?:\s+\w+){0,2}?\s+errors?\b"
+    r"|errors?\s*[:=]\s*(?:0|none|no)\b)",
+    re.IGNORECASE,
+)
 
 #: 强失败信号：这些字样一旦出现，**任何**「自称零错误」的豁免都不成立。
 #:
@@ -380,6 +396,19 @@ def _filter_unavailable(text: str) -> bool:
     return "No such filter" in text or "Filter not found" in text
 
 
+def _no_audio_stream(text: str) -> bool:
+    """ffmpeg 报「输入里没有音频流」。
+
+    和「本机 ffmpeg 缺滤镜」是两回事：没有音轨时 ebur128 / silencedetect 会直接
+    打 `Output file does not contain any stream` 之类的话并以 -22 退出，旧实现把它
+    归因成「ffmpeg 可能既没有 ebur128 也没有 loudnorm」，让人去装 ffmpeg（换多少
+    版本都没用）。真正的修法是先判音轨：check_spec 已经报过「没有音轨」，这里只
+    跳过并 WARN，不再重复刷两条误导性的滤镜 ERROR（BUGS-REPORT P2-11）。
+    """
+    lowered = text.lower()
+    return "does not contain any stream" in lowered or "does not contain any audio stream" in lowered
+
+
 def _analyze_audio(path: Path, audio_filter: str):
     """跑一次只做音频分析的 ffmpeg（-f null -），返回 (returncode, stderr+stdout 文本)。
 
@@ -600,14 +629,14 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
 # 2. 渲染日志
 # ===========================================================================
 
-def check_render_log(report: Report, log_path: Path) -> None:
+def check_render_log(report: Report, log_path: Path, required: bool = True) -> None:
     item = "渲染日志"
     if not log_path.is_file():
         # 以前这里只打一行 log 就 return：等于「渲染日志无报错」这条闸门默认不存在，
         # 交付时最容易被忽略的一类事故（素材没读到、组件抛错但渲染仍然"成功结束"）
-        # 就这么漏过去了。现在至少 WARN，--strict 直接 ERROR。
-        report.warn(
-            item,
+        # 就这么漏过去了。现在默认直接 ERROR —— 阶段 9 的日志扫描必须真的跑过；
+        # 确实不需要日志时用 --no-log 显式声明，命令里留痕，避免「闸门没生效」被误当通过。
+        message = (
             f"找不到 {_rel(log_path)}，没法确认渲染过程有没有报错。"
             "AGENTS.md 阶段 9 规定「渲染日志里出现 cannot be decoded / Error: / failed to load "
             "一律按失败处理」，没有日志这条闸门等于不存在。"
@@ -618,13 +647,17 @@ def check_render_log(report: Report, log_path: Path) -> None:
             "`remotion render ... > out\\render.log 2>&1`，macOS / Linux 用 "
             "`remotion render ... 2>&1 | tee out/render.log`"
             "（PowerShell 的 `>` 默认写 UTF-16，别用它，否则日志读出来是乱码）。"
-            "日志确实在别处就传 --log <路径>；要让缺日志直接算失败，加 --strict",
+            "日志确实在别处就传 --log <路径>；确实不需要检查日志就显式加 --no-log"
         )
+        if required:
+            report.fail(item, message)
+        else:
+            report.ok(item, "按 --no-log 跳过渲染日志检查（交付前请自行确认渲染过程没有报错）")
         return
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        report.warn(item, f"读不了 {_rel(log_path)}：{exc}，跳过渲染日志扫描")
+        report.fail(item, f"读不了 {_rel(log_path)}：{exc}（日志闸门无法验证；修好权限或传 --no-log）")
         return
 
     hits = []
@@ -723,11 +756,21 @@ def _parse_ebur128(text: str):
     return integrated, true_peak
 
 
-def check_loudness(report: Report, path: Path, lufs_min: float, lufs_max: float):
+def check_loudness(report: Report, path: Path, lufs_min: float, lufs_max: float,
+                   has_audio: bool = True):
     item = "响度"
+    if not has_audio:
+        # 没有音轨时 check_spec 已经报过 ERROR；这里再刷「量不出响度 / 可能缺滤镜」
+        # 只会误导人去装 ffmpeg。跳过并保留一条 WARN，说明这条闸门没生效（BUGS-REPORT P2-11）。
+        report.warn(item, "没有音轨，响度检查跳过（先跑 `python scripts/mix.py` 混出音轨再渲染）")
+        return None, None
     returncode, text = _analyze_audio(path, LOUDNESS_FILTER)
     integrated, true_peak = _parse_ebur128(text)
     if integrated is None:
+        if _no_audio_stream(text):
+            # 探针说有声轨但分析仍然读不到音频流：按「跳过音频类闸门」处理，别归因到滤镜缺失。
+            report.warn(item, "ffmpeg 读不到音频流，响度检查跳过（先确认成片里真的有音轨）")
+            return None, None
         # 量不出来 = 这条硬闸门没生效。旧写法在这里只给 WARN，于是「-16~-12 LUFS」在
         # 任何量不出响度的机器上都是一条不存在的闸门（0 ERROR 放行一支响度超标的片子）；
         # 按 AGENTS.md「发现问题就非零退出，不要静默通过」，这里必须算 ERROR。
@@ -786,11 +829,18 @@ def _parse_silence(text: str, total_duration: float):
     return segments
 
 
-def check_silence(report: Report, path: Path, threshold_s: float, total_duration: float) -> None:
+def check_silence(report: Report, path: Path, threshold_s: float, total_duration: float,
+                  has_audio: bool = True) -> None:
     item = "空档"
+    if not has_audio:
+        report.warn(item, "没有音轨，空档检查跳过（先跑 `python scripts/mix.py` 混出音轨再渲染）")
+        return
     filter_text = f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={threshold_s:g}"
     returncode, text = _analyze_audio(path, filter_text)
     if returncode != 0:
+        if _no_audio_stream(text):
+            report.warn(item, "ffmpeg 读不到音频流，空档检查跳过（先确认成片里真的有音轨）")
+            return
         # 旧写法不检查退出码：ffmpeg 一条 silence_start 都没打出来时，下面 `not segments`
         # 会打出「全片没有 ≥1 秒的静音段」—— 那是假通过（实测本机 ffmpeg 因缺
         # wrapped_avframe 编码器根本没跑滤镜）。跑不起来就必须报 ERROR。
@@ -813,19 +863,22 @@ def check_silence(report: Report, path: Path, threshold_s: float, total_duration
         )
         return
 
+    # 判定用**原始静音长度**，不是裁剪到正片区间之后的长度（BUGS-REPORT P2-12）。
+    # 旧实现两个豁免会叠加：先按 [0.3, 片尾-0.6] 裁剪，再和 1.0s 阈值比 ——
+    # 等价于片尾最多可以留 1.6s 全静音还报 OK（实测 6s 样片、音频 4.5s 有声 + 1.5s
+    # 全静音被判「都落在淡入淡出区」）。淡入淡出最多各免 FADE_IN_S / FADE_OUT_S，
+    # 而且只对「整段都在豁免区里」的静音生效；跨进正片区间的静音按全长报。
     body_start = FADE_IN_S
     body_end = total_duration - FADE_OUT_S if total_duration > 0 else float("inf")
     offenders = []
-    for start, end, _raw in segments:
-        clipped_start = max(start, body_start)
-        clipped_end = min(end, body_end)
-        clipped = clipped_end - clipped_start
-        if clipped >= threshold_s:
-            offenders.append((clipped_start, clipped_end, clipped))
+    for start, end, raw in segments:
+        if end <= body_start + 1e-9 or start >= body_end - 1e-9:
+            continue  # 整段都在片头/片尾豁免区里
+        offenders.append((start, end, max(raw, end - start)))
     if not offenders:
         report.ok(
             item,
-            f"检测到 {len(segments)} 段静音，但都落在片头/片尾的淡入淡出区，不算空档",
+            f"检测到 {len(segments)} 段静音，但都整段落在片头/片尾的淡入淡出区，不算空档",
         )
         return
 
@@ -833,7 +886,7 @@ def check_silence(report: Report, path: Path, threshold_s: float, total_duration
         report.fail(
             item,
             f"{start:.2f}s ~ {end:.2f}s 有 {length:.2f} 秒空档（≥{threshold_s:g} 秒，"
-            f"判定阈值 {SILENCE_NOISE_DB}dB）",
+            f"判定阈值 {SILENCE_NOISE_DB}dB；按原始静音长度判，淡入淡出豁免不叠加）",
         )
     report.fail(
         item,
@@ -852,7 +905,7 @@ def _pick_label_font(size: int):
     fonts_path = PROJECT_ROOT / "fonts.json"
     candidates = []
     try:
-        cfg = json.loads(fonts_path.read_text(encoding="utf-8"))
+        cfg = json.loads(fonts_path.read_text(encoding="utf-8-sig"))
         candidates = list((cfg.get("check", {}) or {}).get("systemCandidates", []) or [])
     except Exception:
         candidates = []
@@ -887,11 +940,17 @@ def _slugify(text: str) -> str:
     return cleaned or "scene"
 
 
-def extract_frames(report: Report, path: Path, timing: dict):
-    """每个场景取 40% 与 80% 时刻抽帧，返回 [(scene_name, second, frame_path, label)]。"""
+def extract_frames(report: Report, path: Path, timing: dict, duration: float = 0.0):
+    """每个场景取 40% 与 80% 时刻抽帧，返回 [(scene_name, second, frame_path, label)]。
+
+    ``duration`` 用来算「本该抽出几帧」：取帧时刻落在成片之后的场景（timing 比
+    成片长、或成片被截断）不该算进期望数，否则会为了一个不可能存在的时间点
+    永久报「缺帧」。返回值之外，期望帧数会挂在函数属性上供联系表复用。
+    """
     scenes = [s for s in (timing.get("scenes") or []) if isinstance(s, dict)]
     if not scenes:
         report.warn("抽帧审图", "timing.json 没有 scenes，跳过抽帧")
+        extract_frames.expected = 0  # type: ignore[attr-defined]
         return []
 
     frames_dir = PROJECT_ROOT / FRAME_DIRNAME
@@ -901,6 +960,7 @@ def extract_frames(report: Report, path: Path, timing: dict):
 
     slug = str(timing.get("slug", "promo") or "promo")
     frames = []
+    expected = 0
     for scene in scenes:
         name = str(scene.get("name", "?"))
         try:
@@ -912,6 +972,11 @@ def extract_frames(report: Report, path: Path, timing: dict):
             second = start + (end - start) * pct
             if second <= start:
                 second = start + 0.05
+            if duration > 0 and second >= duration - 0.02:
+                # 比成片还晚的时刻抽不出帧，是 timing 与成片不一致的另一种表现（时长检查会报），
+                # 这里不计入期望帧数，避免永远凑不齐。
+                continue
+            expected += 1
             output = frames_dir / f"{slug}-{_slugify(name)}-{index}-{second:08.2f}.jpg"
             proc = _run_binary(
                 [
@@ -931,14 +996,24 @@ def extract_frames(report: Report, path: Path, timing: dict):
                 continue
             frames.append((name, second, output, f"{name}  {second:.2f}s（{int(pct * 100)}%）"))
 
+    extract_frames.expected = expected  # type: ignore[attr-defined]
     if not frames:
         report.fail("抽帧审图", "一帧都没抽出来，无法人工审图；请检查 mp4 是否可解码")
         return []
-    report.ok("抽帧审图", f"抽出 {len(frames)} 帧 → {_rel(frames_dir)}/")
+    # 部分失败不能只 WARN 后报「抽出 N 帧」就完事：人工审图会缺画面，闸门看起来却全过
+    # （BUGS-REPORT P2-13）。期望帧数按「成片里真的存在的取帧时刻」算。
+    if expected and len(frames) < expected:
+        report.fail(
+            "抽帧审图",
+            f"只抽出 {len(frames)}/{expected} 帧（{_rel(frames_dir)}/）。少掉的帧没法人工审图，"
+            "画面缺一块也看不出来；先确认 mp4 能完整解码、磁盘没满，再重跑 check_video.py",
+        )
+    else:
+        report.ok("抽帧审图", f"抽出 {len(frames)}/{expected or len(frames)} 帧 → {_rel(frames_dir)}/")
     return frames
 
 
-def build_contact_sheet(report: Report, timing: dict, frames) -> None:
+def build_contact_sheet(report: Report, timing: dict, frames, expected: int = 0) -> None:
     item = "联系表"
     if not frames:
         return
@@ -991,7 +1066,8 @@ def build_contact_sheet(report: Report, timing: dict, frames) -> None:
     sheet = Image.new("RGB", (width, height), SHEET_BG)
     draw = ImageDraw.Draw(sheet)
     slug = str(timing.get("slug", "promo") or "promo")
-    title = f"{slug} · 审图联系表 · {len(thumbs)} 帧 · 每场景 40% / 80%"
+    count_note = f"{len(thumbs)}/{expected} 帧" if expected else f"{len(thumbs)} 帧"
+    title = f"{slug} · 审图联系表 · {count_note} · 每场景 40% / 80%"
     draw.text((SHEET_PAD + 4, 18), title, fill=SHEET_FG, font=font)
 
     for index, (thumb, label) in enumerate(thumbs):
@@ -1009,11 +1085,114 @@ def build_contact_sheet(report: Report, timing: dict, frames) -> None:
     except OSError as exc:
         report.fail(item, f"联系表写不进 {_rel(out_path)}：{exc}")
         return
-    report.ok(item, f"{_rel(out_path)}（{sheet.width}×{sheet.height}，{human(out_path.stat().st_size)}）")
+    report.ok(
+        item,
+        f"{_rel(out_path)}（{sheet.width}×{sheet.height}，{human(out_path.stat().st_size)}，"
+        f"{len(thumbs)}/{expected or len(thumbs)} 帧）",
+    )
     log("")
     log(f"请打开这张图逐张审图：{out_path}")
     log("对照 references/校验清单.md 打勾：构图、字幕安全区（上 10% / 下 18% / 左 6% / 右 14%）、"
         "截图清晰度、品牌名与网址拼写。")
+
+
+# ===========================================================================
+# 自测（--selftest / scripts/selftest.py）
+# ===========================================================================
+#
+# 纯函数级自测：不碰 ffmpeg、不读素材、不依赖网络，任何机器/CI 都能跑。
+# 覆盖的都是「无视频也判得出来」的逻辑，也是历史上真的写错过的分支。
+
+def _selftest() -> int:
+    """跑纯函数自测；全部通过返回 0，任一失败打印 ERROR 并返回 1。"""
+    failures = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+
+    # --- 渲染日志判定（BUGS-REPORT P2-8：零错误语序 + 强信号优先） ---
+    log_false = (
+        "Finished: 0 errors, 0 warnings",
+        "Errors: 0",
+        "errors: 0",
+        "0 fatal errors",
+        "no errors",
+        "[ERROR:gpu_init.cc(481)] Passthrough is not supported, GL is disabled",
+    )
+    log_true = (
+        "Unhandled exception; 0 errors",
+        "0 errors, but 1 file failed to load",
+        "cannot be decoded",
+        "Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'",
+        "Command failed with exit code 1",
+        "[chrome-headless-shell.exe] exited with code 137",
+        "2 errors: ffmpeg exited",
+    )
+    for line in log_false:
+        check(f"日志应无报错：{line[:40]!r}", _log_error_hit(line), False)
+    for line in log_true:
+        check(f"日志应有报错：{line[:40]!r}", _log_error_hit(line), True)
+
+    # --- ffprobe 帧率分数 ---
+    check("_parse_fraction('60/1')", _parse_fraction("60/1"), 60.0)
+    check("_parse_fraction('24')", _parse_fraction("24"), 24.0)
+    check("_parse_fraction('')", _parse_fraction(""), 0.0)
+    check("_parse_fraction('x/y')", _parse_fraction("x/y"), 0.0)
+    check("_parse_fraction('30000/1001')",
+          round(_parse_fraction("30000/1001"), 3), round(30000 / 1001, 3))
+
+    # --- ebur128 Summary 取最后一块（开头逐帧读数不能采信） ---
+    ebur_sample = (
+        "t: 0.1  I: -70.0 LUFS\n"
+        "Summary:\n"
+        "  Integrated loudness:\n"
+        "    I:           -15.6 LUFS\n"
+        "  True peak:\n"
+        "    Peak:         -1.1 dBFS\n"
+    )
+    integrated, peak = _parse_ebur128(ebur_sample)
+    check("_parse_ebur128 integrated", integrated, -15.6)
+    check("_parse_ebur128 peak", peak, -1.1)
+
+    # --- loudnorm JSON 兜底 ---
+    loudnorm_sample = (
+        '[Parsed_loudnorm_0 @ 0000] {\n'
+        '  "input_i" : "-17.60",\n'
+        '  "input_tp" : "-2.10"\n'
+        '}'
+    )
+    check("_parse_loudnorm_json", _parse_loudnorm_json(loudnorm_sample), (-17.6, -2.1))
+    check("_parse_loudnorm_json 无 JSON", _parse_loudnorm_json("nothing here"), (None, None))
+
+    # --- silencedetect 解析（含未闭合段按片尾补齐） ---
+    silence_sample = (
+        "[silencedetect @ 0000] silence_start: 3.25\n"
+        "[silencedetect @ 0000] silence_end: 4.75 | silence_duration: 1.5\n"
+        "[silencedetect @ 0000] silence_start: 9.5\n"
+    )
+    segments = _parse_silence(silence_sample, 10.0)
+    check("_parse_silence 段数", len(segments), 2)
+    check("_parse_silence 第一段", segments[0], (3.25, 4.75, 1.5))
+    check("_parse_silence 未闭合段", segments[1], (9.5, 10.0, 0.5))
+
+    # --- 帧号/期望帧数：抽帧只数成片里真的存在的时刻 ---
+    timing = {"scenes": [{"name": "A", "start": 0.0, "end": 5.0},
+                         {"name": "B", "start": 5.0, "end": 45.0}]}
+    expected_times = []
+    for scene in timing["scenes"]:
+        for pct in FRAME_PCTS:
+            second = scene["start"] + (scene["end"] - scene["start"]) * pct
+            expected_times.append(second)
+    check("抽帧时刻数", len(expected_times), 4)
+
+    if failures:
+        for message in failures:
+            sys.stderr.write(f"ERROR: selftest — {message}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
+        return 1
+    print("OK: selftest — 渲染日志判定 / 帧率分数 / ebur128 / loudnorm / silencedetect / 抽帧时刻 全部通过")
+    return 0
 
 
 # ===========================================================================
@@ -1022,25 +1201,34 @@ def build_contact_sheet(report: Report, timing: dict, frames) -> None:
 
 def main(argv=None) -> int:
     _force_utf8()
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    if "--selftest" in raw_argv:
+        return _selftest()
     parser = argparse.ArgumentParser(
         prog="check_video.py",
         description="promo-forge 成片闸门（AGENTS.md 阶段 9）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "输出格式：OK/WARN/ERROR: <检查项> — <说明>；最后一行统计。\n"
-            "退出码：0 通过（0 ERROR）；1 有 ERROR（--strict 时 WARN 也算 ERROR）。"
+            "退出码：0 通过（0 ERROR）；1 有 ERROR（--strict 时 WARN 也算 ERROR）。\n"
+            "纯函数自测（不需要成片/ffmpeg）：python scripts/check_video.py --selftest"
         ),
     )
-    parser.add_argument("video", help="要检查的 mp4，例如 out/final-1080p.mp4")
+    parser.add_argument("video", nargs="?", help="要检查的 mp4，例如 out/final-1080p.mp4")
+    parser.add_argument("--selftest", action="store_true",
+                        help="只跑纯函数自测（不检查成片、不需要 ffmpeg）")
     parser.add_argument("--expect", default=None,
                         help="期望分辨率 WxH，例如 1080x1920；默认取 timing.json 的 width×height。"
                              "渲染 4K 版时传 2160x3840，或让它按整数倍自动通过")
     parser.add_argument("--log", default=DEFAULT_LOG_PATH,
-                        help=f"渲染日志路径（默认 {DEFAULT_LOG_PATH}；文件不存在会 WARN，"
-                             "--strict 下算 ERROR）")
+                        help=f"渲染日志路径（默认 {DEFAULT_LOG_PATH}；文件不存在默认算 ERROR，"
+                             "确实不需要检查时用 --no-log）")
+    parser.add_argument("--no-log", action="store_true",
+                        help="显式跳过渲染日志检查（日志重定向到别处/手工审计时用；"
+                             "默认缺日志是 ERROR，因为那意味着阶段 9 的日志闸门没跑过）")
     parser.add_argument("--strict", action="store_true",
                         help="把所有 WARN 也当 ERROR（交付前的严格模式，语义同 check_assets.py）；"
-                             "缺渲染日志、真峰值偏高、拼不了联系表都会变成失败")
+                             "真峰值偏高、拼不了联系表都会变成失败")
     parser.add_argument("--fps", type=float, default=None,
                         help="期望帧率；默认取 timing.json 的 fps（预览版是 30fps，传 30）")
     parser.add_argument("--lufs-min", type=float, default=DEFAULT_LUFS_MIN,
@@ -1049,7 +1237,9 @@ def main(argv=None) -> int:
                         help=f"响度上限 LUFS（默认 {DEFAULT_LUFS_MAX:g}）")
     parser.add_argument("--silence", type=float, default=DEFAULT_SILENCE_S,
                         help=f"空档判定阈值秒数（默认 {DEFAULT_SILENCE_S:g}）")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if not args.video:
+        parser.error("需要一个成片路径（例如 out/final-1080p.mp4）；只跑自测请用 --selftest")
 
     report = Report(strict=args.strict)
     _ensure_tools()
@@ -1072,13 +1262,15 @@ def main(argv=None) -> int:
     log("")
 
     width, height, fps, duration = check_spec(report, probe, timing, video_path, args.expect, args.fps)
-    check_render_log(report, _resolve_project_path(args.log))
-    integrated, true_peak = check_loudness(report, video_path, args.lufs_min, args.lufs_max)
-    check_silence(report, video_path, args.silence, duration)
+    has_audio = _pick_audio_stream(probe) is not None
+    check_render_log(report, _resolve_project_path(args.log), required=not args.no_log)
+    integrated, true_peak = check_loudness(
+        report, video_path, args.lufs_min, args.lufs_max, has_audio=has_audio)
+    check_silence(report, video_path, args.silence, duration, has_audio=has_audio)
 
     log("")
-    frames = extract_frames(report, video_path, timing)
-    build_contact_sheet(report, timing, frames)
+    frames = extract_frames(report, video_path, timing, duration)
+    build_contact_sheet(report, timing, frames, getattr(extract_frames, "expected", 0))
 
     spec = f"{width}×{height} · {fps:g}fps · {duration:.2f}s"
     if integrated is not None:

@@ -23,7 +23,11 @@ import { Proof } from "./Proof";
 import { Cta } from "./Cta";
 import { PALETTE } from "../lib/theme";
 
-/** 场景组件不接收 props：一切数据都从 timing.json 与 useBeat() 来。 */
+/**
+ * 场景组件不接收 props：一切数据都从 timing.json 与 `useSceneBeat("<场景名>")` 来。
+ * ❗不要用零参的 `useBeat()` 取卡点：它现在必须传场景名，否则拿到的 `at/barAt/snap`
+ * 会是**绝对秒**（旧版行为），和场景里的相对秒 `t` 一比就整场黑屏 —— 详见 lib/beats.ts。
+ */
 export const SCENES: Record<string, React.FC> = {
   hook: Hook, // 0~4.5s   痛点开场
   demo: Demo, // 4.5~26s  三个真实界面

@@ -169,23 +169,6 @@ export type BeatApi = {
 };
 
 /**
- * 场景里取卡点信息的 hook。
- *
- * ❗时间基准只有一套：**场景相对秒**（和 `useSceneTime()` 完全一致）。
- * 早期版本这里返回的是绝对秒，而场景里的 `t` 是相对秒，两者一比较永远不成立
- * （proof 实测 t=5 而 at=26），整场画面全黑只剩字幕 —— 所以现在
- * at/barAt/snap/energy/phase 全部按相对秒给出，绝对秒只留 `abs` 与 `beatAt`。
- *
- * ❗start 直接来自 timing.json 的 scenes[]，**不走 React context**：
- * 打包后 context 会因为出现两份 React 实例而读成 null（实测 probe:null），
- * 从数据算反而更稳，而且 SceneFrame 之外调用也不会静默拿到 0。
- */
-export const useBeat = (): BeatApi => {
-  const local = framesToSec(useCurrentFrame(), useVideoConfig().fps);
-  return makeBeatApi(TIMING, local);
-};
-
-/**
  * 用 timing + **场景相对秒** 造一套 BeatApi。抽出来是为了让 scenes 之外的
  * 地方（比如脚本预览页）也能复用同一套换算。
  */
@@ -219,3 +202,25 @@ export const useSceneBeat = (sceneName: string): BeatApi => {
   const local = framesToSec(useCurrentFrame(), useVideoConfig().fps);
   return makeBeatApi(TIMING, local, sceneName);
 };
+
+/**
+ * 场景里取卡点信息的 hook —— **必须传场景名**：`const beat = useBeat("proof")`。
+ * 它和 `useSceneBeat(name)` 是同一条路径，保留两个名字只是为了兼容旧代码的写法。
+ *
+ * ❗时间基准只有两套，混用必翻车：
+ *   - `useSceneTime(name)`、`beat.now`、`beat.at(i)`、`beat.barAt(i)`、`beat.snap(t)`、
+ *     `beat.energy(t)`、`beat.phase(t)` 全是**本场景相对秒**（Promo 的 `<Sequence>` 已减掉场景起点）；
+ *   - `beat.abs`、`beat.beatAt(name, i)`、以及 `timing.json` 里的 `scenes[].start/end`、
+ *     `voice.lines[].at` 才是**全片绝对秒**。
+ *
+ * ❗早期版本这个 hook 是**零参**的，`makeBeatApi` 没拿到场景名 → start 恒为 0，
+ * 于是 at/barAt/snap 返回的全是绝对秒；而场景里的 `t` 是相对秒，两者一比较永远不成立
+ * （实测 proof 场景 t=5 而 at=26），症状是**整场画面全黑只剩字幕、且不报任何错**。
+ * 为了让这种用法**编译失败**而不是静默画错，签名改成了必须传场景名：零参调用会直接报
+ * 「Expected 1 arguments, but got 0」。
+ *
+ * ❗start 直接来自 timing.json 的 scenes[]，**不走 React context**：
+ * 打包后 context 会因为出现两份 React 实例而读成 null（实测 probe:null），
+ * 从数据算反而更稳，而且 SceneFrame 之外调用也不会静默拿到 0。
+ */
+export const useBeat = (sceneName: string): BeatApi => useSceneBeat(sceneName);

@@ -65,11 +65,15 @@ const DEFAULT_TIMEOUT_MS = 120000;
 const BUNDLE_DIR = "out/.remotion-bundle";    // 打包产物，out/ 已被 .gitignore 忽略
 const SCENE_PCTS = [0.4, 0.8];                // AGENTS.md 阶段 9：每场景 40% 与 80% 各一帧
 const CHROMIUM_GL = "angle";                  // 与 remotion.config.ts 的 setChromiumOpenGlRenderer 一致
-// 允许「默认清空」的输出目录白名单（相对项目根的第一段）。
+// 允许「默认清空」的输出目录白名单（按相对项目根的路径段匹配）。
 // 抽帧产物是纯临时文件，清掉无所谓；但 --out 指到 public/ 或 src/ 下面就是真实素材与源码，
 // 那些目录在 .gitignore 里（public/img/*、public/fonts/*），删了连 git 都恢复不回来。
+// out/ **根目录不在此列**：成片（final-1080p.mp4）、校验图、字幕、封面都在那里，属于交付产物；
+// 只有 out/stills（默认抽帧目录）这种纯临时子目录才允许默认清空，其它子目录要显式 --force。
 // 不在白名单里的目录必须显式加 --force，否则一律拒绝删除。
-const WIPE_SAFE_DIRS = ["out", "outputs", "宣传片", ".review-tmp"];
+const WIPE_SAFE_DIRS = ["out/stills", "outputs", "宣传片", ".review-tmp"];
+// out/ 根目录即使加 --force 也不清空：上面放着成片与校验产物，清掉等于交付失败。
+const NEVER_WIPE_DIRS = ["out"];
 // 无论有没有 --force 都不许清空/写入的目录（真实素材与源码）。
 const PROTECTED_DIRS = ["public", "src", "audio-src", "node_modules", ".git", "references", "template"];
 
@@ -83,10 +87,10 @@ const HELP = `promo-forge 抽帧工具（stills.mjs）
   --scenes          对 timing.json 的每个场景取 40% 与 80% 两个时刻
   --scale <n>       renderStill 的缩放，默认 ${DEFAULT_SCALE}
   --comp <id>       composition id，默认 ${DEFAULT_COMP}
-  --out <dir>       输出目录，默认 ${DEFAULT_OUT}
+  --out <dir>       输出目录，默认 ${DEFAULT_OUT}；out/ 根目录不能当输出目录（成片/校验图在那里）
   --keep            不清空输出目录
   --force           允许清空白名单（${WIPE_SAFE_DIRS.join("、")}）之外的输出目录
-                    （${PROTECTED_DIRS.join("、")} 这些真实素材/源码目录即使加了 --force 也不放行）
+                    （${PROTECTED_DIRS.join("、")} 这些真实素材/源码目录与 out/ 根目录即使加了 --force 也不放行）
   --quality <n>     JPEG 质量 1-100，默认 ${DEFAULT_QUALITY}
   --entry <path>    入口文件，默认 ${DEFAULT_ENTRY}
   --public <dir>    publicDir，默认 ${DEFAULT_PUBLIC}
@@ -160,8 +164,9 @@ function realpath(target) {
 
 /**
  * outDir 能不能被安全清空（抽帧会先删光它）。
- * 规则：真实路径（跟穿 junction/symlink）必须在 projectRoot 之下、且第一段在
- * WIPE_SAFE_DIRS 里；白名单之外只有 --force 能放行，而 --force 也**永远动不了** PROTECTED_DIRS。
+ * 规则：真实路径（跟穿 junction/symlink）必须在 projectRoot 之下、且命中 WIPE_SAFE_DIRS
+ * 里的路径段；白名单之外只有 --force 能放行，而 --force 也**永远动不了**
+ * PROTECTED_DIRS 与 out/ 根目录（成片、校验图所在）。
  */
 function canWipeDir(projectRoot, outDir, force = false) {
   const root = realpath(projectRoot);
@@ -171,7 +176,11 @@ function canWipeDir(projectRoot, outDir, force = false) {
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
   const parts = relative.split(path.sep);
   if (parts.some((part) => PROTECTED_DIRS.includes(part))) return false; // --force 也不放行
-  if (WIPE_SAFE_DIRS.includes(parts[0])) return true;
+  const normalized = parts.join("/");
+  // out/ 根目录放的是成片与校验产物，--force 也不清（`--out out` 多半是 `--out out/stills` 的手误）。
+  if (NEVER_WIPE_DIRS.includes(normalized)) return false;
+  // 白名单按路径段匹配：out/stills 放行，out/stills-backup 这类同前缀目录不会误伤（要 --force）。
+  if (WIPE_SAFE_DIRS.some((dir) => normalized === dir || normalized.startsWith(dir + "/"))) return true;
   return force;
 }
 
@@ -360,12 +369,14 @@ async function main() {
   // ---- 输出目录护栏：必须在**做任何事之前**过 ----
   // 抽帧会先清空输出目录。--out public/img 这种写法会把真实素材删光，而 public/img/*、
   // public/fonts/*、public/audio/* 都在 .gitignore 里，删了 git 也恢复不回来。
+  // out/ 根目录同理：成片 final-1080p.mp4、校验图、字幕、封面都在那里，删了等于交付出事。
   // 所以挡在这里（而不是挡在删除前一步）：哪怕后面还会因为别的原因失败，也不能先删了再失败。
   if (fs.existsSync(outDir) && !options.keep && !canWipeDir(projectRoot, outDir, options.force)) {
     fail(
       `拒绝清空 ${rel(outDir)}：它不在可安全清空的目录里（白名单：${WIPE_SAFE_DIRS.join("、")}）。\n` +
         `    抽帧会先删掉输出目录里的所有内容，而 ${PROTECTED_DIRS.join("、")} 下面是你真正的素材与源码，` +
-        `其中 public/img、public/fonts、public/audio 都被 .gitignore 忽略，删了 git 也救不回来。\n` +
+        `其中 public/img、public/fonts、public/audio 都被 .gitignore 忽略，删了 git 也救不回来；` +
+        `out/ 根目录还放着成片与校验图，所以永远不清（加 --force 也不清）。\n` +
         `    换一个输出目录（例如默认的 ${DEFAULT_OUT}），或加 --keep 保留已有文件；\n` +
         `    确实要清空白名单之外的输出目录就显式加 --force（但上面这些素材/源码目录不会放行）。`,
     );
@@ -405,7 +416,7 @@ async function main() {
   if (!canWipeDir(projectRoot, outDir, options.force)) {
     fail(
       `拒绝写入 ${rel(outDir)}：它不在可安全使用的输出目录里（白名单：${WIPE_SAFE_DIRS.join("、")}；` +
-        `目录还不存在时也按同一规则判，避免把抽帧图写进 public/ 之类的素材目录）。\n` +
+        `目录还不存在时也按同一规则判，避免把抽帧图写进 public/ 之类的素材目录或 out/ 根目录）。\n` +
         `    换一个输出目录（例如默认的 ${DEFAULT_OUT}）。`,
     );
   }

@@ -21,7 +21,7 @@ import type React from "react";
 import { AbsoluteFill, useVideoConfig } from "remotion";
 import { SceneFrame, useSceneTime } from "../components/Scene";
 import { Stage } from "../components/Stage";
-import { PALETTE, alpha, useType } from "../lib/theme";
+import { PALETTE, SAFE, alpha, isVertical, safePadding, useType } from "../lib/theme";
 import { FONT } from "../lib/fonts";
 import { EASE, clamp, impulse, loop, ramp, riseIn, shake, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
@@ -95,10 +95,36 @@ export const Hook: React.FC = () => {
   const punch = impulse(t, tPunch, 0.32);
   const energy = beat.energy(beat.now);
 
+  // ---- 尺寸：只按宽度算会在横版 16:9 上翻车（pr-b5 横版 1.8s 帧：hero 压在字幕上）----
+  // 竖屏内容高够用，横版高度只有 1080、字幕带却吃掉近 0.39 屏高（字号按 1280 基准放大），
+  // 所以横版必须①按高度夹格子尺寸、②把内容拆成两栏、③给底部字幕带让位。竖屏保持原样。
+  const vertical = isVertical(width, height);
+  const horizontal = !vertical;
+  const safe = safePadding(width, height);
+  const stageW = Math.min(
+    width - safe.left - safe.right,
+    Math.round(width * (vertical ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal)),
+  );
+  // 字幕带高度按 Caption.tsx 的尺寸公式算：底边 captions.bottom + maxLines 行 + 行距
+  const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
+  const capLine = type.caption.size * (type.caption.lineHeight + 0.44); // 行高 + 上下 padding（0.22 × 2）
+  const capBand = TIMING.captions.enabled
+    ? captionBottom + TIMING.captions.maxLines * capLine + (TIMING.captions.maxLines - 1) * type.caption.size * 0.18
+    : 0;
+  // 竖屏内容在字幕带之上本来就放得下（原样保留，避免视觉回归）；横版必须让出字幕带
+  const bottomExtra = vertical ? 0 : Math.max(0, Math.round(capBand - safe.bottom + height * 0.012));
+
   // 一整页手写记录：4 列 × 3 行 = 12 组
   const groups = 12;
   const cols = 4;
-  const cell = width * 0.135;
+  // 横版两栏时左栏宽度（放标题 + 账本）、右栏（问句）占剩下的；46/54 是试出来的：
+  // 左栏再宽一点，问句会被挤成 3 行、断在词中间（"每天记 / 账要花十 / 几分钟?"）。
+  const ledgerW = horizontal ? stageW * 0.46 : stageW;
+  const gapX = height * 0.018;
+  const colW = (ledgerW - (cols - 1) * gapX) / cols;
+  // Tally 的 svg 宽 = size × 1.45（size = cell / 2），先按列宽夹一次，再按"高度基准"夹一次：
+  // 横版 min(width, height*1.7) = 1836 → 247.9，竖屏 min(1080, 3264) = 1080 → 145.8（与原值一致）
+  const cell = Math.min(width * 0.135, Math.min(width, height * 1.7) * 0.135, colW * 1.379);
 
   // 计时器：从 0:00 涨到 9:58，把"十几分钟"变成看得见的数字
   const timerP = ramp(t, [tTally, tPunch], [0, 1], EASE.soft);
@@ -127,7 +153,28 @@ export const Hook: React.FC = () => {
         }}
       />
 
-      <Stage align="center" style={{ gap: height * 0.022 }}>
+      <Stage align="center" bottomExtra={bottomExtra} style={{ gap: height * 0.022 }}>
+        {/* 横版（16:9）把四个块拆成两栏：左栏「标题 + 账本」、右栏「问句」。
+            竖屏保持原来的单列竖排 —— 竖屏内容高够用，改了反而会动到已经调好的构图。 */}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: horizontal ? "row" : "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: height * 0.022,
+            width: "100%",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: height * 0.022,
+              width: horizontal ? "46%" : "100%",
+            }}
+          >
         {/* 第一行：这是什么 + 现在几秒 */}
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", width: "100%" }}>
           <div
@@ -216,7 +263,17 @@ export const Hook: React.FC = () => {
             {timerText}
           </div>
         </div>
+          </div>
 
+          <div
+            style={{
+              flex: horizontal ? 1 : undefined,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: height * 0.022,
+            }}
+          >
         {/* 痛点问句：tQuestion = 1.5 秒（第 3 拍）起浮现，+0.38 秒 = 1.88 秒完全落位（≤2.0 秒底线） */}
         <div
           style={{
@@ -249,6 +306,8 @@ export const Hook: React.FC = () => {
           }}
         >
           拍一张小票就能记完的事，为什么要手写一整页
+        </div>
+          </div>
         </div>
       </Stage>
     </SceneFrame>

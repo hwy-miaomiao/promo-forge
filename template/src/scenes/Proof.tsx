@@ -54,20 +54,26 @@ const ITEMS: ProofItem[] = [
 const BEAT_INDEX = [0, 2, 4, 6.5, 8.5, 10.5];
 
 /**
- * 卡片在网格里占几行 —— 从 `span` 的第 1 个数读出来（`span` 写的是 `grid-area` 的
- * `grid-row-start / grid-column-start` 语法，所以第一个 `span N` 才是行数）。
- * 行数必须**算**出来：写死 2 行时，6 张卡实际需要 6 行，多出来的行变成隐式行、
- * 按最小内容高度分配，于是第一张卡（占两行的主卡）从 463px 塌到 105px。
+ * 卡片在网格里占几列 —— 读 `span` 的**第 1 个数**。
+ * 约定（本文件、`<div>` 的 gridColumn 与 check_assets 的取图尺寸都以它为准）：
+ *   `span 2 / span 2` = 占满两列的主卡（2×2，一行只能放它一张）；
+ *   `span 1 / span 2` = 半宽卡（占 1 列、2 行高，两张并排占满一行）。
+ * ❗列数读反过一次：把第 1 个数当行、第 2 个数当列，colSpan 恒等于 2 —— 6 张卡全被
+ * 当成满宽卡排成一列细条，半宽卡的画面区只剩十几 px（rowSpan 也变成 [2,1,1,2,1,1]）。
  */
-const rowSpan = (span: string): number => {
+const colSpan = (span: string): number => {
   const m = /^\s*span\s+(\d+)/.exec(span);
-  return m ? Number(m[1]) : 1;
+  return m ? Number(m[1]) : 2;
 };
 
-/** 卡片在网格里占几列 —— 同一串 `span` 的第 2 个数（`span 1 / span 2` 是半宽卡）。 */
-const colSpan = (span: string): number => {
+/**
+ * 卡片在网格里占几行 —— 同一串 `span` 的**第 2 个数**（本数据里恒为 2）。
+ * 行数必须**算**出来（见 Proof 里 rows 的推导）：写死行数时多出来的行会变成隐式行、
+ * 按最小内容高度分配，卡片高度就不再是下面算的 cellH。
+ */
+const rowSpan = (span: string): number => {
   const m = /span\s+(\d+)\s*$/.exec(span);
-  return m ? Number(m[1]) : 2;
+  return m ? Number(m[1]) : 1;
 };
 
 /** 代码画的占位"作品画面"：用 art 里的矩形拼一张抽象的界面缩略图。 */
@@ -138,7 +144,10 @@ const WorkCard: React.FC<{
       {/* ↑↑↑ 替换到此为止，下面的署名栏保留（真实作品也需要标题） */}
 
       <div style={{ marginTop: height * 0.03, display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: width * 0.02 }}>
-        <span style={{ fontFamily: FONT.display, fontSize: type.heading.size, fontWeight: 800, color: bright ? PALETTE.bg : PALETTE.fg, whiteSpace: "nowrap" }}>
+        {/* 标题字号按**卡片高度**夹一次：横版 16:9 下 heading 有 61.44px，而一张 2 行卡只有
+            约 120px 高，不夹就会把署名栏顶出卡片、标题被 overflow: hidden 切掉（16:9 实测）。
+            竖屏卡高约 214px，0.3 倍 = 64px > heading，字号不变。 */}
+        <span style={{ fontFamily: FONT.display, fontSize: Math.min(type.heading.size, height * 0.3), fontWeight: 800, color: bright ? PALETTE.bg : PALETTE.fg, whiteSpace: "nowrap" }}>
           {item.title}
         </span>
         <span style={{ fontFamily: FONT.body, fontSize: type.tiny.size, color: bright ? alpha(PALETTE.bg, 0.75) : PALETTE.dim, whiteSpace: "nowrap" }}>
@@ -163,52 +172,62 @@ export const Proof: React.FC = () => {
     width * (isVertical(width, height) ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal),
   );
   const gap = height * 0.018;
-  // 卡片区固定成"舞台高度的一半"：竖屏 1920 的一半约 960px。行数由卡片 span 决定
-  // （见下面的 rows），所以一个网格行高约 215px、【2×2 主卡】约 463px —— 主卡接近 1:1，
-  // 真实截图替换后最好裁成接近这个比例的缩略图。
+  // 卡片区固定成"舞台高度的一半"（竖屏 1920 的一半约 960px），但**先夹一次可用高**：
+  // 横版 16:9 时 Stage 的内容盒只有 1080 − 上下安全区 ≈ 929px，标题行 + 底部横条还要占掉
+  // 约 150px；画幅更扁 / 安全区更大时 height*0.5 会顶穿内容盒，底部横条被挤出安全区。
+  // headerH / footerH / stageGap 必须和下面 JSX 里标题字号、底部横条字号、Stage 的 gap 一致。
+  const headerH = type.title.size * type.title.lineHeight;
+  const footerH = type.body.size * type.body.lineHeight;
+  const stageGap = height * 0.02;
+  const availH = height - inner.top - inner.bottom - headerH - footerH - stageGap * 2;
   const gridW = contentW;
-  const gridH = height * 0.5;
+  const gridH = Math.min(height * 0.5, availH);
   const cellW = (gridW - gap) / 2;
-  // 网格行数按卡片的 span **算**出来，不写死：自动排版下每个「1×2 卡」占半格，
-  // 两张并排才凑一行；「2×2 卡」独占一整行。写死 2 行会被撑出隐式行，
-  // 卡片的实际高度就不再是下面算的 cellH（:195-197 的注释要求严格一致）。
   // 每张卡的落位与网格总行数**一起**显式算出来（不靠浏览器自动排布）：
   //   占满两列的卡（span 2 / span 2）独占一整行，占 spanRows 行；
-  //   半宽卡（span 1 / span 2）两两并排：第 1 张落 col 1、第 2 张落 col 2，两张占掉一整行。
+  //   半宽卡（span 1 / span 2）两两并排：第 1 张落 col 1、第 2 张落 col 2，
+  //   两张**并排**占满 spanRows 行（不是上下叠，所以一对只消耗 spanRows 行）。
+  // ❗游标要在一对半宽卡都落位后才前进 spanRows 行（只进 1 行时，下一张满宽卡会压在
+  // 这一对半宽卡身上 —— 两者 rowStart 相同，卡片重叠、下半截被切）；
+  // `usedRows` 也必须记 `rowStart + spanRows - 1`（只记 rowStart 会让总行数偏少）。
   // 为什么不敢交给自动排布：sparse 算法不会回头填前面的空格，第 4 张卡（占两行）会被推到
   // 第 4~5 行，后面两张紧跟着掉进隐式行 —— 实测 top=925/960、bottom=1002，越过网格底边
   // 并压到底部进度条上（`grid-auto-flow: dense` 也救不回来，同样量到越界）。
-  // ❗总行数必须由**落位结果**反推，不能写 `占行数之和 / 2`：那个式子假设"两张半宽卡叠起来
-  // 占一行"，而实际是**并排**占一行，半宽卡的实际占行数（ceil(半宽卡数 / 2)）与它自己的
-  // spanRows 之和并不相等。算错就会出现"声明 4 行、实际需要 6 行"→ 后两张卡越出网格盒子。
   let cursorRow = 1;
   let halfCol = 1;
+  /** 已落位、还在等配对的半宽卡占几行（0 = 没有等着配对的半宽卡） */
+  let halfRows = 0;
   let usedRows = 1;
   const placements = ITEMS.map((item) => {
     const spanRows = rowSpan(item.span);
-    const rowStart = cursorRow;
     if (colSpan(item.span) === 1) {
-      // 半宽卡：两两并排。第一张落 col 1，第二张落 col 2 并把游标推到下一行
+      // 半宽卡：两两并排。第一张落 col 1，第二张落 col 2 并把游标推满 spanRows 行
+      const rowStart = cursorRow;
       const colStart = halfCol;
       if (halfCol === 2) {
-        cursorRow += 1;
+        cursorRow += Math.max(halfRows, spanRows);
         halfCol = 1;
+        halfRows = 0;
       } else {
         halfCol = 2;
+        halfRows = spanRows;
       }
-      usedRows = Math.max(usedRows, rowStart);
+      usedRows = Math.max(usedRows, rowStart + spanRows - 1);
       return { rowStart, colStart, spanRows };
     }
-    const colStart = 1;
-    // 独占一行：游标必须先跳到「半宽卡凑不齐的残留列」之后（halfCol === 2 说明游标那一行
-    // 只坐了一张半宽卡），否则满宽卡会和它挤在同一行、后面的卡再被挤出行数边界。
-    cursorRow += spanRows + (halfCol === 2 ? 1 : 0);
-    halfCol = 1;
+    // 占满两列的卡：先让过一张没配对的半宽卡，再独占 spanRows 行
+    if (halfCol === 2) {
+      cursorRow += halfRows;
+      halfCol = 1;
+      halfRows = 0;
+    }
+    const rowStart = cursorRow;
+    cursorRow += spanRows;
     usedRows = Math.max(usedRows, rowStart + spanRows - 1);
-    return { rowStart, colStart, spanRows };
+    return { rowStart, colStart: 1, spanRows };
   });
   // 网格行数 = 落位真正用掉的行数（上面的 usedRows）
-  const rows = usedRows;
+  const rows = Math.max(1, usedRows);
   // 一张 1 行卡的高度（= 一个网格行高）。卡片尺寸按行数缩放，见下面 WorkCard 的 height。
   const cellH = (gridH - gap * (rows - 1)) / rows;
 
@@ -256,15 +275,16 @@ export const Proof: React.FC = () => {
           </div>
         </div>
 
-        {/* 卡片区：列数固定 2，行数**按卡片的 span 算**（rows），每张卡的行列位置也用
-            `placements` 显式落位（见上面的注释）。两个坑叠在一起才会"零素材也看不到卡"：
-              1) 写死 2 行时 6 张卡需要 4 行，多出来的行变成隐式行、按最小内容高度挤进同一个
-                 960px 盒子，第一张卡从 463px 塌到 126px（实测非零行 8 行）；
-              2) 就算行数算对了、交给浏览器自动排布，第 4 张卡（占两行）也会被推到第 4~5 行，
-                 第 5/6 张紧接着掉进隐式行 —— 量到 top=925/960、bottom=1002，越过 960 的网格
-                 底边并压到底部进度条上（`grid-auto-flow: dense` 也救不回来）。
-            卡片尺寸必须和上面算出来的 cellW/每行高严格一致，否则真实截图的
-            "图片宽度 ≥ 显示宽度×2" 这条校验就无从谈起（布局一变，需要的出图尺寸就变了）。 */}
+        {/* 卡片区：列数固定 2，行数按落位结果算（rows = usedRows），每张卡用 placements 显式落位。
+            span 约定是「第一个数字 = 列 span、第二个数字 = 行 span」：
+            "span 2 / span 2" = 2×2 主卡（占两列两行），"span 1 / span 2" = 半宽卡（一列两行），
+            两张半宽卡并排 ⇒ 一个两行高的行块。所以 6 张卡（2 主 + 4 半）总共占 8 个网格行：
+              主卡 row1-2 → 半宽对 row3-4 → 主卡 row5-6 → 半宽对 row7-8。
+            ❗别退回"写死 2 行 + 浏览器自动排布"：那样多出来的行会变成隐式行、按最小内容高度
+            挤进同一个 gridH 盒子（实测第一张卡从 463px 塌到 126px），第 4 张占两行的卡还会被
+            推到网格底边之外压到底部条上（grid-auto-flow: dense 也救不回来）。
+            卡片尺寸必须和上面算出来的 cellW / 每行高严格一致：卡高 = cellH × 行 span + 行间距，
+            否则真实截图的"图片宽度 ≥ 显示宽度×2"这条校验就无从谈起（布局一变，需要的出图尺寸就变了）。 */}
         <div
           style={{
             width: gridW,
@@ -286,14 +306,14 @@ export const Proof: React.FC = () => {
             // 出场瞬间的脉冲：scale 从 1.03 落到 1，模拟"镜头到位"
             const hit = impulse(t, at, 0.26);
             const scale = 1 + hit * 0.028;
-            // height 传「占几行 × 一行高」：卡内的圆角/内边距/署名栏都按这个高度缩放，
-            // 直接传一行高会让 2×2 主卡的圆角和内边距按小卡的比例算（视觉上偏小）。
+            // height 传**卡片真实高度**（占几行 × 一行高 + 行间距）：卡内的圆角/内边距/署名栏
+            // 都按这个高度缩放，只传一行高会让 2 行卡的圆角和内边距按小卡的比例算（视觉上偏小）。
             const place = placements[i];
             return (
               <WorkCard
                 key={item.title}
                 width={cellW}
-                height={cellH * place.spanRows}
+                height={cellH * place.spanRows + gap * (place.spanRows - 1)}
                 p={p}
                 hit={hit}
                 scale={scale}

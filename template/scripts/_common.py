@@ -147,7 +147,9 @@ def error(msg: Any, code: int = 1) -> None:
 def load_json(path: Path) -> Any:
     """读 JSON；失败抛 ValueError（调用方自己决定报错方式）。"""
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig：Windows 记事本等编辑器存 UTF-8 会写 BOM，BOM 留在字符串里会让
+        # json.loads 报「Expecting value: line 1 column 1」，整条闸门链直接 abort。
+        text = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise ValueError(f"读不到 {rel(path)}：{exc}") from exc
     try:
@@ -428,11 +430,14 @@ def ffprobe_json(path: Any) -> Dict[str, Any]:
 
 
 def probe_duration(path: Any) -> Optional[float]:
-    """媒体时长（秒）；探测不到返回 None。"""
-    try:
-        info = ffprobe_json(path)
-    except SystemExit:
-        return None
+    """媒体时长（秒）；ffprobe 读不出时长字段时返回 None。
+
+    这里**不再**吞 ``error()`` 抛出的 ``SystemExit``：缺 ffprobe、文件不存在、
+    ffprobe 输出不是合法 JSON 都是真错误，必须立刻非零退出（AGENTS.md 第 7 节）。
+    过去 ``except SystemExit: return None`` 会把 ERROR 变成「时长未知」，
+    ``music.py cut`` 因此打印了 ERROR 却仍然 exit 0（V12）。
+    """
+    info = ffprobe_json(path)
     fmt = info.get("format") or {}
     try:
         return float(fmt.get("duration"))

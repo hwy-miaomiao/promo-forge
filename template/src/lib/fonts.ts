@@ -103,8 +103,12 @@ const systemFamily = (role: FontRole): string => {
 
 /**
  * public/ 里的文件清单（打包时的快照）→ 相对 public/ 的路径 → 字节数。
- * 拿不到清单时是 null，`fileExists()` 会按"存在"处理 —— 与 Promo.tsx 的 MUSIC_FILE_EXISTS
- * 同一个取舍：宁可让渲染报错，也不要静默换成系统字体（那会安静地产出一支字形不对的片子）。
+ * 拿不到清单（null）或清单为空时，`fileExists()` 都会按"存在"处理 —— 与 Promo.tsx 的
+ * MUSIC_FILE_EXISTS 同一个取舍：宁可让渲染报错，也不要静默换成系统字体（那会安静地产出一支字形不对的片子）。
+ *
+ * ❗空清单 ≠ 文件不存在：网页播放器（<Player>）里 `getStaticFiles()` 返回的是**空数组**而不是抛错
+ * （见 node_modules/remotion/dist/cjs/get-static-files.js：window.remotion_isPlayer 时直接 return []）。
+ * 如果把空数组当成"public/ 里什么都没有"，网页版会静默回退系统字体、丢掉子集字体。
  */
 const staticFiles: Map<string, number> | null = (() => {
   try {
@@ -114,14 +118,15 @@ const staticFiles: Map<string, number> | null = (() => {
       const size = typeof file.sizeInBytes === "number" ? file.sizeInBytes : Number.NaN;
       map.set(name, size);
     });
-    return map;
+    // 空清单 = 不知道 public/ 里有什么（Player 场景），按未知处理
+    return map.size === 0 ? null : map;
   } catch {
     return null;
   }
 })();
 
 const fileExists = (relPath: string): boolean => {
-  if (staticFiles === null) return true; // 拿不到清单：按存在处理（同 MUSIC_FILE_EXISTS）
+  if (staticFiles === null) return true; // 拿不到清单 / 空清单：按存在处理（同 MUSIC_FILE_EXISTS）
   const key = relPath.replace(/\\/g, "/").replace(/^\/?public\//, "");
   const size = staticFiles.get(key);
   if (size === undefined) return false;
@@ -261,7 +266,7 @@ const reportRoute = (): void => {
     );
   });
   if (staticFiles === null) {
-    console.info("[fonts]   （拿不到 public/ 文件清单，按「存在」处理，见 src/lib/fonts.ts 注释）");
+    console.info("[fonts]   （拿不到 public/ 文件清单或清单为空，按「存在」处理，见 src/lib/fonts.ts 注释）");
   }
 };
 
