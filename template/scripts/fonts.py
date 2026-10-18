@@ -396,7 +396,10 @@ def _src_texts(checker: Any) -> Tuple[List[str], int]:
             continue
         scanned += 1
         try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
+            # utf-8-sig：带 BOM 的 fonts.json / props json 走 _json_comment_stripped 时，
+            # BOM 留在字符串里会让 json.loads 失败、回退成整段原文（_note 里的汉字进子集、
+            # check 报假缺字，R5-fonts-01）。剥掉 BOM 就与不带 BOM 的文件行为一致。
+            raw = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError as exc:
             C.warn(f"读不了 {C.rel(path)}：{exc}")
             continue

@@ -103,22 +103,29 @@ const systemFamily = (role: FontRole): string => {
 
 /**
  * public/ 里的文件清单（打包时的快照）→ 相对 public/ 的路径 → 字节数。
- * 拿不到清单（null）或清单为空时，`fileExists()` 都会按"存在"处理 —— 与 Promo.tsx 的
- * MUSIC_FILE_EXISTS 同一个取舍：宁可让渲染报错，也不要静默换成系统字体（那会安静地产出一支字形不对的片子）。
+ * 拿不到清单（null）时，`fileExists()` 都按"存在"处理 —— 与 Promo.tsx 的 MUSIC_FILE_EXISTS
+ * 同一个取舍：宁可让渲染报错，也不要静默换成系统字体（那会安静地产出一支字形不对的片子）。
  *
- * ❗空清单 ≠ 文件不存在：网页播放器（<Player>）里 `getStaticFiles()` 返回的是**空数组**而不是抛错
- * （见 node_modules/remotion/dist/cjs/get-static-files.js：window.remotion_isPlayer 时直接 return []）。
- * 如果把空数组当成"public/ 里什么都没有"，网页版会静默回退系统字体、丢掉子集字体。
+ * ❗R5-TPL-01：remotion 4.0.529 的 getStaticFiles() 在普通浏览器页里返回的是 **undefined**
+ * （document 存在、window.remotion_isPlayer 还没置位、window.remotion_staticFiles 未定义），
+ * 既不是空数组也不抛错。下面的 `.forEach` 会抛 TypeError，被 try/catch 兜住 → null（按未知处理），
+ * 所以网页版这里恰好不崩；但**不要依赖这个"恰好"** —— 任何提前解引用都会变成整页白屏，
+ * Promo.tsx 的 MUSIC_FILE_EXISTS 就是因为直接读 `.length` 崩的。这里显式先判数组类型。
+ * 空数组仍按未知处理：SSR / Player 里拿不到真实清单。
  */
 const staticFiles: Map<string, number> | null = (() => {
   try {
+    const listed: unknown = getStaticFiles();
+    if (!Array.isArray(listed)) {
+      return null; // 拿不到清单（浏览器页里是 undefined）：按未知处理
+    }
     const map = new Map<string, number>();
-    getStaticFiles().forEach((file) => {
-      const name = String(file.name).replace(/\\/g, "/").replace(/^\/?public\//, "");
+    (listed as { name?: unknown; src?: unknown; sizeInBytes?: unknown }[]).forEach((file) => {
+      const name = String(file.name ?? "").replace(/\\/g, "/").replace(/^\/?public\//, "");
       const size = typeof file.sizeInBytes === "number" ? file.sizeInBytes : Number.NaN;
       map.set(name, size);
     });
-    // 空清单 = 不知道 public/ 里有什么（Player 场景），按未知处理
+    // 空清单 = 不知道 public/ 里有什么（SSR / Player 场景），按未知处理
     return map.size === 0 ? null : map;
   } catch {
     return null;

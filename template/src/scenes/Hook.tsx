@@ -21,7 +21,7 @@ import type React from "react";
 import { AbsoluteFill, useVideoConfig } from "remotion";
 import { SceneFrame, useSceneTime } from "../components/Scene";
 import { Stage } from "../components/Stage";
-import { PALETTE, SAFE, alpha, isVertical, safePadding, useType } from "../lib/theme";
+import { PALETTE, SAFE, alpha, captionBandHeight, isVertical, safePadding, useType } from "../lib/theme";
 import { FONT } from "../lib/fonts";
 import { EASE, clamp, impulse, loop, ramp, riseIn, shake, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
@@ -105,11 +105,12 @@ export const Hook: React.FC = () => {
     width - safe.left - safe.right,
     Math.round(width * (vertical ? SAFE.contentWidth.vertical : SAFE.contentWidth.horizontal)),
   );
-  // 字幕带高度按 Caption.tsx 的尺寸公式算：底边 captions.bottom + maxLines 行 + 行距
+  // 字幕带高度按 Caption.tsx 的口径算：底边 captions.bottom + maxLines 行 + 行距。
+  // 字号与硬字幕 ASS 同源（lib/theme 的 captionBandHeight / captionFontSize，R5-TPL-03），
+  // 字幕字号一改这里自动跟着变，不会再出现"字号改了但让位没改"的压字。
   const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
-  const capLine = type.caption.size * (type.caption.lineHeight + 0.44); // 行高 + 上下 padding（0.22 × 2）
   const capBand = TIMING.captions.enabled
-    ? captionBottom + TIMING.captions.maxLines * capLine + (TIMING.captions.maxLines - 1) * type.caption.size * 0.18
+    ? captionBottom + captionBandHeight(width, height, TIMING.captions.maxChars, TIMING.captions.maxLines)
     : 0;
   // 竖屏内容在字幕带之上本来就放得下（原样保留，避免视觉回归）；横版必须让出字幕带
   const bottomExtra = vertical ? 0 : Math.max(0, Math.round(capBand - safe.bottom + height * 0.012));

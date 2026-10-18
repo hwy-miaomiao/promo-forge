@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:  # pragma: no cover - 只在 _common.py 缺失时走到
     from _common import (  # type: ignore
         PROJECT_ROOT,
+        ensure_dir,
         error,
         ffprobe_json,
         fmt_sec,
@@ -270,13 +271,30 @@ def _with_retry(what: str, fn):
     raise RuntimeError(f"{what} 连续 {NET_RETRIES} 次失败：{last_exc}")
 
 
+def _forget_pcm(path: Path) -> None:
+    """原地替换某个音频文件后，清掉它所有版本的 PCM 缓存。"""
+    prefix = str(path)
+    for key in [k for k in _PCM_CACHE if k[0] == prefix]:
+        _PCM_CACHE.pop(key, None)
+
+
 def _pcm_mono16k(path: Path):
-    """解码成 16kHz 单声道 s16 样本（array('h')），失败返回 None。"""
-    key = str(path)
+    """解码成 16kHz 单声道 s16 样本（array('h')），失败返回 None。
+
+    缓存键 = (路径, mtime_ns, 大小)：``_trim_silence`` / ``_apply_tempo`` 会用
+    ``os.replace`` 原地替换同一个路径。只按路径缓存时，替换前解码的波形会一直命中，
+    替换后的 ``_tail_ms`` 拿到的还是旧音频（审计实测：1.3s 文件换成 0.5s 后仍读到
+    20800 个样本，正确值 8000）——cache.json / report.json 的 tail_ms、ECHO 判定
+    因此和最终音频对不上。解码失败（None）不缓存：文件可能稍后才写好。
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size)
     if key in _PCM_CACHE:
         return _PCM_CACHE[key]
     if not has_cmd("ffmpeg"):
-        _PCM_CACHE[key] = None
         return None
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -286,10 +304,8 @@ def _pcm_mono16k(path: Path):
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError:
-        _PCM_CACHE[key] = None
         return None
     if proc.returncode != 0:
-        _PCM_CACHE[key] = None
         return None
     raw = proc.stdout[: len(proc.stdout) // 2 * 2]
     samples = array.array("h")
@@ -430,6 +446,7 @@ def _trim_silence(src: Path, dst: Path) -> float:
     except OSError as exc:
         warn("尾部拖音截断后替换文件失败（%s），保留原音频" % (exc,))
         return 0.0
+    _forget_pcm(dst)
     return tail_ms
 
 
@@ -456,6 +473,7 @@ def _apply_tempo(src: Path, factor: float) -> None:
             pass
         raise RuntimeError(f"ffmpeg atempo={factor:.3f} 失败：{err}")
     tmp.replace(src)
+    _forget_pcm(src)
 
 
 def _status_of(base: str, tail_ms: float) -> str:
@@ -1207,7 +1225,9 @@ def cmd_preview(args) -> int:
     outdir = Path(args.out) if args.out else (PROJECT_ROOT / PREVIEW_DIRNAME)
     if not outdir.is_absolute():
         outdir = PROJECT_ROOT / outdir
-    outdir.mkdir(parents=True, exist_ok=True)
+    # 统一走 _common.ensure_dir：-o 指向一个已存在的文件时，旧实现直接
+    # mkdir(exist_ok=True) 抛 FileExistsError 裸 traceback（审计实测）。
+    outdir = ensure_dir(outdir)
 
     voice_cfg = timing.get("voice", {}) or {}
     rate = str(voice_cfg.get("rate", "+0%") or "+0%")

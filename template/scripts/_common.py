@@ -289,8 +289,22 @@ def human(size_bytes: Any) -> str:
 
 
 def ensure_dir(path: Any) -> Path:
+    """创建目录（幂等）；路径上已经有一个同名文件时打印 ERROR 并退 1。
+
+    旧实现直接 ``mkdir(exist_ok=True)``：对「已存在的文件」会抛
+    ``FileExistsError`` 裸 traceback，没有 ERROR 行——capture/media/music/tts/deliver
+    所有把 `--out` 指向一个文件的入口都会这样崩（审计实测）。
+    """
     p = Path(path)
-    p.mkdir(parents=True, exist_ok=True)
+    if p.is_dir():
+        return p
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        error(f"目录路径上已经有一个同名文件：{rel(p)}"
+              f"（这里要的是目录，不是文件：删掉/改名这个文件，或换一个输出路径）")
+    except OSError as exc:
+        error(f"创建目录失败：{rel(p)} — {exc}")
     return p
 
 

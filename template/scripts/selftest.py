@@ -8,11 +8,13 @@
     python scripts/selftest.py
 
 只测脚本里**纯函数级**的逻辑：注释剥离、日志强信号判定、时间/响度解析、
-折行、版本解析、缓存键……不读素材、不跑 ffmpeg、不联网、不需要 node，
-因此可以放心放进 CI 的 Python 矩阵里。
+折行、版本解析、缓存键、平台表 & conf 档位、同步分类与 --diff 只读……
+不读素材、不跑 ffmpeg、不联网、不需要 node，因此可以放心放进 CI 的 Python 矩阵里。
 
-每个脚本自己的 ``--selftest`` 是唯一事实来源；本文件只负责逐个跑、
-汇总、把失败原样带出来（有失败就非零退出）。
+每个脚本自己的 ``--selftest`` 是唯一事实来源（当前 6 个：check_assets / check_video /
+mix / doctor / deliver / sync_template）；本文件只负责逐个跑、汇总、把失败原样带出来
+（有失败就非零退出）。另外两道静态兜底：Python 3.9 真写盘 smoke、脚本源码 AST 扫描
+（扫描容忍 UTF-8 BOM——PowerShell 5.1 的 ``-Encoding utf8`` 会写 BOM，不能让合法脚本假红）。
 """
 from __future__ import annotations
 
@@ -24,11 +26,19 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
-#: 带 --selftest 的脚本，按固定顺序跑（输出稳定，方便对照）
+#: 带 --selftest 的脚本，按固定顺序跑（输出稳定，方便对照）。
+#: deliver.py / sync_template.py 的 --selftest 覆盖平台表 & conf 文案映射（交付线）与
+#: 同步分类 / --diff 只读 / --apply 安全语义（同步线）：以前这两个脚本零自测，
+#: 换成 3 行 exit(3) 存根时本文件仍然全绿，所以必须注册进来。
+#: mix.py 的 --selftest 覆盖响度闸门 / 母带模式预测 / 人声余量阈值 / loudnorm / ebur128
+#: （pr-checks 新增，16 条离线断言，不需要 ffmpeg/numpy）。
 TARGETS = (
     "check_assets.py",
     "check_video.py",
+    "mix.py",
     "doctor.py",
+    "deliver.py",
+    "sync_template.py",
 )
 
 #: Python 3.9 写盘 smoke：``Path.write_text(newline=...)`` 是 3.10+ 的参数，而降级测试
@@ -112,30 +122,72 @@ def _run_write_smoke() -> tuple:
     return proc.returncode, (proc.stdout or b"").decode("utf-8", errors="replace").strip()
 
 
+def _read_source(path: Path) -> str:
+    """按 PEP 263 读脚本源码。``utf-8-sig`` 会吃掉文件头 BOM。
+
+    为什么必须容忍 BOM：PowerShell 5.1 的 ``Set-Content -Encoding utf8`` 会写 BOM，
+    而 ``ast.parse(text)`` 遇到 BOM 会抛 ``SyntaxError: invalid non-printable character U+FEFF``
+    —— 合法脚本会被误判成「读不了/解析不了」。解释器本身能正常跑这种文件。
+    """
+    return path.read_text(encoding="utf-8-sig")
+
+
+def _banned_write_calls(tree: ast.AST, filename: str) -> list:
+    """扫 AST 找 ``x.write_text(..., newline=...)``（3.10+ 参数），返回命中的位置字符串。"""
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == BANNED_WRITE_METHOD):
+            continue
+        if any(kw.arg == BANNED_WRITE_KEYWORD for kw in node.keywords):
+            hits.append(f"{filename}:{node.lineno}: .write_text(..., newline=)")
+    return hits
+
+
 def _check_write_api() -> tuple:
     """AST 扫 scripts/*.py：出现 ``x.write_text(..., newline=...)`` 即失败。"""
     hits = []
     checked = 0
     for path in sorted(SCRIPTS_DIR.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            tree = ast.parse(_read_source(path), filename=str(path))
         except (OSError, SyntaxError) as exc:
             return 1, f"读不了/解析不了 {path.name}：{exc}"
         checked += 1
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == BANNED_WRITE_METHOD):
-                continue
-            if any(kw.arg == BANNED_WRITE_KEYWORD for kw in node.keywords):
-                hits.append(f"{path.name}:{node.lineno}: .write_text(..., newline=)")
+        hits.extend(_banned_write_calls(tree, path.name))
     for hit in hits:
         print(f"    {hit}")
     if hits:
         return 1, (f"发现 {len(hits)} 处 3.10+ 写法 `.write_text(..., newline=)`；"
                   "Python 3.9 会抛 TypeError，改用 open(..., newline=)")
     print(f"    OK：扫了 {checked} 个脚本，0 处 3.10+ 写盘参数")
+    return 0, ""
+
+
+def _check_bom_tolerance() -> tuple:
+    """带 UTF-8 BOM 的合法脚本必须能读进来、且禁用写法仍能被扫出来（不能假红也不能漏检）。"""
+    import tempfile
+
+    code = (
+        "from pathlib import Path\n"
+        "\n"
+        "Path('demo.txt').write_text('x', newline='\\n')\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bom_demo.py"
+        path.write_bytes(b"\xef\xbb\xbf" + code.encode("utf-8"))
+        try:
+            tree = ast.parse(_read_source(path), filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            return 1, f"带 BOM 的合法脚本读不进来：{exc}"
+        hits = _banned_write_calls(tree, path.name)
+        if not hits:
+            return 1, "带 BOM 的脚本里 .write_text(..., newline=) 没被扫描出来（BOM 吞掉了检查）"
+        if f"{path.name}:3:" not in hits[0]:
+            return 1, f"带 BOM 文件的扫描行号不对：{hits[0]}"
+    print("    OK：带 UTF-8 BOM 的脚本能正常解析，禁用写法仍能被扫出来")
     return 0, ""
 
 
@@ -173,6 +225,7 @@ def main(argv=None) -> int:
     checks = (
         ("Python 3.9 写盘 smoke（subtitles._write_srt）", _run_write_smoke),
         ("Python 3.9 兼容静态兜底（scripts/*.py 无 write_text(newline=)）", _check_write_api),
+        ("源码 AST 扫描容忍 UTF-8 BOM（合法脚本不假红）", _check_bom_tolerance),
     )
     total += len(checks)
     for index, (name, func) in enumerate(checks, start=len(TARGETS) + 1):

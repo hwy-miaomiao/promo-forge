@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import glob
 import hashlib
 import html as html_mod
 import math
@@ -531,24 +532,21 @@ def cmd_grab(args: argparse.Namespace) -> int:
     req = _requests()
     md_files: List[Path] = []
     for raw in args.md_files:
-        # 绝对路径 + 通配符：PowerShell 不展开 `*`（cmd.exe 会展开，bash 也会），
-        # 原来直接把它喂给 Path().glob() -> 未捕获 NotImplementedError:
-        # Non-relative patterns are unsupported（真 CLI 退 1、出 traceback，没有 ERROR: 行）。
-        # 拆成「绝对父目录 .glob(名字片段)」：既保留通配能力，又满足 pathlib 只吃相对模式的要求。
+        # 通配符一律由脚本自己展开：PowerShell 不展开 `*`（cmd.exe/bash 会），而旧实现
+        # 只认「绝对父目录」，`docs/*.md` 的 parent 是相对路径 `docs`，于是静默回落到
+        # cwd 的 `*.md`——在 README.md 里跑会读到另一个目录（甚至不存在的）文件，
+        # 结果看起来成功、URL 却一条没抓到（审计实测 exit 0）。
+        # 现在用 glob.glob 按当前目录字面展开完整 pattern（含子目录与 `**`）。
         if any(ch in raw for ch in "*?["):
-            abs_dir = None
-            for base in (Path(raw).parent, Path.cwd()):
-                try:
-                    if base.is_absolute() and base.is_dir():
-                        abs_dir = base
-                        break
-                except OSError:
-                    continue
-            if abs_dir is not None:
-                matches = sorted(abs_dir.glob(Path(raw).name))
-            else:
-                C.warn(f"通配符路径的父目录既不是绝对路径也不存在：{raw}，改成只试文件名部分：{Path(raw).name}")
-                matches = sorted(Path().glob(Path(raw).name))
+            try:
+                expanded = glob.glob(raw, recursive=True)
+            except (OSError, ValueError) as exc:
+                C.error(f"通配符展开失败：{raw} — {type(exc).__name__}: {exc}")
+            matches = sorted(Path(p) for p in expanded if Path(p).is_file())
+            if not matches:
+                C.error(f"通配符没匹配到任何文件：{raw}（相对路径按当前目录 "
+                        f"{C.rel(Path.cwd())} 解析；PowerShell 不会替你展开 *.md，"
+                        f"这个模式已由脚本直接展开）")
         else:
             matches = [Path(raw)]
         for p in matches:

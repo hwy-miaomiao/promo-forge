@@ -275,6 +275,38 @@ def _clean_text(text: Any) -> str:
     return re.sub(r"\s+", " ", raw).strip()
 
 
+#: ASS 里「反斜杠 + 字符」的转义表：``\N``/``\n`` 换行、``\h`` 不换行空格、``\{``/``\}`` 字面花括号。
+#: 正文里的反斜杠如果紧挨 N/n/h，会被 libass 当成转义指令（``C:\new`` 直接被拆成两行）。
+ASS_ZWSP = "\u200b"
+
+
+def _escape_ass_text(text: str) -> str:
+    r"""把字幕正文转成 ASS 的「显示出来与原文逐字一致」形式（R5-subs-02）。
+
+    ffmpeg 7.1 + libass 实测（1080×1920，Microsoft YaHei 66，像素 bbox 对比 + 目检）：
+
+    * 花括号是 override 块定界符：正文 ``{over} ABCD`` 渲染成 ``  ABCD``（整块被吞）。
+      libass 认 ``\{`` / ``\}`` 是字面花括号，所以花括号统一转义。
+    * 正文里只有 ``\N`` ``\n`` ``\h`` ``\{`` ``\}`` 是转义，其余反斜杠按字面渲染；
+      所以问题只出在「反斜杠紧跟 N/n/h/{/}」——``C:\new`` 会变成换行。
+      在反斜杠后面插一个 U+200B 零宽空格打断它：ZWSP 不进画面（像素实测与不插的
+      ``A\ND`` 完全一致），渲染出来的字与原文相同。
+    * 结构性换行由调用方用 ``\N`` join，不走本函数（本函数只处理单行正文）。
+    """
+    out: List[str] = []
+    for ch in text:
+        if ch == "\\":
+            out.append(ch + ASS_ZWSP)
+        elif ch == "{":
+            out.append("\\{")
+        elif ch == "}":
+            out.append("\\}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+
 def _vis_len(text: str) -> int:
     """字幕的「字数」：东亚洲宽字符算 1 个字，半角算 0.5，凑整进位。
 
@@ -314,7 +346,12 @@ def _valid_break(tokens: Sequence[str], cut: int) -> bool:
 
 #: 拉丁词 / URL / 数字：字母数字开头结尾，内部允许 URI 里常见的连接符。
 #: 折行时整段不可拆——否则 ``xiaozhangben.app`` 会被切成两行各半个域名（V35）。
-LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._\-/:@#?=&%][A-Za-z0-9]+)*")
+#: ``scheme://`` 前缀也算进原子：否则 ``https://example.com/x`` 会从 ``https://``
+#: 后面被静默拆行（R5-subs-03；V35 的 URL 原子修复没覆盖 scheme）。
+LATIN_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.\-]*://)?"
+    r"[A-Za-z0-9]+(?:[._\-/:@#?=&%][A-Za-z0-9]+)*"
+)
 
 #: 平衡折行时在平衡点附近往回找标点边界的搜索半径（字）。
 BALANCE_LOOKBACK = 2
@@ -1011,7 +1048,12 @@ def _write_filter_script(dst: Path, ass_path: Path) -> Path:
     path = dst.parent / f".subtitles-{dst.stem}.filter"
     # 内容照样要按滤镜图语法转义（从文件读并不跳过滤镜解析器，实测如此）：
     # 复用 _escape_filter_path 那三条规则，文件里就不必再写第二套转义逻辑。
-    path.write_text(_filter_script_text(ass_path) + "\n", encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_filter_script_text(ass_path) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # 输出目录不可写时别抛裸 traceback：与 _write_srt/_build_ass 一样给 ERROR 行（R5-subs-04）。
+        error(f"滤镜脚本写不进 {path}：{exc}（检查输出目录 {dst.parent} 是否存在/可写）")
     return path
 
 
@@ -1068,6 +1110,14 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
     captions = timing.get("captions") if isinstance(timing.get("captions"), dict) else {}
     max_chars = _int(captions.get("maxChars"), 13)
     max_lines = _int(captions.get("maxLines"), 2)
+    if max_lines <= 0:
+        # 0 / 负数会让 _check_fold_lines 把「超行」硬闸门静默关掉（V42 的意义就没了），
+        # 是无效配置而不是「不限制」：直接停，并说清楚怎么改。
+        error(
+            f"timing.json 的 captions.maxLines={max_lines} 不合法：必须是正整数。"
+            "字幕最多 2 行是 AGENTS.md 阶段 7 的硬要求（0/负数会让超行闸门静默失效），"
+            "请把它改成 2（或你确实要的行数）再跑"
+        )
 
     voice = timing.get("voice") if isinstance(timing.get("voice"), dict) else {}
     raw_lines = voice.get("lines")
@@ -1147,11 +1197,23 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
                 )
                 end = limit
             if end <= start:
+                # 收边分支不能再往外顺延：越过 scene_end 就会和下一场景的字幕同屏，
+                # 越过 timing.duration 则会写出一条片尾之后的字幕（R5-subs-01）。
+                # 能给的只有「场景末端 / 片长」这一截，取两者较小值。
+                room_end = min(scene_end, _num(timing.get("duration"), scene_end))
+                if room_end <= start:
+                    error(
+                        f"第 {line_id} 句的 at={fmt_sec(start)} 已经在场景「{scene}」末端"
+                        f"（{fmt_sec(scene_end)}）或之后，场景里没有位置写字幕。"
+                        "请把 timing.json 里这句的 at 前移，或延长这个场景"
+                    )
+                end = min(start + hold, room_end)
                 warn(
-                    f"第 {line_id} 句在场景「{scene}」里几乎没有位置（at={fmt_sec(start)}，"
-                    f"场景 {fmt_sec(scene_start)}~{fmt_sec(scene_end)}）：把终点顺延到 {fmt_sec(scene_end)}"
+                    f"第 {line_id} 句在场景「{scene}」末端只剩 {fmt_sec(room_end - start)}"
+                    f"（{fmt_sec(start)}~{fmt_sec(room_end)}，字数目测下限 {fmt_sec(min_s)}）："
+                    f"字幕终点压到 {fmt_sec(end)}，不再越过场景末端（越过就会串场/越片长）。"
+                    "请把 timing.json 的 at 前移或删字缩短这句，否则这句会一闪而过"
                 )
-                end = max(start + 0.2, scene_end)
 
         lines = _fold_text(text, max_chars, max_lines)
         _check_fold_lines(line_id, text, lines, max_chars, max_lines)
@@ -1412,10 +1474,11 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
 
     events = []
     for cue in cues:
-        body = r"\N".join(_clean_text(line) for line in cue.lines)
+        # ASS 正文必须转义：花括号是 override 块、\N/\n/\h 是换行/空格指令，
+        # 不转义的话烧出来会静默改字（R5-subs-02，_escape_ass_text 的 docstring 有像素实测）。
+        body = r"\N".join(_escape_ass_text(_clean_text(line)) for line in cue.lines)
         start = fmt_ass_time(cue.start)
         end = fmt_ass_time(cue.end)
-        # ASS 里文本必须放最后，且换行要用字面量 \N，所以这里不做任何再转义。
         events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{body}")
     text = header + "\n".join(events) + "\n"
 
@@ -1620,6 +1683,13 @@ def cmd_burn(args) -> int:
         dst = dst.with_name(dst.stem + "-preview" + dst.suffix)
     if dst == src:
         error(f"输出路径和输入是同一个文件（{dst}），会覆盖原片。请用 -o 指定别的路径")
+
+    # 输出目录不存在时 ffmpeg 只会报一句难懂的 "No such file or directory"（软字幕路径
+    # 连滤镜脚本都不会写，于是更早翻车）：先建目录，建不出来给 ERROR 行（R5-subs-04）。
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        error(f"输出目录建不出来 {dst.parent}：{exc}（把 -o 指到可写目录，或先手工建好它）")
 
     if args.preview is not None and args.preview <= 0:
         error(f"--preview 必须是正数秒数，收到 {args.preview}")

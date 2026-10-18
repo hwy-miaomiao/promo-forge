@@ -437,6 +437,18 @@ def _consistency(onset: Any, fps: float, period: float, tol: float = 0.25) -> Tu
     return max(0.0, 1.0 - cv), mean, std, int(core.size), float(np.median(arr_r))
 
 
+def _finite(value: float, label: str) -> float:
+    """把命令行 float 参数收敛成有限数字。
+
+    只查 ``<= 0`` 挡不住 nan/inf（``nan <= 0`` 是 False），后面的 ``int(t * sr)``
+    会抛 ValueError/OverflowError 裸 traceback，没有 ERROR: 行（审计实测）。
+    """
+    v = float(value)
+    if not math.isfinite(v):
+        C.error(f"{label} 必须是有限数字，不能是 nan/inf（现在 {value!r}）")
+    return v
+
+
 def _analyze_track(path: Path, use_from: Optional[float] = None, use_to: Optional[float] = None) -> Dict[str, Any]:
     """把一首曲子分析成一份数字结论（analyze / grid 共用）。"""
     np = _np()
@@ -602,7 +614,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                         f"源采样率 {st.get('sample_rate', '?')}Hz，声道 {st.get('channels', '?')}，"
                         f"编码 {st.get('codec_name', '?')}")
             except SystemExit:
-                meta = "（ffprobe 读不出来）"
+                # C.ffprobe_json 失败时内部已经打过 `ERROR:` 行并抛 SystemExit（V12 的
+                # 教训：吞掉它会让 stderr 有 ERROR 行、退出码却是 0）。这里只降级元信息，
+                # 但必须把 rc 记成失败，保证最终 exit≠0；音频分析本身照常打完。
+                meta = "（ffprobe 读不出来，见上面的 ERROR 行）"
+                rc = 1
         C.log(meta)
         C.log(f"BPM 估算：{info['bpm']:.2f}（拍长 {C.fmt_sec(info['period'])}，"
               f"自相关 {info['candidate_score']:.2f}，按 120 BPM 先验加权后 {info['candidate_weighted']:.2f}）")
@@ -687,11 +703,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
 def cmd_grid(args: argparse.Namespace) -> int:
     path = _check_audio_file(Path(args.file))
-    info = _analyze_track(path, args.from_sec, args.to_sec)
+    # nan/inf 能绕过 `<= 0` 类检查（nan <= 0 是 False），要么被 _analyze_track 里的
+    # max(0.0, nan) 静默当成 0（--from nan 实测 exit 0），要么在 int(t * sr) 抛裸
+    # traceback。区间写反也只报「分析区间太短（-90s）」，看不出真正原因。
+    from_sec = _finite(args.from_sec, "--from")
+    to_sec = _finite(args.to_sec, "--to")
+    if to_sec <= from_sec:
+        C.error(f"--to 必须大于 --from（现在 --from {from_sec:g}、--to {to_sec:g}）："
+                "至少要有 2 秒才能估出节拍")
+    drop_arg = None if args.drop is None else _finite(args.drop, "--drop")
+    info = _analyze_track(path, from_sec, to_sec)
     period = info["period"]
     bar = period * BAR_BEATS
     music = _music_of_timing()
-    drop = args.drop
+    drop = drop_arg
     drop_src = "--drop"
     if drop is None and music.get("drop") is not None:
         try:
@@ -845,18 +870,23 @@ def _band_rms(x: Any, sr: int, band: Optional[Tuple[float, float]],
 def cmd_bars(args: argparse.Namespace) -> int:
     np = _np()
     path = _check_audio_file(Path(args.file))
-    beat = float(args.beat)
-    downbeat = float(args.downbeat)
+    beat = _finite(args.beat, "--beat")
+    downbeat = _finite(args.downbeat, "--downbeat")
     if beat <= 0:
         C.error(f"--beat 必须 > 0（现在 {beat}）。用 python scripts/music.py grid <文件> 拿这个数")
-    beats_per_bar = float(args.beats_per_bar)
+    beats_per_bar = _finite(args.beats_per_bar, "--beats-per-bar")
+    if beats_per_bar <= 0:
+        # 旧实现到此不查，bar=0 后 rows 为空，最后却报「检查 --beat / --downbeat 是不是
+        # 写反了」——完全指错方向（审计实测 --beats-per-bar 0）。
+        C.error(f"--beats-per-bar 必须 > 0（现在 {beats_per_bar:g}；bar = beat × beats_per_bar，默认 4）")
     bar = beat * beats_per_bar
     count = int(args.count)
     if count <= 0:
         C.error(f"--count 必须 > 0（现在 {count}）")
+    offset_arg = None if args.offset is None else _finite(args.offset, "--offset")
 
     music_cfg = _music_of_timing()
-    offset = args.offset
+    offset = offset_arg
     offset_src = "命令行 --offset"
     if offset is None:
         # 只有真的从 timing.json 里读到了 music.offset 才这么说。
@@ -969,9 +999,9 @@ def cmd_bars(args: argparse.Namespace) -> int:
 def cmd_cut(args: argparse.Namespace) -> int:
     src = _check_audio_file(Path(args.input))
     dst = Path(args.output)
-    start = float(args.start)
-    dur = float(args.dur)
-    fade = float(args.fade)
+    start = _finite(args.start, "--start")
+    dur = _finite(args.dur, "--dur")
+    fade = _finite(args.fade, "--fade")
     if start < 0:
         C.error(f"--start 不能是负数（现在 {start}）")
     if dur <= 0:

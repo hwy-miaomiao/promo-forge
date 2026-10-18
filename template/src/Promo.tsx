@@ -45,30 +45,43 @@ export type PromoProps = {
  * `check_assets.py`（ERROR: 混音文件）和渲染后的 `check_video.py`（无音轨）明确报出来。
  *
  * 拿不到清单（或清单为空）时按"存在"处理（宁可让渲染报错，也不要静默丢音轨）。
- * ❗网页播放器里 `getStaticFiles()` 返回的是空数组而不是抛错，见下面的注释。
+ *
+ * ❗三种返回必须分清（R5-TPL-01，见 .audit/round5/findings/r5-pr-template.md）：
+ *   - 数组：拿到了真实清单，可以据此判断文件在不在；
+ *   - undefined / null / 抛错：拿不到清单，按"未知"处理（挂音轨）。
+ *   **remotion 4.0.529 的 getStaticFiles() 在普通浏览器页里返回的是 `undefined`**（document 存在、
+ *   window.remotion_isPlayer 还没置位、window.remotion_staticFiles 未定义），既不是空数组也不抛错。
+ *   旧代码直接 `files.length`，网页版在**模块加载阶段**就
+ *   `TypeError: Cannot read properties of undefined (reading 'length')` → 整页白屏
+ *   （Round 5 用 headless chrome 打开 out/web 复现：dump 出的 #root 为空）。
+ *   所以下面先判 `Array.isArray` 再碰 length。
  */
 const MUSIC_FILE_EXISTS: boolean = (() => {
-  const want = TIMING.music.file.replace(/\\/g, "/");
-  if (want.trim() === "") {
+  const want = TIMING.music.file.replace(/\\/g, "/").trim();
+  if (want === "") {
     return false;
   }
-  let files: ReturnType<typeof getStaticFiles>;
+  // 先拿清单；只有"确认拿到数组"才可能判断"不存在"，其余一律按未知处理。
+  let files: unknown;
   try {
     files = getStaticFiles();
   } catch {
     return true;
   }
-  // ❗<Player>（网页播放版）里 getStaticFiles() 返回**空数组**而不是抛错：
-  // 见 node_modules/remotion/dist/cjs/get-static-files.js —— window.remotion_isPlayer 为真时直接 return []，
-  // 而 Player 会在渲染场景组件前把 isPlayer 置为 true。空清单的含义是"不知道 public/ 里有什么"，
-  // **不是"文件不存在"** —— 这里必须按未知处理（返回 true），否则网页版会悄悄丢掉音轨。
-  // 真正缺文件时由渲染前的 check_assets.py（ERROR: 混音文件）和渲染后的 check_video.py（无音轨）报出来。
+  // ❗R5-TPL-01：普通浏览器页里这里拿到的是 undefined（Player 还没挂载、staticFiles 未注入）。
+  // 不做 Array.isArray 直接读 .length 会让整个网页白屏，所以"未知"必须在这里兜住。
+  if (!Array.isArray(files)) {
+    return true;
+  }
+  // 空数组 = SSR / Player 里"不知道 public/ 有什么"，不是"文件不存在"（文件不存在的判断交给
+  // 渲染前的 check_assets.py 和渲染后的 check_video.py）。见 node_modules/remotion/dist/esm/index.mjs
+  // 的 getStaticFiles 实现。
   if (files.length === 0) {
     return true;
   }
-  return files.some((file) => {
-    const name = String(file.name).replace(/\\/g, "/").replace(/^\/?public\//, "");
-    const src = String(file.src).replace(/\\/g, "/");
+  return (files as { name?: unknown; src?: unknown }[]).some((file) => {
+    const name = String(file.name ?? "").replace(/\\/g, "/").replace(/^\/?public\//, "");
+    const src = String(file.src ?? "").replace(/\\/g, "/");
     return name === want || src.endsWith("/" + want) || src.endsWith("/public/" + want);
   });
 })();

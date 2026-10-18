@@ -251,6 +251,28 @@ def _positive_number(value):
     return number
 
 
+def _seconds_value(value):
+    """把「秒」字段转成 float；返回 (number, None) 或 (None, 中文原因)。
+
+    与 `_positive_number` 的区别：允许 0（`music.segments[].at` 可以写 0.0，表示从片头起），
+    但仍然拒绝布尔值、NaN / Inf、负数 —— 这些写进 timing.json 都是配置错误，不是「没填」。
+    调用方负责把原因拼进 ERROR 行。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, "缺失（单位：秒，例如 12.0）"
+    if isinstance(value, bool):
+        return None, f"是布尔值 {value!r}，不是数字"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None, f"不是数字：{value!r}（要数字，不要单位后缀，例如 12.0）"
+    if number != number or number in (float("inf"), float("-inf")):
+        return None, f"必须是有限的数字：{number!r}"
+    if number < 0:
+        return None, f"不能是负数：{number:g}"
+    return number, None
+
+
 # ===========================================================================
 # 1. 素材引用（staticFile / assetUrl / src="..."）
 # ===========================================================================
@@ -747,6 +769,45 @@ def check_music_fields(report: Report, timing: dict) -> None:
         except (TypeError, ValueError):
             problems.append(f"music.drop={drop!r} 不是数字")
 
+    # music.segments（剪接片段）的结构校验（R5-CA-03）：
+    # 契约见 AGENTS.md 阶段 5：每段是 {"at": 视频时间, "from": 音乐起点, "to": 音乐终点}
+    # （单位秒，from < to；at 必须 < 片长才听得见）。旧实现一个字段都不查，`segments: ["x"]`
+    # 能 0 ERROR 通过，到 mix.py 才被跳过/报错 —— 渲染前的闸门应该先拦住坏配置。
+    segments = music.get("segments")
+    if segments not in (None, "", []):
+        if not isinstance(segments, (list, tuple)):
+            problems.append(
+                f"music.segments 应该是数组（每段一个对象 {{at, from, to}}），"
+                f"现在是 {type(segments).__name__}：{segments!r}"
+            )
+        else:
+            for index, segment in enumerate(segments):
+                label = f"music.segments[{index}]"
+                if not isinstance(segment, dict):
+                    problems.append(
+                        f"{label} 应该是对象（at/from/to），现在是 "
+                        f"{type(segment).__name__}：{segment!r}"
+                    )
+                    continue
+                at, at_error = _seconds_value(segment.get("at"))
+                if at_error:
+                    problems.append(f"{label}.at {at_error}")
+                start, start_error = _seconds_value(segment.get("from"))
+                if start_error:
+                    problems.append(f"{label}.from {start_error}")
+                stop, stop_error = None, None
+                raw_stop = segment.get("to")
+                if raw_stop not in (None, ""):
+                    stop, stop_error = _seconds_value(raw_stop)
+                    if stop_error:
+                        problems.append(f"{label}.to {stop_error}")
+                if (not start_error and not stop_error
+                        and start is not None and stop is not None
+                        and stop <= start):
+                    problems.append(
+                        f"{label} 的 from={start:g}s / to={stop:g}s 区间为空（要求 from < to）"
+                    )
+
     if problems:
         for text in problems:
             report.fail(item, text)
@@ -863,9 +924,56 @@ def check_voice_lines(report: Report, timing: dict) -> None:
     # voice 的坏输入（字符串/列表/数字）只在这一个检查项里报 ERROR；
     # 其余消费点用 _obj 静默归一，避免同一个字段刷出好几条 ERROR。
     voice = _sub_dict(timing, "voice", report, item, "{engine, voice, rate, lines}")
-    lines = [line for line in (voice.get("lines") or []) if isinstance(line, dict)]
-    if not lines:
+    declared = voice.get("lines")
+    if declared is None:
+        declared = []
+    if not isinstance(declared, (list, tuple)):
+        report.fail(
+            item,
+            f"voice.lines 应该是数组（每句一个对象 {{id, scene, at, text}}），"
+            f"现在是 {type(declared).__name__}：{declared!r}",
+        )
+        return
+    if not declared:
         report.warn(item, "voice.lines 是空的：片子里没有任何旁白（确认这是有意为之）")
+        return
+
+    # 结构必须先校验（R5-CA-02）：以前非 dict 的行被静默过滤、缺 at 的按 0.0 兜底，
+    # 坏 timing.json 能 0 ERROR 通过 check_assets，到渲染/字幕阶段才悄悄少一句。
+    lines = []
+    for index, line in enumerate(declared):
+        if not isinstance(line, dict):
+            report.fail(
+                item,
+                f"voice.lines[{index}] 应该是对象（id/scene/at/text），"
+                f"现在是 {type(line).__name__}：{line!r}",
+            )
+            continue
+        missing_keys = [key for key in ("id", "scene", "at", "text") if key not in line]
+        if missing_keys:
+            report.fail(
+                item,
+                f"voice.lines[{index}] 缺少必需字段 {'、'.join(missing_keys)}：{line!r}",
+            )
+            continue
+        line_id = str(line.get("id", "")).strip()
+        if not line_id:
+            report.fail(item, f"voice.lines[{index}] 的 id 是空的：audio-src/vo/<id>.mp3 无从对应")
+            continue
+        if not str(line.get("scene", "") or "").strip():
+            report.fail(item, f"第 {line_id} 句的 scene 是空的")
+            continue
+        at_raw = line.get("at")
+        if isinstance(at_raw, bool) or not isinstance(at_raw, (int, float, str)):
+            report.fail(item, f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头）")
+            continue
+        try:
+            float(at_raw)
+        except (TypeError, ValueError):
+            report.fail(item, f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头）")
+            continue
+        lines.append(line)
+    if not lines:
         return
 
     scenes = {str(s.get("name")): s for s in (timing.get("scenes") or []) if isinstance(s, dict)}
@@ -881,7 +989,7 @@ def check_voice_lines(report: Report, timing: dict) -> None:
             )
             continue
         try:
-            at = float(line.get("at", 0.0) or 0.0)
+            at = float(line.get("at"))
             start = float(scene.get("start"))
             end = float(scene.get("end"))
         except (TypeError, ValueError):
@@ -1207,6 +1315,10 @@ def _collect_source_chars(report: Report, item: str):
     except Exception as exc:  # noqa: BLE001
         report.warn(item, f"扫 src/web 上屏文本失败（{exc}），只检查 timing.json 的文案")
         return [], 0
+    # 防御性处理（R5-CA-01 的兜底层）：BOM（U+FEFF）和零宽字符不是「上屏要看到字形」的
+    # 字符，不该拿去查字体 cmap。根因（按 UTF-8 读带 BOM 源码文件）由 fonts.py 修成
+    # utf-8-sig；这里再兜一层，保证某个文件带 BOM 时缺字闸门也不会误报「字体缺少 」。
+    chunks = [chunk.lstrip("\ufeff") for chunk in chunks]
     return chunks, scanned
 
 
@@ -1510,12 +1622,63 @@ def _selftest() -> int:
     last_start, last_end = _local_window(timing, {"at": 5.0, "scene": "s1"})
     check("_local_window 最后一句终点（场景 end 10 减 0.15）", round(last_end, 3), 9.85)
 
+    # --- json 读取：带 UTF-8 BOM 的 timing/fonts 也要能读（R5-CA-01） ---
+    import contextlib
+    import io
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bom_path = Path(tmpdir) / "timing-bom.json"
+        bom_path.write_bytes(b'\xef\xbb\xbf{"title": "\xe6\xb5\x8b\xe8\xaf\x95"}')
+        data, err = _read_json_file(bom_path)
+        check("_read_json_file 带 BOM 能读", (data or {}).get("title"), "测试")
+        check("_read_json_file 带 BOM 无报错", err, None)
+
+    def _collect_report_errors(func) -> int:
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            func(report)
+        return report.errors
+
+    # --- music.segments 结构校验（R5-CA-03）：坏段必须 ERROR ---
+    base_music = {"beat": 0.5769, "bar": 2.3076, "drop": 1.5}
+
+    def _segments_errors(segments) -> int:
+        timing_fixture = {"music": dict(base_music, segments=segments)}
+        return _collect_report_errors(
+            lambda report: check_music_fields(report, timing_fixture))
+
+    check("segments 合法 → 0 ERROR",
+          _segments_errors([{"at": 22.0, "from": 12.0, "to": 30.0}]), 0)
+    check("segments 非数组 → ERROR", _segments_errors("oops") > 0, True)
+    check("segments 段非对象 → ERROR", _segments_errors(["x"]) > 0, True)
+    check("segments 缺 at → ERROR", _segments_errors([{"from": 1.0, "to": 2.0}]) > 0, True)
+    check("segments 空区间 → ERROR",
+          _segments_errors([{"at": 1.0, "from": 5.0, "to": 3.0}]) > 0, True)
+
+    # --- voice.lines 结构校验（R5-CA-02）：缺 at / 非对象行必须 ERROR ---
+    base_scenes = [{"name": "s1", "start": 0.0, "end": 10.0}]
+
+    def _voice_errors(lines) -> int:
+        timing_fixture = {"scenes": base_scenes, "voice": {"lines": lines}}
+        return _collect_report_errors(
+            lambda report: check_voice_lines(report, timing_fixture))
+
+    check("voice.lines 合法 → 0 ERROR",
+          _voice_errors([{"id": "01", "scene": "s1", "at": 2.0, "text": "文案"}]), 0)
+    check("voice.lines 缺 at → ERROR",
+          _voice_errors([{"id": "01", "scene": "s1", "text": "文案"}]) > 0, True)
+    check("voice.lines 非对象行 → ERROR", _voice_errors([1, 2]) > 0, True)
+    check("voice.lines 非数组 → ERROR", _voice_errors("oops") > 0, True)
+
     if failures:
         for message in failures:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
-    print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 全部通过")
+    print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
+          "music.segments / voice.lines 全部通过")
     return 0
 
 

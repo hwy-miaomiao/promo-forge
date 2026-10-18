@@ -22,7 +22,7 @@ import { AbsoluteFill, useVideoConfig } from "remotion";
 import { SceneFrame, useSceneTime } from "../components/Scene";
 import { Stage } from "../components/Stage";
 import { PhoneFrame } from "../components/PhoneFrame";
-import { PALETTE, SAFE, alpha, isVertical, safePadding, useType } from "../lib/theme";
+import { PALETTE, SAFE, alpha, captionBandHeight, isVertical, safePadding, useType } from "../lib/theme";
 import { FONT } from "../lib/fonts";
 import { EASE, clamp, impulse, loop, ramp, riseIn, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
@@ -319,11 +319,11 @@ export const Demo: React.FC = () => {
   // 机身高 600.8 ÷ (9/19.5) ≈ 1301.7px，而 Stage 的内容高只有 1080 − 上 6% − 下 8% ≈ 929px ——
   // 机身被上下各裁掉 300 多 px（pr-b5 横版 13.1s 帧）。所以必须再按**可用高**夹一次：
   // 手机高度不能超过「内容盒高 − 标题 − 小结 − 三步条 − 字幕带」。
-  // 字幕带高度按 Caption.tsx 的尺寸公式算（底边 captions.bottom + maxLines 行 + 行距），不再写死 0.3 屏高。
+  // 字幕带高度按 Caption.tsx 的口径算（底边 captions.bottom + maxLines 行 + 行距），不再写死 0.3 屏高。
+  // 字号与硬字幕 ASS 同源（lib/theme 的 captionBandHeight / captionFontSize，R5-TPL-03）。
   const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
-  const capLine = type.caption.size * (type.caption.lineHeight + 0.44); // 行高 + 上下 padding（0.22 × 2）
   const capBand = TIMING.captions.enabled
-    ? captionBottom + TIMING.captions.maxLines * capLine + (TIMING.captions.maxLines - 1) * type.caption.size * 0.18
+    ? captionBottom + captionBandHeight(width, height, TIMING.captions.maxChars, TIMING.captions.maxLines)
     : 0;
   // 字幕带顶边已经在安全区内时不再额外让位；+1.2% 屏高是字幕与内容之间的呼吸位。
   const bottomExtra = Math.max(0, Math.round(capBand - safe.bottom + height * 0.012));

@@ -6,17 +6,35 @@
  *      超出的**在进场前就折行/截断**，绝不允许靠 CSS 溢出把字画到安全区外。
  *      ——CSS 的 `-webkit-line-clamp` 在不同 Chromium 版本上对 CJK 断行不一致，
  *        抽帧时才会发现多出一行，所以在 JS 里按字数断行是唯一稳的做法。
+ *      折行算法与 scripts/subtitles.py 的 `_fold_text()` 同一套（见 lib/captionText.ts）：
+ *      避头尾、优先标点边界、拉丁词/URL/数字不拆、最后一行不会只剩标点或单字。
  *   2) 大字最多比旁白早 1.5 秒出现，停留 ≥ 字数/8 + 0.4 秒（见 holdFor）。
  *   3) 底衬/描边保证在任何画面上都能读：半透明底 + 描边 + 阴影三层，
  *      因为真实截图（Shot）的明暗不可控，纯白字压在浅色截图上会看不见。
+ *
+ * 字号与左右安全区跟**硬字幕 ASS 同一口径**（R5-TPL-03）：不用 useType().caption.size
+ * （那是按屏宽缩放的 51.9px），而是用 lib/theme 的 captionFontSize() / captionSideInsets()，
+ * 与 scripts/subtitles.py 的 `_build_ass()` 用同一公式（1080×1920 → 66px；1920×1080 → 41px）。
  */
 import type React from "react";
 import { AbsoluteFill, useVideoConfig } from "remotion";
 import { TIMING, type VoiceLine } from "../lib/timing";
 import { useAbsTime } from "./Scene";
-import { PALETTE, alpha, useType } from "../lib/theme";
+import {
+  CAPTION_GAP,
+  CAPTION_PAD_Y,
+  PALETTE,
+  alpha,
+  captionFontSize,
+  captionSideInsets,
+  useType,
+} from "../lib/theme";
+import { visLen, wrapCJK } from "../lib/captionText";
 import { FONT } from "../lib/fonts";
 import { EASE, ramp } from "../lib/anim";
+
+/** 兼容旧引用：折行实现已移到 lib/captionText.ts（可单独打包做断言测试）。 */
+export { wrapCJK };
 
 /** 字幕淡入时长（秒）。0.15 秒≈9 帧，短到不像动画，但足以避免"啪"地跳出来。 */
 export const CAPTION_FADE = 0.15;
@@ -41,14 +59,21 @@ export const CAPTION_TAIL = 0.15;
  * 按 字数/8+0.4 只有 2.4 秒，而真人念完要 ~3.0 秒 —— 字幕会比语音早半秒消失。
  */
 export const captionUntil = (line: VoiceLine, sceneEnd: number): number =>
-  Math.min(sceneEnd - CAPTION_TAIL, line.at + Math.max(holdFor(line.text), Array.from(line.text).length / VO_CHARS_PER_SEC + 0.35));
+  Math.min(
+    sceneEnd - CAPTION_TAIL,
+    line.at + Math.max(holdFor(line.text), Array.from(line.text).length / VO_CHARS_PER_SEC + 0.35),
+  );
 
 /**
  * 当前该显示哪一句。
  * 取"at ≤ now 的最后一句"，并保证它不会跨出自己所属场景的窗口 ——
  * 配音是被人为约束在场景窗口内的（tts.py audit 会检查），字幕跟着场景走才不会串场。
  */
-export const activeLine = (now: number, lines: readonly VoiceLine[], scenes: readonly { name: string; start: number; end: number }[]): VoiceLine | null => {
+export const activeLine = (
+  now: number,
+  lines: readonly VoiceLine[],
+  scenes: readonly { name: string; start: number; end: number }[],
+): VoiceLine | null => {
   let found: VoiceLine | null = null;
   for (const line of lines) {
     if (line.at <= now) {
@@ -59,25 +84,6 @@ export const activeLine = (now: number, lines: readonly VoiceLine[], scenes: rea
     }
   }
   return found;
-};
-
-/**
- * 按字数折行。
- * 先算"塞进 maxLines 行每行最多几个字"，再从后往前丢弃多余的字 ——
- * 这样短句保持自然断行，长句只会被截尾并加省略号，不会出现一行挤 20 个字。
- */
-export const wrapCJK = (text: string, maxChars: number, maxLines: number, ellipsis = "…"): string[] => {
-  const chars = Array.from(text);
-  const perLine = Math.max(1, maxChars);
-  const capacity = perLine * Math.max(1, maxLines);
-  const shown =
-    chars.length <= capacity ? chars : [...chars.slice(0, Math.max(0, capacity - 1)), ellipsis];
-
-  const lines: string[] = [];
-  for (let i = 0; i < shown.length; i += perLine) {
-    lines.push(shown.slice(i, i + perLine).join(""));
-  }
-  return lines;
 };
 
 export type CaptionProps = {
@@ -101,6 +107,11 @@ export const Caption: React.FC<CaptionProps> = ({ bottom }) => {
   const p = ramp(now, [line.at, line.at + CAPTION_FADE], [0, 1], EASE.out);
   const rise = (1 - p) * 18; // 轻微上移，陪衬淡入，避免"贴纸感"
 
+  // 字号 / 左右留白与硬字幕 ASS 同一口径（R5-TPL-03）：见 lib/theme 的 captionFontSize 注释。
+  const size = captionFontSize(width, height, cfg.maxChars);
+  const insets = captionSideInsets(width);
+  const availW = Math.max(1, width - insets.left - insets.right);
+
   // 底部距离：用比例而不是像素，换画幅时字幕自动跟着走
   const bottomPx = Math.round(height * (bottom ?? cfg.bottom));
 
@@ -110,46 +121,60 @@ export const Caption: React.FC<CaptionProps> = ({ bottom }) => {
         // 字幕层不吃点击、不参与布局，纯覆盖；zIndex 高于画面内容但低于 URL/CTA 的强调层
         pointerEvents: "none",
         justifyContent: "flex-end",
-        alignItems: "center",
         paddingBottom: bottomPx,
+        // 与 ASS 的 MarginL / MarginR 对齐：Alignment=2 是在「左右留白之间」居中，
+        // 不是整幅画面居中（竖屏左右留白不对称：6% / 14%）。不加这层 padding 的话，
+        // 13 个全角字 × 66px 会越到右侧安全区外面（R5-TPL-03）。
+        paddingLeft: insets.left,
+        paddingRight: insets.right,
         zIndex: 40,
       }}
     >
       <div
         style={{
-          maxWidth: "84%",
+          width: "100%",
           opacity: p,
           transform: `translateY(${rise}px)`,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
-          gap: "0.18em",
+          // ❗必须用 px：写成 `0.18em` 时 em 相对的是这个 div 继承来的 16px，
+          // 实际只有 2.9px，跟 Hook/Demo 里按「0.18 × 字幕字号」预留的间距对不上。
+          gap: size * CAPTION_GAP,
         }}
       >
-        {lines.map((text, i) => (
-          <span
-            key={`${line.id}-${i}`}
-            style={{
-              fontFamily: FONT.display,
-              fontSize: type.caption.size,
-              fontWeight: type.caption.weight,
-              lineHeight: type.caption.lineHeight,
-              letterSpacing: type.caption.letterSpacing,
-              color: PALETTE.fg,
-              // 三层可读性保障：底衬 + 描边 + 投影。任何一层单独都可能被浅色截图吃掉。
-              background: alpha(PALETTE.bg, 0.62),
-              borderRadius: width * 0.018,
-              padding: `${type.caption.size * 0.22}px ${type.caption.size * 0.5}px`,
-              WebkitTextStroke: `${Math.max(1, type.caption.size * 0.022)}px ${alpha(PALETTE.bg, 0.55)}`,
-              // paint-order 让描边画在字形外侧，中文字形不会因为描边变糊
-              paintOrder: "stroke fill",
-              textShadow: `0 ${type.caption.size * 0.05}px ${type.caption.size * 0.25}px ${alpha(PALETTE.bg, 0.85)}`,
-              whiteSpace: "pre",
-            }}
-          >
-            {text}
-          </span>
-        ))}
+        {lines.map((text, i) => {
+          // 底衬左右内边距：13 字 × 66px 正好卡满 864px 安全区（只剩 6px），
+          // 不能再像小字号时那样用 0.5em 把底衬撑出去。按这一行的估计宽度夹一次，
+          // 底衬与字形都留在安全区内；字号本身不变（R5-TPL-03）。
+          // 1.05 是保守系数：半角字形的实际前进宽度比 0.5em 略宽。
+          const estimated = Math.ceil(visLen(text) * size * 1.05);
+          const padX = Math.max(2, Math.min(Math.round(size * 0.5), Math.floor((availW - estimated) / 2)));
+          return (
+            <span
+              key={`${line.id}-${i}`}
+              style={{
+                fontFamily: FONT.display,
+                fontSize: size,
+                fontWeight: type.caption.weight,
+                lineHeight: type.caption.lineHeight,
+                letterSpacing: type.caption.letterSpacing,
+                color: PALETTE.fg,
+                // 三层可读性保障：底衬 + 描边 + 投影。任何一层单独都可能被浅色截图吃掉。
+                background: alpha(PALETTE.bg, 0.62),
+                borderRadius: width * 0.018,
+                padding: `${size * CAPTION_PAD_Y}px ${padX}px`,
+                WebkitTextStroke: `${Math.max(1, size * 0.022)}px ${alpha(PALETTE.bg, 0.55)}`,
+                // paint-order 让描边画在字形外侧，中文字形不会因为描边变糊
+                paintOrder: "stroke fill",
+                textShadow: `0 ${size * 0.05}px ${size * 0.25}px ${alpha(PALETTE.bg, 0.85)}`,
+                whiteSpace: "pre",
+              }}
+            >
+              {text}
+            </span>
+          );
+        })}
       </div>
     </AbsoluteFill>
   );

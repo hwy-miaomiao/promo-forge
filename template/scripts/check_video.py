@@ -89,6 +89,11 @@ except ImportError as exc:  # pragma: no cover
 # AGENTS.md 第 7 节闸门表：规格与 timing.json 一致（时长 ±0.2 秒）。
 DURATION_TOLERANCE_S = 0.2
 
+# 音轨比视频短多少算「片尾没有声音」：0.3 秒容差。
+# AAC 编码器的补帧 / 容器时长取整会带来几十毫秒的差；真正的「音频提前结束」通常是
+# 整数秒级（例如 -shortest 截断、音轨只铺到第 40 秒）。见 check_spec 的音轨段。
+AUDIO_SHORTER_TOLERANCE_S = 0.3
+
 # AGENTS.md 第 5 节：timing.fps 与成片帧率一致；这里给 ±0.01 的浮点容差。
 FPS_TOLERANCE = 0.01
 
@@ -128,13 +133,14 @@ SILENCE_NOISE_DB = -45
 #   （`Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'`），所以
 #   `_RX_LOG_STRONG` 里那批信号（未捕获异常 / 子进程非零退出 / 段错误 / MODULE_NOT_FOUND /
 #   模块解析失败 / ffmpeg 读不了输入 / 找不到编解码参数 / 浏览器进程退出）**无条件**先命中。
-# 其余三个词（AGENTS.md 阶段 9 的原文口径）保持纯子串匹配，且**大小写不敏感**
+# 两个词（AGENTS.md 阶段 9 的原文口径）保持纯子串匹配，且**大小写不敏感**
 # ——旧实现是整行 `.lower()` 之后再子串匹配，`Cannot be decoded` / `Failed to load`
-# 都要能命中。改这里要同步改根文档。
+# 都要能命中。第三个词 `Timeout` **不能**裸子串匹配：`Timeout: 30000 ms (page load
+# budget)` 只是配置回显、渲染照样成功，裸匹配会把正常渲染误判成失败（R5-CV-02）；
+# 真正的超时失败交给下面 `_RX_LOG_TIMEOUT` 的失败语义正则。改这里要同步改根文档。
 LOG_ERROR_PATTERNS = (
     "cannot be decoded",
     "failed to load",
-    "Timeout",
 )
 LOG_ERROR_LABEL = "Error:/ERROR"
 #: Chromium / ANGLE 的日志前缀，形态固定为 `[ERROR:组件名(行号)]`（也兼容 `[W:...]` / `[I:...]`）。
@@ -159,6 +165,15 @@ _RX_LOG_ERROR_COUNT = re.compile(r"(?<!\d)(\d+)\s+errors?\b", re.IGNORECASE)
 _RX_LOG_ZERO = re.compile(
     r"(?:\b(?:0|no|without|none)\b(?:\s+\w+){0,2}?\s+errors?\b"
     r"|errors?\s*[:=]\s*(?:0|none|no)\b)",
+    re.IGNORECASE,
+)
+#: 「超时失败」只认失败语义，不认配置回显（R5-CV-02）：
+#:   命中：`TimeoutError: …` / `timed out` / `timeout exceeded|expired|waiting|after|while|during`
+#:   不命中：`Timeout: 30000 ms (page load budget)`（渲染参数回显，渲染其实成功）
+#: 旧的裸子串匹配把后者也当报错，正常渲染会被闸门误杀。
+_RX_LOG_TIMEOUT = re.compile(
+    r"\btimeout\s*error\b|\btimed?\s+out\b"
+    r"|\btimeout\b[^\n]{0,60}?\b(?:exceeded|expired|waiting|after|while|during)\b",
     re.IGNORECASE,
 )
 
@@ -223,23 +238,82 @@ def _log_error_hit(line: str) -> bool:
        （`Finished: 0 errors, 0 warnings. Error: Cannot find module 'x'`），
        先判零错误就整行放行。`_RX_LOG_STRONG` 就是这道前置判定，顺序不能调。
 
-    三个阶段 9 的三个词（`cannot be decoded` / `failed to load` / `Timeout`）也在这里一起判，
-    大小写不敏感——这样「这一行算不算报错」只有一个入口，不会再出现两套口径。
+    阶段 9 的词（`cannot be decoded` / `failed to load`）也在这里一起判，大小写不敏感——
+    这样「这一行算不算报错」只有一个入口，不会再出现两套口径。裸 `Timeout` 不算报错
+    （配置回显 `Timeout: 30000 ms` 会误报），真正的超时失败由 `_RX_LOG_TIMEOUT`
+    的失败语义判（R5-CV-02）。
     """
     rest = _RX_LOG_CHROMIUM_PREFIX.sub("", line)
     for rx in _RX_LOG_STRONG:
         if rx.search(rest):
             return True
+    if _RX_LOG_TIMEOUT.search(rest):
+        return True
     lowered = rest.lower()
     for term in LOG_ERROR_PATTERNS:
         if term.lower() in lowered:
             return True
-    if _RX_LOG_ZERO.search(rest):
+    # 「零错误汇总」豁免只对**真正的汇总行**生效（R5-CV-03）：汇总和真错误会出现在
+    # 同一行（`Error: frame write failed (Errors: 0)`），旧写法先判 `_RX_LOG_ZERO`
+    # 就 return False，真错误被整行吞掉。现在先把「0 errors / No errors」片段抠掉，
+    # 剩下的文字里还有错误信号就不豁免，交给后面的 count/ERROR/WORD 判。
+    residual = _RX_LOG_ZERO.sub(" ", rest)
+    if _RX_LOG_ZERO.search(rest) and not (
+        _RX_LOG_ERROR_COUNT.search(residual)
+        or _RX_LOG_ERROR.search(residual)
+        or _RX_LOG_ERROR_WORD.search(residual)
+    ):
         return False
-    count = _RX_LOG_ERROR_COUNT.search(rest)
+    count = _RX_LOG_ERROR_COUNT.search(residual)
     if count:
         return int(count.group(1)) > 0
-    return bool(_RX_LOG_ERROR.search(rest) or _RX_LOG_ERROR_WORD.search(rest))
+    return bool(_RX_LOG_ERROR.search(residual) or _RX_LOG_ERROR_WORD.search(residual))
+
+
+def _decode_log_bytes(raw: bytes):
+    """把渲染日志的原始字节解码成 (text, note)。
+
+    R5-CV-01：日志固定按 UTF-8 读会把 PowerShell `>` 重定向写出的 UTF-16 日志读成
+    夹 NUL 的乱码 —— 里面明明有 `Error: boom`，闸门却报「没有报错字样（3 行）」。
+    这里按字节判断真实编码：BOM 优先（UTF-8 BOM / UTF-16LE / UTF-16BE）；没有 BOM
+    但 NUL 密集的按 UTF-16 解（PowerShell 5 的默认重定向就是无 BOM UTF-16LE）；
+    其余仍按 UTF-8 容错解。note 非空表示「编码不是标准 UTF-8，已按猜到的编码解码」，
+    调用方会打一条 WARN 留痕（不静默改口径）。
+    """
+    if not raw:
+        return "", None
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "replace"), None
+    if raw.startswith(b"\xff\xfe"):
+        return (
+            raw[2:].decode("utf-16-le", "replace"),
+            "日志带 UTF-16LE BOM（PowerShell 的 `>` 默认编码），已按 UTF-16LE 解码",
+        )
+    if raw.startswith(b"\xfe\xff"):
+        return (
+            raw[2:].decode("utf-16-be", "replace"),
+            "日志带 UTF-16BE BOM，已按 UTF-16BE 解码",
+        )
+    if len(raw) >= 4:
+        nul = raw.count(b"\x00")
+        if nul * 20 >= len(raw):  # NUL 占比 ≥ 5%：几乎不可能是 UTF-8 文本
+            le_nul = raw[1::2].count(b"\x00")
+            be_nul = raw[0::2].count(b"\x00")
+            encoding = "utf-16-le" if le_nul >= be_nul else "utf-16-be"
+            return (
+                raw.decode(encoding, "replace"),
+                "日志没有 BOM 但 NUL 密集（疑似 PowerShell `>` 写出的 UTF-16），"
+                f"已按 {encoding} 解码",
+            )
+    text = raw.decode("utf-8", "replace")
+    if "\ufffd" in text:
+        bad = text.count("\ufffd")
+        return (
+            text,
+            f"日志里有 {bad} 个字节不是合法 UTF-8，已用替换符容错解码；"
+            "如果日志其实是 UTF-16/GBK，报错判定可能不可靠",
+        )
+    return text, None
 
 # 模板 remotion.config.ts 的编码设置；不一致不算硬失败，但要提醒平台兼容性。
 EXPECTED_CODEC = "h264"
@@ -621,6 +695,23 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
                 audio.get("channels", "?"),
             ),
         )
+        # R5-CV-04：音轨比视频短时，片尾一段根本没有声音 —— 但 silencedetect 只在
+        # 音频流**内部**找静音，片尾无声区它看不见，check_silence 会报「全片没有
+        # ≥1 秒的静音段」。这里直接比 ffprobe 的音轨时长与视频时长。
+        audio_duration = _parse_fraction(audio.get("duration"))
+        if audio_duration <= 0:
+            report.warn(
+                item,
+                "ffprobe 没报出音轨时长，无法核对音轨是否覆盖全片（请人工确认片尾有声）",
+            )
+        elif duration > 0 and audio_duration < duration - AUDIO_SHORTER_TOLERANCE_S:
+            report.fail(
+                item,
+                f"音轨只有 {audio_duration:.2f}s，比视频 {duration:.2f}s 短 "
+                f"{duration - audio_duration:.2f}s：片尾这段没有声音。"
+                "silencedetect 只在音频流内部找静音，查不到这里 —— "
+                "跑 `python scripts/mix.py` 重新铺满全片，或检查渲染命令有没有用 -shortest 截掉音轨",
+            )
 
     return width, height, actual_fps, duration
 
@@ -655,15 +746,21 @@ def check_render_log(report: Report, log_path: Path, required: bool = True) -> N
             report.ok(item, "按 --no-log 跳过渲染日志检查（交付前请自行确认渲染过程没有报错）")
         return
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        raw = log_path.read_bytes()
     except OSError as exc:
         report.fail(item, f"读不了 {_rel(log_path)}：{exc}（日志闸门无法验证；修好权限或传 --no-log）")
         return
+    # R5-CV-01：UTF-16（PowerShell `>` 的默认编码）日志不能按 UTF-8 硬读 ——
+    # 那样读出来是夹 NUL 的乱码，含 `Error: boom` 也会判成「没有报错字样」。
+    text, encoding_note = _decode_log_bytes(raw)
+    if encoding_note:
+        report.warn(item, encoding_note)
 
     hits = []
     for lineno, line in enumerate(text.splitlines(), start=1):
-        # AGENTS.md 阶段 9 的三个词是整行 `.lower()` 之后做子串匹配的（旧实现如此），
-        # `Cannot be decoded` / `Failed to load resource` / `TimeoutError` 都要命中。
+        # AGENTS.md 阶段 9 的词是整行 `.lower()` 之后做子串匹配的（旧实现如此），
+        # `Cannot be decoded` / `Failed to load resource` 都要命中；`TimeoutError`
+        # 走 `_log_error_hit` 的超时语义正则，不裸匹配 `Timeout`（R5-CV-02）。
         lowered = line.lower()
         for pattern in LOG_ERROR_PATTERNS:
             if pattern.lower() in lowered:
@@ -1112,6 +1209,10 @@ def _selftest() -> int:
             failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
 
     # --- 渲染日志判定（BUGS-REPORT P2-8：零错误语序 + 强信号优先） ---
+    import contextlib
+    import io
+    import tempfile
+
     log_false = (
         "Finished: 0 errors, 0 warnings",
         "Errors: 0",
@@ -1119,6 +1220,8 @@ def _selftest() -> int:
         "0 fatal errors",
         "no errors",
         "[ERROR:gpu_init.cc(481)] Passthrough is not supported, GL is disabled",
+        # R5-CV-02：渲染参数回显不是报错
+        "Timeout: 30000 ms (page load budget)",
     )
     log_true = (
         "Unhandled exception; 0 errors",
@@ -1128,11 +1231,89 @@ def _selftest() -> int:
         "Command failed with exit code 1",
         "[chrome-headless-shell.exe] exited with code 137",
         "2 errors: ffmpeg exited",
+        # R5-CV-02：真正的超时失败要命中
+        "TimeoutError: page did not load",
+        "Command timed out after 30000 ms",
+        # R5-CV-03：同一行的真错误不能被「Errors: 0」豁免吞掉
+        "Error: frame write failed (Errors: 0)",
     )
     for line in log_false:
         check(f"日志应无报错：{line[:40]!r}", _log_error_hit(line), False)
     for line in log_true:
         check(f"日志应有报错：{line[:40]!r}", _log_error_hit(line), True)
+
+    # --- 日志字节解码（R5-CV-01）：UTF-16 日志必须按真实编码解 ---
+    decoded, note = _decode_log_bytes(b"\xff\xfe" + "Error: boom".encode("utf-16-le"))
+    check("_decode_log_bytes UTF-16LE BOM 文本", decoded, "Error: boom")
+    check("_decode_log_bytes UTF-16LE BOM 留痕", bool(note), True)
+    decoded, note = _decode_log_bytes("Error: boom".encode("utf-16-le"))
+    check("_decode_log_bytes 无 BOM UTF-16LE 也识别", decoded, "Error: boom")
+    check("_decode_log_bytes 无 BOM 也留痕", bool(note), True)
+    decoded, note = _decode_log_bytes(b"plain ascii log\n")
+    check("_decode_log_bytes UTF-8 无 note", (decoded, None), ("plain ascii log\n", None))
+
+    # --- 日志闸门集成（R5-CV-01/CV-03）：字节 → 解码 → 命中判定 ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        utf16_bad = tmp / "utf16-bad.log"
+        utf16_bad.write_bytes(
+            b"\xff\xfe" + "Processed 3 frames\nError: boom\nDone\n".encode("utf-16-le"))
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_render_log(report, utf16_bad)
+        check("UTF-16LE BOM 日志含 Error: → ERROR", report.errors > 0, True)
+
+        utf16_ok = tmp / "utf16-ok.log"
+        utf16_ok.write_bytes(
+            b"\xff\xfe" + "Rendered 300 frames\nDone\n".encode("utf-16-le"))
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_render_log(report, utf16_ok)
+        check("UTF-16 干净日志 → 0 ERROR", report.errors, 0)
+        check("UTF-16 干净日志 → 编码 WARN 留痕", report.warnings > 0, True)
+
+        same_line = tmp / "same-line.log"
+        same_line.write_text("Error: frame write failed (Errors: 0)\n", encoding="utf-8")
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_render_log(report, same_line)
+        check("同行 Error:+(Errors: 0) → ERROR", report.errors > 0, True)
+
+    # --- 音轨比视频短：check_spec 必须 ERROR（R5-CV-04，fake ffprobe 数据） ---
+    def _spec_errors(video_dur: float, audio_dur) -> tuple:
+        streams = [
+            {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+             "width": 1080, "height": 1920, "r_frame_rate": "60/1",
+             "avg_frame_rate": "60/1", "duration": f"{video_dur:.3f}"},
+            {"codec_type": "audio", "codec_name": "aac", "sample_rate": "48000",
+             "channels": 2},
+        ]
+        if audio_dur is not None:
+            streams[1]["duration"] = f"{audio_dur:.3f}"
+        probe_fixture = {
+            "format": {"duration": f"{video_dur:.3f}", "size": "1"},
+            "streams": streams,
+        }
+        report = Report(strict=False)
+        timing_fixture = {"width": 1080, "height": 1920, "fps": 60,
+                          "duration": video_dur}
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_spec(report, probe_fixture, timing_fixture,
+                       Path("out/final-1080p.mp4"), None, None)
+        return report.errors, report.warnings
+
+    errors, _warnings = _spec_errors(45.0, 40.0)
+    check("check_spec 音轨短 5s → ERROR", errors > 0, True)
+    errors, _warnings = _spec_errors(45.0, 45.0)
+    check("check_spec 音轨等长 → 0 ERROR", errors, 0)
+    errors, _warnings = _spec_errors(45.0, 44.8)
+    check("check_spec 音轨短 0.2s（容差内）→ 0 ERROR", errors, 0)
+    errors, warnings = _spec_errors(45.0, None)
+    check("check_spec 无音轨时长 → 0 ERROR 但有 WARN", (errors, warnings > 0), (0, True))
 
     # --- ffprobe 帧率分数 ---
     check("_parse_fraction('60/1')", _parse_fraction("60/1"), 60.0)
@@ -1191,7 +1372,8 @@ def _selftest() -> int:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
-    print("OK: selftest — 渲染日志判定 / 帧率分数 / ebur128 / loudnorm / silencedetect / 抽帧时刻 全部通过")
+    print("OK: selftest — 渲染日志判定 / 日志编码 / 帧率分数 / ebur128 / loudnorm / "
+          "silencedetect / 抽帧时刻 / 音轨时长 全部通过")
     return 0
 
 

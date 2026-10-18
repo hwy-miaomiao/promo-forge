@@ -160,12 +160,18 @@ python scripts/tts.py audit      # 检查每句时长是否落在窗口内、有
 - 字幕：竖屏单行 ≤13 字、最多 2 行，屏上大字**最多比旁白早 1.5 秒**出现；停留时长 ≥ `字数 / 6 + 0.35` 秒
   （配音 5.5~6.5 字/秒，**字幕必须活到人声读完**，否则句尾还在念、字幕已经消失）。模板组件取
   `max(字数/8+0.4, 字数/6+0.35)`，并在场景结束前 0.15 秒收掉，避免和下一场景的字幕叠在一起。
-- 字幕字号由脚本按安全区换算，**不许手写死**：`min(画布高 × 0.038, (画布宽 − 左右留白) / captions.maxChars)`。
+- 字幕字号由脚本按安全区换算，**不许手写死**：`max(12, min(round(画布高 × 0.038), floor((画布宽 − 左右留白) / captions.maxChars)))`。
   竖屏 1080×1920 时 = min(73, 864/13) = **66px**；只按高度算的 73px 会让 13 个全角字（949px）越过
-  右侧 14% 留白，侵入平台互动按钮区（`subtitles.py` 生成 ASS 时会把字号压到 66 并打日志）。
+  右侧 14% 留白，侵入平台互动按钮区。**画面内 `<Caption>` 与硬字幕现在用同一个公式**：`src/lib/theme.ts` 的
+  `captionFontSize()` / `captionSideInsets()`（左右按 6% / 14% 收边）↔ `subtitles.py` 的 `FONT_SCALE = 0.038` / `SAFE_LEFT` / `SAFE_RIGHT`，
+  改一边必须同步另一边（模板已用 4 组画布/字数对账）。
 - 断行**不许拆词**：优先标点/语义边界，`URL`/英文单词/数字整段不可拆，装不下就整词下移；只有单个词
   本身比整行还宽才从中间硬切并 WARN。因此一句话若放不进 2 行，`subtitles.py srt/ass/burn` 会**直接
   ERROR**（不是静默多一行）：回去删字，或调大 `captions.maxChars`、调小字号对应的画面文案。
+  **画面内字幕**的折行同样按这套规则走 `src/lib/captionText.ts`（`subtitles.py::_fold_text` 的 TS 移植，
+  两组实现用 9 个句子对账过），改折行要两边一起改。
+- ASS 文本里的 `{ } \N \n \h` 是语义字符：拼装字幕一律走 `subtitles._escape_ass_text()`，不要图省事自己
+  把 `\` 换成 `\\`（实测无效，第二个反斜杠 + 字母会重新组成转义），细节见 `references/踩坑记录.md` #43。
 - 字幕有两条路：**画面内字幕**（`<Caption>` 组件，跟着画面一起渲染）和**字幕文件 / 硬字幕**
   （`scripts/subtitles.py`，给平台上传用，或平台不认软字幕时烧进画面）：
 
@@ -190,6 +196,10 @@ python scripts/mix.py --env      # 打印成品响度包络，检查人声是否
 
 硬性要求：每句人声比该处音乐高 **≥6 dB**（脚本里的 `vo_margin`）；母带 **-14 LUFS / 真峰值 -1 dBFS**；
 片头 0.3 秒淡入、片尾 0.6 秒淡出；除转场瞬间外不允许出现 ≥1.0 秒的空档。
+
+**母带后量不到成品响度 = 混音失败**（闸门失效不等于通过）：`mix.py` 会用 ebur128 复测成品响度，测不到、
+或偏离 -14 LUFS 超过 2 dB，都直接非零退出并打印 `ERROR`。这条需要**完整版 ffmpeg（含 ebur128 滤镜）**：
+Remotion 自带的 compositor 精简构建没有 ebur128，会报「母带后响度复测失败」——这是环境限制，装完整 ffmpeg 再混。
 
 **母带的两种模式会让「打印的余量」和「成片的余量」不一致**：逐句余量是在**母带前**总线上量的，
 而 -14 LUFS / 真峰值 -1 dBFS 只允许 13 dB 的 PLR（真峰值 − 响度）。母带前真峰值贴着 0 dBFS
@@ -220,6 +230,12 @@ python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预
   `Segmentation fault`、`core dumped` / `MODULE_NOT_FOUND`、`Cannot find module`、`Unable to resolve module`（依赖或路径真找不到）/
   `Invalid data found when processing input`、`Could not find codec parameters`（ffmpeg 读不了输入）/
   `chrome-headless-shell` 非零退出。判据实现见 `template/scripts/check_video.py` 的 `_RX_LOG_STRONG`。
+- **超时按失败语义判、不按裸词判**：`TimeoutError` / `timed out` / `timeout … exceeded|expired|waiting|after|while|during`
+  才算失败；配置回显 `Timeout: 30000 ms` 不算（`check_video.py` 的 `_RX_LOG_TIMEOUT`，R5-CV-02）。
+- **日志编码**：不要用 PowerShell `>` 写日志（默认 UTF-16）；脚本会识别 UTF-16 BOM / 无 BOM 的 UTF-16 日志
+  并打 WARN 说明（`_decode_log_bytes`），但仍推荐 `--log` 用 UTF-8（`... | Out-File -Encoding utf8 out/render.log`）。
+- **音轨必须覆盖全片**：有音轨但比视频短 >0.3 秒 = ERROR（片尾静音 silencedetect 只查音频流内部，查不到这段；
+  `check_video.py` 的 `AUDIO_SHORTER_TOLERANCE_S`）；渲染命令别用 `-shortest` 截音轨。
 
 ### 阶段 10 · 渲染与交付
 
@@ -243,14 +259,20 @@ python scripts/deliver.py cover out/final-1080p.mp4 --title "每天记账要花�
 ```
 
 - `check` 按平台给硬限制与推荐值；**抖音、小红书的官方口径脚本抓不到**，那部分标「需人工确认」
-  （只提示、不参与判定，不会因此刷 WARN）；第三方汇总口径才按 WARN 处理，交付时必须说清"需人工确认"。
+  （只提示、不参与判定，不会因此刷 WARN）；第三方汇总口径才按 WARN 处理，交付时必须说清"需人工确认"；
+  视频号的码率 / 画幅官方原文用的是「建议」，标「官方建议值（非硬限制）」只判 WARN，不算拒收门槛
+  （视频号分辨率是「本项目规范」——AGENTS 的 1080×1920 交付要求，不是平台硬限制）。
 - `cover` 出三张 1080×1920 候选封面 + 联系表：文字自动排进安全区、越界自动缩字号；
-  封面文字可能压住画面自带的字，脚本用亮像素比例粗判并提示换 `--position bottom|middle|top`，
+  重跑时会把上一轮本功能留下的 `cover-*.png` 与 `_{片子名}-frame-*.png` 先清掉（只删匹配到的文件，不动其它产物），
+  避免旧候选混进交付目录；封面文字可能压住画面自带的字，脚本用亮像素比例粗判并提示换 `--position bottom|middle|top`，
   最终**必须逐张看图**再交（`references/校验清单.md` 的 B8）。
 - 需要硬字幕时：先 `npm run render:1080:nosubs` 再 `subtitles.py burn`（见阶段 7），
   烧完的片子要塞进 `check_video.py` 复查一遍。
 
 交付时告诉用户三件事：成片路径、网页版地址、以及"哪里还可以改、改一处要重做哪些步骤"。
+
+网页版已加启动兜底：`web/main.tsx` 的 `<BootErrorBoundary>` + `getStaticFiles()` 返回 `undefined` 的守卫（R5-TPL-01）；
+页面若显示「网页版加载失败」，先 `npm run web:build` 重新构建，再看浏览器 console（细节见 `references/踩坑记录.md` #46）。
 
 ### 阶段 11 · 改版
 
@@ -317,7 +339,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
     "bar": 1.846,         // 每小节秒数（通常 4 beat）
     "drop": 3.69,         // 第一次爆发的视频时间
     "gain": 0.6,             // 音乐床电平；人声余量不足先降它（PLR 过高多是人声峰值顶的，见阶段 8）。只在 mix.py 混音时生效，成片播放不要再乘一次
-    "segments": [ { "at": 22.0, "from": 12.0, "to": 30.0 } ]  // 可选：剪接片段
+    "segments": [ { "at": 22.0, "from": 12.0, "to": 30.0 } ]  // 可选：剪接片段。结构由 check_assets 校验：必须是数组；每段是对象；at/from 是非负数字；给了 to 必须 from < to。at 超出片长的段由 mix.py 处理（摆不进片子会报错/跳过，不静默）
   },
   "scenes": [             // 必须按 start 升序、首尾相接、不留缝
     { "name": "hook",  "start": 0.0,  "end": 4.5,  "note": "痛点开场" },
@@ -344,6 +366,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
 ```
 
 约定：`at`、`start`、`end`、`drop` 一律是**秒**（浮点）；`beat/bar` 是**秒**；帧数由脚本或组件用 `Math.round(秒 × fps)` 换算。
+`voice.lines` 每句必须有 `id/scene/at/text`（缺字段、非对象行、`voice.lines` 不是数组都是 **ERROR**，由 `check_assets.py` 校验，不再默认 `at = 0`）。
 
 ## 6. 技术栈与脚本速查
 
@@ -354,34 +377,40 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 没装 pnpm 可以 `npm install` 兜底（`doctor.py` 只报 WARN），但 npm 不认 `allowBuilds`，esbuild 需要手动确认。
 模板依赖：Remotion 4 + React 19 + Vite（网页播放版）；不引入 Tailwind、GSAP 等额外框架，画面用内联样式 + 少量全局 CSS。
 
+可选 `.env`：只有 `tts.py`（`ELEVENLABS_API_KEY`）与 `doctor.py`（体检时读同一个 key）会解析**项目根**的 `.env`；
+`capture.py` / `music.py` 等其余脚本只读**真实环境变量**（`os.environ`）。所以代理 / 镜像 / `PLAYWRIGHT_DOWNLOAD_HOST`
+这类设置要写成环境变量（PowerShell `$env:NAME=...`、bash `export NAME=...`），写进 `.env` 不会生效。
+`.env.example` 是模板，复制成 `.env` 后填 key 即可（`.env` 已在 `.gitignore` 里）。
+
 | 脚本 | 用途 | 关键参数 |
 | --- | --- | --- |
 | `scripts/doctor.py` | 环境体检，只查不装 | 无 |
 | `scripts/capture.py` | Playwright 真实网页截图（默认 2 倍图） | `<url> <name> [--factor 2] [--at 0,900,1800] [--full 3600] [--device iphone] [--hide 选择器] [--eval JS] [--wait 1.5] [--quality 92] [--keep-avatar] [--login] [--out out/shots]` |
 | `scripts/media.py` | 素材整理：抓 Markdown 里全部图片、拼联系表、按实际裁切预览、限宽、列尺寸 | `grab <md...> -o <dir>` / `sheet <dir> [--cols 4]` / `crop <out> <file...> [--ratio 9:16]` / `prepare <src> <dst> [--max 2800]` / `info <dir>` |
-| `scripts/music.py` | 配乐：下载/分析/找节拍/逐小节能量/剪段 | `analyze <file...>` / `grid <file> [--from --to]` / `bars <file> --beat --downbeat --offset` / `cut <in> <out> --start --dur` |
-| `scripts/tts.py` | 配音：生成、多音色试听、时长与拖音审核 | `all` / `one <id>` / `audit` / `voices [--lang zh]` / `preview --text "..."` / `stt <file>`（需可选依赖） |
-| `scripts/mix.py` | 混音：放人声、ducking、音效、母带 | `[--no-vo]` / `--env` |
-| `scripts/subtitles.py` | 字幕：导出 SRT / ASS，烧成硬字幕或软字幕 | `srt [--out out/subtitles/zh.srt]` / `ass [--out out/subtitles/zh.ass]` / `burn [<mp4>] [-o out/final-1080p-hard.mp4] [--soft] [--preview <秒>]` |
+| `scripts/music.py` | 配乐：下载/分析/找节拍/逐小节能量/剪段 | `analyze <file...>` / `grid <file> [--from --to]` / `bars <file> --beat --downbeat --offset` / `cut <in> <out> --start --dur` / `get <url> [--name camel]` |
+| `scripts/tts.py` | 配音：生成、多音色试听、时长与拖音审核 | `all [--only 01,03]` / `one <id>` / `audit` / `voices [--lang zh]` / `preview --text "..."` / `stt <file>`（需可选依赖） |
+| `scripts/mix.py` | 混音：放人声、ducking、音效、母带（母带后响度复测失败 = ERROR） | `[--no-vo]` / `--env` / `--no-sfx` / `[--out <路径>]` / `--selftest` |
+| `scripts/subtitles.py` | 字幕：导出 SRT / ASS，烧成硬字幕或软字幕 | `srt [--out out/subtitles/zh.srt]` / `ass [--out out/subtitles/zh.ass] [--fontsize N]` / `burn [<mp4>] [-o out/final-1080p-hard.mp4] [--soft] [--preview <秒>]` |
 | `scripts/fonts.py` | 字体子集化与内嵌（换机器不缺字） | `subset [--role all\|display\|body\|mono] [--out public/fonts] [--name promo-subset] [--weight 700] [--flavor auto\|woff2\|ttf\|otf]` / `check` |
-| `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` |
+| `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` / `--selftest` |
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` / `--selftest`（纯函数自测，不读素材） |
-| `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log]` / `--selftest` |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款） | 无 |
+| `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log] [--fps] [--lufs-min] [--lufs-max] [--silence]` / `--selftest` |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；6 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查） | 无 |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
-| `scripts/sync_template.py` | 用新版模板更新已有项目 | `[--diff] [--apply] [--force]` |
+| `scripts/sync_template.py` | 用新版模板更新已有项目（同步范围与「未纳入比对」清单见 `--help`） | `[--diff] [--apply] [--force]` / `--selftest` |
 
 ## 7. 校验闸门与退出码
 
 | 闸门 | 通过条件 |
 | --- | --- |
 | `doctor.py` | 无 MISSING（WARN 可接受） |
-| `scripts/selftest.py` | 3 个脚本的 `--selftest` + Python 3.9 写盘 smoke（真写 SRT）/ API 扫描全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
-| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
-| `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`）；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
+| `scripts/selftest.py` | 6 个脚本的 `--selftest`（`check_assets` / `check_video` / `mix` / `doctor` / `deliver` / `sync_template`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描 / 源码 AST 扫描容忍 UTF-8 BOM，共 9 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
+| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空、`at` 是数字——不再默认 `at = 0`）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
+| `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；**音轨时长覆盖全片**（音轨比视频短 >0.3 秒 = ERROR，片尾静音 silencedetect 查不到）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`），日志会按字节识别 UTF-8/UTF-16 编码（UTF-16 打 WARN 留痕），超时只认失败语义（`_RX_LOG_TIMEOUT`）不认配置回显；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
+| `mix.py` | 母带后响度复测成功（-14 LUFS ±2 dB）；**测不到成品响度 = ERROR**（闸门失效不等于通过；需要完整版 ffmpeg 的 ebur128，compositor 精简构建跑不通）；每句人声比音乐高 ≥6 dB |
 | `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO`：脚本已自动截掉低能量拖音，重跑仍报说明尾巴能量不低，需人工试听确认） |
 | `fonts.py check` | 0 ERROR：片子用到的每个字符都有字形（内嵌子集或系统字体都算） |
-| `deliver.py check` | 目标平台 0 ERROR；「需人工确认」项（抖音/小红书的官方码率、体积口径）只提示、不参与判定；第三方汇总口径 WARN 由人逐条判断；音轨/视频流是「本项目规范」不是平台限制 |
+| `deliver.py check` | 目标平台 0 ERROR；「需人工确认」项（抖音/小红书的官方码率、体积口径）只提示、不参与判定；「推荐值（第三方汇总，非官方）」WARN 由人逐条判断；「官方建议值（非硬限制）」（视频号的码率 / 画幅：官方原文用词是「建议」，不是拒收门槛）只判 WARN；「本项目规范（AGENTS.md）」是硬规矩（如必须有音轨/视频流、视频号分辨率按 AGENTS 的 1080×1920）；音轨/视频流不是平台限制 |
 | `subtitles.py srt/ass/burn` | 折行超过 `captions.maxLines` 直接 ERROR（最多 2 行是硬要求，不是 WARN）；字号自动压进左右安全区；burn 完的片子仍要过 `check_video.py`（音轨用 `-c:a copy` 保留）；烧之前画面里必须没有自带字幕 |
 | 人工审图 | 联系表逐张看过，`references/校验清单.md` 全部打勾 |
 

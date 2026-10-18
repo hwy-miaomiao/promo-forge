@@ -29,6 +29,10 @@
 ``official``
     **平台官方文档直接查到的数字**，可以直接当硬限制用。
 
+``suggestion``
+    **平台官方原文用「建议」的推荐值**（例如视频号「建议 10Mbps 及以上」）：数字有官方
+    出处，但不是拒收门槛；脚本只做提示、判 WARN，绝不判 ERROR。
+
 ``thirdparty``
     **第三方汇总/博客**，方向可信、数字可能过期；脚本按「WARN 而非 ERROR」处理，
     并在输出里明确标出这条不是官方口径。
@@ -58,6 +62,10 @@
   —— 抖音 4GB / 15 分钟 / 推荐 9:16 1080×1920；小红书 5GB / 15 分钟 / 推荐
   9:16 或 3:4 1080×1920；视频号 1GB / 60 分钟（与上面的官方页不一致，故视频号一律
   以官方页为准）。
+
+按上面这份原文，视频号的 ``aspect`` / ``vbitrate`` 官方用词是「**建议**」，所以标
+``suggestion``、只判 WARN，输出里不写「硬限制 / 要求 / 超了会被拒收」；官方原文没有给
+分辨率数字，1080×1920 来自 AGENTS.md 第 1 节的本项目规范，所以标 ``project``。
 
 **没有查到的**（脚本标 ``unknown`` 并打印「需人工确认」，绝不编数字）：
 抖音与小红书的**官方**体积上限、时长上限、码率建议——两家的帮助中心正文都是
@@ -295,9 +303,11 @@ PLATFORMS: Dict[str, Dict[str, Any]] = {
         "dur": (3.0, 3600.0),
         # 官方：手机端最大 2G，助手端最大 20G —— 取更严的手机端 2G。
         "size": (2 * 1024 ** 3,),
+        # 官方原文是「建议上传标准比例的视频（16:9 或 9:16）」——是建议，不是拒收门槛。
         "aspect": ((0.33, 3.0), "官方建议上传标准比例（16:9 或 9:16）"),
+        # 官方原文没有给分辨率数字；1080×1920 来自 AGENTS.md 第 1 节的本项目规范。
         "res": (1080, 1920),
-        # 官方：「建议在 10Mbps 及以上」。
+        # 官方：「建议在 10Mbps 及以上」——是建议，不是拒收门槛。
         "vbitrate": (10_000_000, None),
         "codecs": ("h264", "hevc"),
         # 官方：Windows 助手端一般仅支持 H.264（H.265 需装 HEVC 扩展），故 Windows 上只认 h264。
@@ -307,10 +317,11 @@ PLATFORMS: Dict[str, Dict[str, Any]] = {
                          "体积 手机端 ≤2G / 助手端 ≤20G；码率建议 ≥10Mbps；编码 H.264（Windows 助手端）或 H.265；暂不支持 HDR",
              "https://findeross.weixin.qq.com/cgi-bin/mmfindernodelivecrmwebbroker-bin/helper-center/pages/DCbKPGzZkvVHcIr6"),
         ],
-        "conf": {"dur": "official", "size": "official", "aspect": "official",
-                 "res": "official", "vbitrate": "official"},
-        "advice": "视频号官方要求码率 ≥10 Mbps，比抖音/小红书都高；从 out/final-1080p.mp4 直接传通常够，"
-                  "如果低于 10 Mbps 建议用 render:4k 或提高 remotion.config.ts 的码率重渲",
+        "conf": {"dur": "official", "size": "official", "aspect": "suggestion",
+                 "res": "project", "vbitrate": "suggestion"},
+        "advice": "视频号官方建议码率 ≥10 Mbps（官方原文用词是「建议」，不是拒收门槛），"
+                  "比抖音/小红书都高；从 out/final-1080p.mp4 直接传通常够，"
+                  "如果低于建议值建议用 render:4k 或提高 remotion.config.ts 的码率重渲",
     },
     "shorts": {
         "name": "YouTube Shorts",
@@ -341,10 +352,24 @@ PLATFORM_ORDER = ("douyin", "xiaohongshu", "shipinhao", "shorts")
 
 CONF_LABEL = {
     "official": "平台硬限制（官方文档）",
+    "suggestion": "官方建议值（非硬限制）",
     "thirdparty": "推荐值（第三方汇总，非官方）",
     "unknown": "需人工确认（没查到确切数字）",
     "project": "本项目规范（AGENTS.md，不是平台限制）",
 }
+
+#: 每次 check 结尾打印的口径说明。放在这里（而不是 cmd_check 里硬编码日志）是为了让
+#: ``--selftest`` 能断言「CONF_LABEL 的每一档都有对应说明、且建议档不许写成硬限制」。
+CONF_LEGEND = (
+    "「平台硬限制（官方文档）」= 官方帮助页写明的数字，超了会被拒收；",
+    "「官方建议值（非硬限制）」= 官方原文用「建议」的推荐值，不达标不会被拒收，"
+    "脚本只提示、不判 ERROR；",
+    "「推荐值（第三方汇总，非官方）」= 只做方向参考，脚本按 WARN 处理，"
+    "投稿前请到平台页面复核；",
+    "「需人工确认（没查到确切数字）」= 脚本不编数字，不参与判定；",
+    "「本项目规范（AGENTS.md，不是平台限制）」= 我们自己的硬规矩（如必须有音轨/视频流），"
+    "不是平台参数。",
+)
 
 
 # ===========================================================================
@@ -814,8 +839,12 @@ def _check_fps(m: Media, p: Dict[str, Any]) -> Check:
     if fps >= 24:
         return _mk("帧率", f"{fps:g}fps", "≥24fps", "WARN", "thirdparty",
                    "低于 30fps 运动镜头会顿；只有纯文字/图表为主的片子才可以接受")
-    return _mk("帧率", f"{fps:g}fps", "≥24fps", "ERROR", "thirdparty",
-               "低于 24fps 平台会当成异常帧率做补帧，画面会出现果冻感；请把 timing.json 的 fps 改回 60 并重渲")
+    # 低于 24fps 只 WARN：23.976 / 24 / 25 / 29.97 都是标准帧率，平台不会因此拒收；
+    # 而且平台帧率本来就没有官方硬限制出处（本表里 fps 一项是 thirdparty），
+    # 按 docstring 的承诺，thirdparty 口径最多 WARN，不许判 ERROR。
+    return _mk("帧率", f"{fps:g}fps", "≥24fps", "WARN", "thirdparty",
+               "低于 24fps（23.976 / 24 是标准帧率，平台一般照收）；但低于 30fps 运动镜头会顿，"
+               "本模板默认 60fps 更稳，建议把 timing.json 的 fps 改成 60 后重渲")
 
 
 def _check_bitrate(m: Media, p: Dict[str, Any]) -> Check:
@@ -842,14 +871,22 @@ def _check_bitrate(m: Media, p: Dict[str, Any]) -> Check:
             return _mk("码率", value, rule, "WARN", conf,
                        f"高于 {hi / 1_000_000:g} Mbps：平台必定二压，上传也慢；"
                        "1080p 给到 16 Mbps 已经足够，再高是白花体积")
-        return _mk("码率", value, rule, "OK", conf,
-                   "码率给足能少被压糊" if conf == "thirdparty" else "符合官方建议")
+        if conf == "suggestion":
+            ok_note = "符合官方建议值（官方原文用「建议」，不是拒收门槛）"
+        elif conf == "thirdparty":
+            ok_note = "码率给足能少被压糊"
+        else:
+            ok_note = "符合官方要求"
+        return _mk("码率", value, rule, "OK", conf, ok_note)
     shortfall = lo - m.video_bitrate
-    if conf == "thirdparty":
+    if conf == "suggestion":
+        low_note = (f"比官方建议值低 {shortfall / 1_000_000:.1f} Mbps"
+                    "（官方原文用「建议」，不是拒收门槛）；")
+    elif conf == "thirdparty":
         low_note = (f"比第三方汇总的建议值低 {shortfall / 1_000_000:.1f} Mbps"
                     "（非官方口径，只做方向参考）；")
     else:
-        low_note = f"比官方建议值低 {shortfall / 1_000_000:.1f} Mbps；"
+        low_note = f"比官方要求低 {shortfall / 1_000_000:.1f} Mbps；"
     if m.video_bitrate >= lo * 0.6:
         return _mk("码率", value, rule, "WARN", conf,
                    low_note + "从 out/final-1080p.mp4 直接传通常够，"
@@ -1078,10 +1115,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             log(f"    出处：{url}")
         log(f"  一句话建议：{p['advice']}")
     log("")
-    log("  说明：「平台硬限制（官方文档）」= 官方帮助页写明的数字，超了会被拒收；")
-    log("        「推荐值（第三方汇总，非官方）」= 只做方向参考，脚本按 WARN 处理，投稿前请到平台页面复核；")
-    log("        「需人工确认（没查到确切数字）」= 脚本不编数字，不参与判定；")
-    log("        「本项目规范（AGENTS.md）」= 我们自己的硬规矩（如必须有音轨/视频流），不是平台参数。")
+    log("  说明：")
+    for line in CONF_LEGEND:
+        log(f"    {line}")
 
     log("")
     log("=" * 78)
@@ -1599,6 +1635,44 @@ def _brand_accent_rgb(brand_cfg: Dict[str, Any]) -> Tuple[int, int, int]:
     return (int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16))
 
 
+def _cover_out_dir(value: str) -> Path:
+    """``--out`` 预检：已存在但不是目录时给干净 ``ERROR: ...``，而不是抛 FileExistsError traceback。"""
+    path = Path(value)
+    if path.exists() and not path.is_dir():
+        error(f"--out {value} 已存在且不是目录（是个文件）。换一个 --out，或先把它删掉/改名。")
+    return ensure_dir(path)
+
+
+#: 封面候选的文件名模式（本功能自己的固定产物）。
+COVER_CANDIDATE_RE = re.compile(r"^cover-\d+\.png$")
+
+
+def _cover_frame_re(base_name: str):
+    """中间帧的文件名模式：``_<mp4 文件名>-frame-<序号>.png``。"""
+    return re.compile(r"^_" + re.escape(base_name) + r"-frame-\d+\.png$")
+
+
+def _clean_stale_cover_outputs(out_dir: Path, base_name: str) -> List[Path]:
+    """删掉同一输出目录里上一轮留下的 ``cover-N.png`` / ``_<stem>-frame-N.png``。
+
+    为什么需要：``--frames`` 变少时旧的 ``cover-2.png`` / ``cover-3.png`` 不会被本轮覆盖；
+    它们留在目录里会被误当成本轮候选（换过标题时还是旧文案），而日志与联系表只反映本轮。
+    只匹配本功能生成的文件名（固定前缀 + 序号），用户自己放进目录的其它文件一律不动。
+    """
+    frame_re = _cover_frame_re(base_name)
+    removed: List[Path] = []
+    for path in sorted(out_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if COVER_CANDIDATE_RE.match(path.name) or frame_re.match(path.name):
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError as exc:
+                warn(f"清理上一轮残留 {path.name} 失败：{exc}")
+    return removed
+
+
 def cmd_cover(args: argparse.Namespace) -> int:
     _pil()
     if not has_cmd("ffmpeg"):
@@ -1632,8 +1706,8 @@ def cmd_cover(args: argparse.Namespace) -> int:
 
     m = Media(mp4)
     seconds = _parse_frames(args.frames, m.duration)
-    out_dir = ensure_dir(args.out)
     base_name = mp4.stem
+    out_dir = _cover_out_dir(args.out)
 
     # 排版跟具体哪一帧无关，先算一次：三张封面字号一致，也不会重复报字体缺字警告
     layout = _layout_cover(title, brand, max_chars, args.position, max_lines)
@@ -1657,6 +1731,13 @@ def cmd_cover(args: argparse.Namespace) -> int:
            "top": "（贴安全区上边）"}[args.position])
     log(f"安全区：上 {SAFE_TOP:.0%} / 下 {SAFE_BOTTOM:.0%} / 左 {SAFE_LEFT:.0%} / 右 {SAFE_RIGHT:.0%}"
         f"（AGENTS.md 第 4 节；右侧留给平台互动按钮）")
+
+    # 同一 --out 目录重跑时，上一轮帧数更多会留下旧的 cover-N.png / 中间帧（换过标题时还是旧文案）。
+    # 先清掉这些本功能固定命名的文件再写，保证目录里只剩本轮候选。
+    stale = _clean_stale_cover_outputs(out_dir, base_name)
+    if stale:
+        log(f"已清理上一轮残留：{len(stale)} 个文件（"
+            + "、".join(path.name for path in stale[:6]) + ("…" if len(stale) > 6 else "") + "）")
     log("")
 
     results: List[Dict[str, Any]] = []
@@ -1824,6 +1905,259 @@ def cmd_cover(args: argparse.Namespace) -> int:
 
 
 # ===========================================================================
+# 自测（--selftest / scripts/selftest.py）
+#
+# 纯离线：不读素材、不需要 ffmpeg / ffprobe / Pillow、不联网。
+# 覆盖交付线最容易悄悄回归的纯逻辑：平台表 schema、conf 档位 → 文案映射、
+# 帧率/码率阈值、--frames 解析与折行、--out 预检、旧封面清理。
+# ===========================================================================
+
+class _FakeMedia:
+    """给 ``_check_*`` 用的最小 Media 替身（不跑 ffprobe，保证自测不依赖 ffmpeg）。"""
+
+    def __init__(self, width: int = 1080, height: int = 1920, fps: float = 60.0,
+                 video_bitrate: Optional[int] = 8_000_000, duration: float = 45.0,
+                 codec: str = "h264", pix_fmt: str = "yuv420p",
+                 audio_codec: str = "aac", file_size: int = 8_900_000,
+                 lufs: Optional[float] = -14.0, true_peak: Optional[float] = -1.0) -> None:
+        self.width = width
+        self.height = height
+        self.has_video = width > 0 and height > 0
+        self.fps = fps
+        self.video_bitrate = video_bitrate
+        self.duration = duration
+        self.codec = codec
+        self.pix_fmt = pix_fmt
+        self.audio_codec = audio_codec
+        self.file_size = file_size
+        self.lufs = lufs
+        self.true_peak = true_peak
+
+    @property
+    def aspect(self) -> float:
+        return (self.width / self.height) if self.height else 0.0
+
+    @property
+    def aspect_label(self) -> str:
+        for label, ratio in (("9:16", 9 / 16), ("16:9", 16 / 9), ("3:4", 3 / 4),
+                             ("4:3", 4 / 3), ("1:1", 1.0)):
+            if self.aspect and abs(self.aspect - ratio) / ratio < 0.005:
+                return label
+        return f"{self.aspect:.3f}"
+
+
+def _selftest() -> int:
+    import contextlib
+    import io
+    import tempfile
+
+    failures: List[str] = []
+    total = 0
+
+    def check(name, func) -> None:
+        nonlocal total
+        total += 1
+        try:
+            note = func()
+        except AssertionError as exc:
+            failures.append(f"{name}：{exc}")
+        except SystemExit as exc:  # error() 的预期退出不该在这里冒出来
+            failures.append(f"{name}：不该退出的地方退出了（SystemExit {exc.code}）")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{name}：未预期异常 {type(exc).__name__}: {exc}")
+        else:
+            print(f"    OK：{name}" + (f" —— {note}" if note else ""))
+
+    def platform_schema() -> str:
+        required = ("name", "dur", "size", "aspect", "res", "vbitrate", "codecs",
+                    "audio_codecs", "src", "conf", "advice")
+        assert set(PLATFORM_ORDER) == set(PLATFORMS), "PLATFORM_ORDER 与 PLATFORMS 不一致"
+        for key in PLATFORM_ORDER:
+            p = PLATFORMS[key]
+            missing = [field for field in required if field not in p]
+            assert not missing, f"{key} 缺字段 {missing}"
+            assert set(p["conf"]) == {"dur", "size", "aspect", "res", "vbitrate"}, \
+                f"{key} 的 conf 缺项或多项：{sorted(p['conf'])}"
+            for field, conf in p["conf"].items():
+                assert conf in CONF_LABEL, \
+                    f"{key}.{field} 的 conf={conf!r} 不在 CONF_LABEL 里"
+            for conf, _text, url in p["src"]:
+                assert conf in CONF_LABEL, f"{key} 的 src 里有未知 conf={conf!r}"
+                assert url.startswith("http"), f"{key} 的 src 出处不是 URL：{url}"
+            assert isinstance(p["dur"], tuple) and len(p["dur"]) == 2 and p["dur"][0] < p["dur"][1]
+            assert isinstance(p["res"], tuple) and len(p["res"]) == 2
+            assert isinstance(p["codecs"], tuple) and p["codecs"]
+            assert isinstance(p["audio_codecs"], tuple) and p["audio_codecs"]
+            assert isinstance(p["advice"], str) and p["advice"].strip()
+        return f"{len(PLATFORMS)} 个平台 schema 齐全、conf 档位合法"
+
+    def conf_text_mapping() -> str:
+        assert "建议" in CONF_LABEL["suggestion"]
+        for banned in ("平台硬限制", "拒收", "要求"):
+            assert banned not in CONF_LABEL["suggestion"], \
+                f"「官方建议值」标签里出现了「{banned}」：{CONF_LABEL['suggestion']}"
+        legend = "\n".join(CONF_LEGEND)
+        for conf, label in CONF_LABEL.items():
+            assert label in legend, f"CONF_LEGEND 漏了 {conf} 的说明"
+        assert "不会被拒收" in legend, "legend 没说明「建议」不拒收"
+        return "conf 标签与 legend 一一对应，建议档不写「平台硬限制/要求」"
+
+    def suggestion_checks() -> str:
+        p = PLATFORMS["shipinhao"]
+        assert p["conf"]["vbitrate"] == "suggestion", p["conf"]
+        assert p["conf"]["aspect"] == "suggestion", p["conf"]
+        assert p["conf"]["res"] == "project", p["conf"]
+        low = _check_bitrate(_FakeMedia(video_bitrate=1_260_000), p)
+        assert low.level == "WARN" and low.conf == "suggestion", \
+            f"视频号低码率应为 WARN/suggestion，实际 {low.level}/{low.conf}"
+        for banned in ("硬限制", "要求"):
+            assert banned not in low.advice, f"建议值文案里出现了「{banned}」：{low.advice}"
+        assert "建议" in low.advice, low.advice
+        ok = _check_bitrate(_FakeMedia(video_bitrate=12_000_000), p)
+        assert ok.level == "OK" and "建议" in ok.advice and "要求" not in ok.advice, ok.advice
+        aspect = _check_aspect(_FakeMedia(width=384, height=1920), p)
+        assert aspect.level == "WARN" and aspect.conf == "suggestion", \
+            f"视频号越界画幅应为 WARN（不是 ERROR），实际 {aspect.level}/{aspect.conf}"
+        extra_ok = _check_aspect(_FakeMedia(width=1920, height=1080), p)
+        assert extra_ok.level == "OK", f"视频号 16:9 在宽高比 0.33~3.0 内应 OK，实际 {extra_ok.level}"
+        res = _check_resolution(_FakeMedia(), p)
+        assert res.level == "OK" and res.conf == "project", \
+            f"视频号分辨率应为 OK/project，实际 {res.level}/{res.conf}"
+        return "视频号官方建议值只判 WARN，文案含「建议」不含「硬限制/要求」"
+
+    def fps_thresholds() -> str:
+        p = PLATFORMS["shipinhao"]
+        cases = ((23.976, "WARN"), (24.0, "WARN"), (25.0, "WARN"),
+                 (29.97, "WARN"), (30.0, "OK"), (60.0, "OK"))
+        for fps, expected in cases:
+            row = _check_fps(_FakeMedia(fps=fps), p)
+            assert row.level == expected, f"{fps:g}fps 期望 {expected}，实际 {row.level}"
+            assert row.level != "ERROR", f"{fps:g}fps 用 thirdparty 口径判了 ERROR"
+            assert row.conf == "thirdparty"
+        return "23.976/24/25/29.97fps 只 WARN，30/60fps OK（thirdparty 从不 ERROR）"
+
+    def unknown_conf_info() -> str:
+        p = PLATFORMS["douyin"]
+        row = _check_bitrate(_FakeMedia(video_bitrate=1_000_000), p)
+        assert row.level == "INFO" and row.conf == "unknown", f"{row.level}/{row.conf}"
+        size = _check_size(_FakeMedia(), PLATFORMS["shorts"])
+        assert size.level == "INFO", f"Shorts 体积 unknown 应 INFO，实际 {size.level}"
+        return "conf=unknown 的码率/体积只打 INFO，不参与判定"
+
+    def cover_frames_parse() -> str:
+        assert _parse_frames(None, 45.0) == list(DEFAULT_COVER_FRAMES), \
+            _parse_frames(None, 45.0)
+        assert _parse_frames("3.6,21.7", 45.0) == [3.6, 21.7]
+        assert _parse_frames("3.6，21.7", 45.0) == [3.6, 21.7], "中文逗号应兼容"
+        assert _parse_frames("999", 45.0) == [44.9], _parse_frames("999", 45.0)
+        for bad in ("abc", "-1"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    _parse_frames(bad, 45.0)
+                except SystemExit as exc:
+                    assert exc.code == 1, f"--frames {bad!r} 的退出码应为 1，实际 {exc.code}"
+                else:
+                    raise AssertionError(f"--frames {bad!r} 应该 ERROR 退出")
+        return "--frames 默认值/中文逗号/越界夹取/非法值退出码都正常"
+
+    def cover_helpers() -> str:
+        lines = _split_caption("每天记账要花十几分钟真的很烦人", 13)
+        assert len(lines) == 2 and all(len(line) <= 13 for line in lines), lines
+        assert _split_caption("", 13) == []
+        assert _brand_accent_rgb({"colors": {"accent": "#FF6B35"}}) == (255, 107, 53)
+        assert _brand_accent_rgb({}) == DEFAULT_BRAND_ACCENT
+        assert _brand_accent_rgb({"colors": {"accent": "bad"}}) == DEFAULT_BRAND_ACCENT
+        return "折行与品牌色解析（含兜底）正常"
+
+    def cover_out_precheck() -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            out_dir = _cover_out_dir(str(base / "covers"))
+            assert out_dir.is_dir(), f"正常 --out 应建目录，实际 {out_dir}"
+            existing_file = base / "not-a-dir.txt"
+            existing_file.write_text("x", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    _cover_out_dir(str(existing_file))
+                except SystemExit as exc:
+                    assert exc.code == 1, f"退出码应为 1，实际 {exc.code}"
+                else:
+                    raise AssertionError("--out 指向文件应该 ERROR 退出（不许抛 traceback）")
+        return "--out 已存在且是文件 → 干净 ERROR（不再抛 FileExistsError）"
+
+    def stale_cleanup() -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            keep = ["other.png", "cover-abc.png", "note.txt", "_other-frame-1.png"]
+            stale = ["cover-1.png", "cover-2.png", "cover-9.png",
+                     "_demo-frame-1.png", "_demo-frame-2.png"]
+            for name in keep + stale:
+                (out_dir / name).write_bytes(b"x")
+            removed = _clean_stale_cover_outputs(out_dir, "demo")
+            removed_names = {path.name for path in removed}
+            assert removed_names == set(stale), f"清理集合不对：{sorted(removed_names)}"
+            remaining = {path.name for path in out_dir.iterdir()}
+            assert remaining == set(keep), \
+                f"误删了不该动的文件：{sorted(remaining - set(keep))}"
+        return "重跑清理只删本功能固定命名的旧候选/中间帧，其它文件不动"
+
+    def system_exit_propagates() -> str:
+        """check_video 复用失败可以兜底，但 ``sys.exit()`` 这类真失败绝不能被兜底吞掉。
+
+        R5 复核（music.py:616 同类问题）：``_probe`` / ``_ebur128`` 的
+        ``except SystemExit: raise`` 必须真的把退出码传出去，否则下游测不出响度/读不出
+        ffprobe 时会静默 fallback 成「成功」，交付预检变成假绿。
+        """
+        class _FakeCV:
+            @staticmethod
+            def _ffprobe(path):
+                raise SystemExit(7)
+
+            @staticmethod
+            def _ffmpeg_af(path, filt):
+                raise SystemExit(8)
+
+        original = globals()["_load_check_video"]
+        try:
+            globals()["_load_check_video"] = lambda: _FakeCV()
+            for func, name, expected in ((_probe, "ffprobe", 7), (_ebur128, "ebur128", 8)):
+                try:
+                    func(Path("unused.mp4"))
+                except SystemExit as exc:
+                    assert exc.code == expected, f"{name} 的 SystemExit 退出码被改写：{exc.code}"
+                else:
+                    raise AssertionError(f"{name} 的 SystemExit 被吞了（会假成功、exit 0）")
+        finally:
+            globals()["_load_check_video"] = original
+        return "复用 check_video 抛 SystemExit 时原样传播（不会被兜底吞成假成功）"
+
+    named_checks = (
+        ("平台表 schema / conf 档位合法", platform_schema),
+        ("conf 档位 → 文案映射（建议档不写成硬限制）", conf_text_mapping),
+        ("视频号「官方建议值」只判 WARN", suggestion_checks),
+        ("帧率阈值：thirdparty 口径从不判 ERROR", fps_thresholds),
+        ("conf=unknown 只打 INFO、不参与判定", unknown_conf_info),
+        ("--frames 解析与越界夹取", cover_frames_parse),
+        ("封面折行 / 品牌色解析", cover_helpers),
+        ("cover --out 预检（指向文件时干净报错）", cover_out_precheck),
+        ("cover 重跑清理（只删本功能产物）", stale_cleanup),
+        ("SystemExit 不被兜底吞掉（复用 check_video 的失败要传播）", system_exit_propagates),
+    )
+    for name, func in named_checks:
+        check(name, func)
+
+    print("")
+    if failures:
+        for failure in failures:
+            sys.stderr.write(f"ERROR: selftest — {failure}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败（共 {total} 项）\n")
+        return 1
+    print(f"OK: selftest — 平台表 / conf 文案 / 帧率码率阈值 / --frames / 折行 / "
+          f"cover 预检与清理 全部通过（{total} 项）")
+    return 0
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 
@@ -1833,15 +2167,17 @@ HELP_TEXT = """promo-forge · 平台交付预检 + 封面候选（deliver.py，A
   python scripts/deliver.py check <mp4> [--platform douyin|xiaohongshu|shipinhao|shorts|all]
   python scripts/deliver.py cover [<mp4>] [--out out/covers] [--title "..."]
                                   [--position bottom|middle|top] [--frames 3.6,21.7,43.2]
+  python scripts/deliver.py --selftest
   python scripts/deliver.py --help
 
 check —— 平台交付预检
   对这一支 mp4 逐平台打印检查表：时长 / 分辨率与画幅 / 帧率 / 码率 / 文件体积 /
   是否有音轨 / 响度是否在 -16~-12 LUFS。每个平台给 OK / WARN / ERROR 与「怎么改」。
   有 ERROR 时非零退出（AGENTS.md 第 7 节）。
-  平台参数区分「平台硬限制（官方文档）」与「推荐值（第三方汇总，非官方）」；
-  没查到确切数字的标「需人工确认」，脚本不编数字；「本项目规范（AGENTS.md）」标记的是
-  我们自己的硬规矩（必须有音轨/视频流），不是平台限制。
+  平台参数区分「平台硬限制（官方文档）」「官方建议值（非硬限制）」
+  「推荐值（第三方汇总，非官方）」；没查到确切数字的标「需人工确认」，脚本不编数字；
+  「本项目规范（AGENTS.md）」标记的是我们自己的硬规矩（必须有音轨/视频流），不是平台限制。
+  官方原文用「建议」的参数（如视频号码率）只做提示、判 WARN，不写成「硬限制 / 要求」。
 
 cover —— 生成 3 张封面候选
   从成片里抽 3 帧（默认 3.6s hook 爆发 / 21.7s demo 图表 / 43.2s CTA），每帧生成一张
@@ -1858,9 +2194,14 @@ cover —— 生成 3 张封面候选
 安全区（AGENTS.md 第 4 节）
   上 10% / 下 18% / 左 6% / 右 14%（右侧留给平台互动按钮）。
 
+自测（--selftest）
+  纯函数自测（不读素材 / 不需要 ffmpeg / 不联网）：平台表 schema、conf 档位 → 文案映射、
+  帧率/码率阈值、--frames 解析、封面折行、--out 预检、旧封面清理。
+
 退出码
   check：0 = 所选平台 0 ERROR；1 = 有 ERROR（或缺依赖/文件不存在）。
   cover：0 = 每张封面都通过安全区判定；1 = 有封面文字越界，或依赖缺失。
+  --selftest：0 = 全部通过；1 = 有断言失败。
 
 例
   python scripts/deliver.py check out/final-1080p.mp4 --platform all
@@ -1882,6 +2223,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="不带子命令时会打印上面这段中文帮助。",
     )
     sub = p.add_subparsers(dest="cmd", metavar="子命令")
+    p.add_argument("--selftest", action="store_true",
+                   help="纯函数自测（不读素材/不需要 ffmpeg）：python scripts/deliver.py --selftest")
 
     c = sub.add_parser(
         "check", help="平台交付预检（抖音/小红书/视频号/Shorts）",
@@ -1921,8 +2264,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     _force_utf8()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--selftest" in raw_argv:
+        # 和其它脚本一致：--selftest 走纯函数自测，不解析子命令、不读素材
+        return _selftest()
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(raw_argv)
     if not getattr(args, "cmd", None):
         # AGENTS.md 第 6 节：不带子命令时打印中文帮助（而不是 argparse 的英文 usage 报错）
         log(HELP_TEXT)

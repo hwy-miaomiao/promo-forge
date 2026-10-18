@@ -38,7 +38,8 @@ promo-forge 把这件事拆成两半：
 ### 前置条件
 
 - **Node.js ≥ 18**、**Python ≥ 3.9**、**ffmpeg / ffprobe**（三样缺一不可）
-- 可选：`ELEVENLABS_API_KEY`（想要更自然的音色再装）
+- 可选：`ELEVENLABS_API_KEY`（想要更自然的音色再装）。把 `template/.env.example` 复制成**项目根**的 `.env` 再填 key；
+  只有 `tts.py` / `doctor.py` 解析这份 `.env`，代理、镜像等设置要写成真实环境变量（PowerShell `$env:NAME=...`）才生效。
 
 ```bash
 git clone https://github.com/hwy-miaomiao/promo-forge.git
@@ -123,15 +124,15 @@ promo-forge/
 | `scripts/media.py` | 素材整理：抓 Markdown 里的图、拼联系表、按实际裁切预览、限宽、列尺寸 |
 | `scripts/music.py` | 配乐：BPM / beat / bar / downbeat / 逐小节能量分析、剪段、直链下载 |
 | `scripts/tts.py` | 配音：免费 edge-tts（或 ElevenLabs）、多音色试听、时长与拖音审核、可选 STT 反查 |
-| `scripts/mix.py` | 混音：人声归一化、ducking、转场音效、两遍 loudnorm 母带到 -14 LUFS |
+| `scripts/mix.py` | 混音：人声归一化、ducking、转场音效、两遍 loudnorm 母带到 -14 LUFS；母带后响度复测失败直接 ERROR |
 | `scripts/subtitles.py` | 字幕：导出 SRT / ASS（样式与画面一致），或把字幕烧进画面（软字幕可选） |
 | `scripts/fonts.py` | 字体子集化：把片子里用到的字从系统字体抽成 300 KB 左右的子集并内嵌，换机器不缺字 |
-| `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格，并出三张候选封面 |
-| `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口 |
-| `scripts/check_video.py` | 成片闸门：规格、音轨、响度、空档、渲染日志报错 + 逐场景抽帧联系表 |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：三个闸门的 `--selftest` + Python 3.9 写盘/API 兼容检查） |
+| `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格（视频号的官方「建议值」只判 WARN），并出三张候选封面 |
+| `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口、`voice.lines` / `music.segments` 结构 |
+| `scripts/check_video.py` | 成片闸门：规格、音轨（含是否覆盖全片）、响度、空档、渲染日志（编码 / 超时语义）+ 逐场景抽帧联系表 |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：6 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查） |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
-| `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖） |
+| `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖；`--help` 会列出同步范围与「未纳入比对」清单） |
 
 `timing.json` 是整支片子的唯一事实来源：帧率、画幅、时长、场景窗口、beat/bar/drop、旁白逐句配置、品牌配色全在里面，TypeScript 与 Python 两侧共读它，改一处全链路生效。
 
@@ -140,12 +141,12 @@ promo-forge/
 脚本里那些容易写错的纯函数逻辑（注释剥离、渲染日志强信号、时间/响度解析、字幕折行、版本解析等）有一组自测，不依赖素材、不需要 ffmpeg、不联网，一条命令全跑：
 
 ```bash
-python template/scripts/selftest.py    # 三个脚本的 --selftest + Python 3.9 写盘/API smoke；全过退出码 0
+python template/scripts/selftest.py    # 6 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 9 项）；全过退出码 0
 ```
 
-每个脚本也能单独跑：`python scripts/check_assets.py --selftest`、`python scripts/check_video.py --selftest`、`python scripts/doctor.py --selftest`。失败会打印 `ERROR: selftest — ...` 并以非零退出。
+每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`mix.py`、`doctor.py`、`deliver.py`、`sync_template.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
 
-除三个脚本自测外，`selftest.py` 还会做两项 Python 3.9 兼容检查：真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径），再用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）。它们必须由 CI 的 3.9 格真正跑过才算数。
+除 6 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
 
 CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
 
@@ -184,7 +185,8 @@ CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 f
 
 **怎么知道能不能投抖音 / 小红书？** `python scripts/deliver.py check out/final-1080p.mp4 --platform all`
 会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条标「需人工确认」——只提示、不参与判定，不会因此刷 WARN；
-封面用 `python scripts/deliver.py cover out/final-1080p.mp4 --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图（`<mp4>` 省略时脚本不报错，会静默套用默认值 `out/final-1080p.mp4`）。
+视频号那几条官方原文用「建议」的（码率 / 画幅）标「官方建议值（非硬限制）」只判 WARN，不是拒收门槛；标「本项目规范（AGENTS.md）」的才是我们自己的硬规矩（必须有音轨/视频流等）。
+封面用 `python scripts/deliver.py cover out/final-1080p.mp4 --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图；重跑时会先清掉上一轮本功能留下的 `cover-*.png` / `_{片子名}-frame-*.png`，不会误删其它文件（`<mp4>` 省略时脚本不报错，会静默套用默认值 `out/final-1080p.mp4`）。
 
 ## 参与贡献
 

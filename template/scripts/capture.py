@@ -21,11 +21,13 @@
     0 = 截图完成（可能有 WARN）
     1 = 缺 playwright / 浏览器、打不开页面、一张都没截成、有 --eval 执行失败、
         --login 在非交互终端里跑（没法等你按回车，见 V5）
+    2 = 命令行参数写错（例如 --factor 不是有限正数；argparse 的标准行为也是 2）
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -352,8 +354,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         viewport = DEFAULT_VIEWPORT
         ua = DEVICES["desktop"]["ua"]
         factor = float(args.factor) if args.factor is not None else DEFAULT_FACTOR
-    if factor <= 0:
-        C.error(f"--factor 必须 > 0，现在是 {factor}")
+    if not math.isfinite(factor) or factor <= 0:
+        # 只查 `<= 0` 挡不住 nan/inf（nan <= 0 是 False），随后 368 行的
+        # int(viewport * factor) 会抛 ValueError/OverflowError 裸 traceback、
+        # 没有 ERROR: 行（审计实测）。--factor 是命令行参数，约定退出码 2。
+        C.error(f"--factor 必须是有限正数（> 0），现在是 {args.factor!r}"
+                "（默认 2；不要传 nan/inf）", code=2)
     # 清晰度下限按设备预设选：手机截图在片子里只占 300~500 逻辑像素宽，
     # 拿 1440 卡 1170/1082 会误报（V4）。见 MIN_USEFUL_WIDTH_BY_DEVICE。
     min_width = MIN_USEFUL_WIDTH_BY_DEVICE.get(args.device or "", MIN_USEFUL_WIDTH)

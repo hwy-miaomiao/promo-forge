@@ -183,6 +183,16 @@ def _loudness_deviation_fail(integrated) -> bool:
             and abs(float(integrated) - TARGET_LUFS) > LOUDNESS_DEVIATION_FAIL_DB + 1e-9)
 
 
+def _loudness_gate_fail(integrated) -> bool:
+    """母带响度闸门：量不到成品响度也按失败 —— 闸门失效不等于通过（R5-MX-01）。
+
+    旧实现只用 `_loudness_deviation_fail`，而它对 None 返回 False：母带后 ebur128 复测
+    失败时只打一条 WARN，脚本照样退 0 交付 —— 成品响度未知，闸门等于不存在。
+    `check_video.py` 对同一情形（量不出响度）是 ERROR，这里对齐。
+    """
+    return integrated is None or _loudness_deviation_fail(integrated)
+
+
 def _margin_threshold_db(master_mode: str) -> float:
     """母带模式 → 人声余量阈值。回落时按 AGENTS.md 阶段 8 的「再留 2 dB」用 8 dB。"""
     return (VO_MARGIN_PLR_FALLBACK_DB if master_mode == MASTER_MODE_PLR_FALLBACK
@@ -558,11 +568,15 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
         log(f"配乐：{_rel(music_path)} · 按 music.segments 剪接（{len(segments)} 段，交叉淡化 {SEGMENT_XFADE_S*1000:.0f}ms）")
         placed_count = 0
         skipped = 0
+        # 坏段一律 ERROR（R5-CA-03）：以前只 WARN + 跳过，timing.json 写坏时成片会
+        # 静默丢掉一段配乐；这里与 check_assets.py 的 music.segments 结构校验对齐。
         for index, seg in enumerate(segments):
             if not isinstance(seg, dict):
-                warn(f"music.segments[{index}] 不是对象，已跳过：{seg!r}")
-                skipped += 1
-                continue
+                error(
+                    f"music.segments[{index}] 应该是对象（{{at, from, to}}），"
+                    f"现在是 {type(seg).__name__}：{seg!r}。坏段不能静默跳过 —— "
+                    "少摆一段，成片就少一段配乐"
+                )
             at = _num(seg, "at", 0.0, f"music.segments[{index}]")
             start = _num(seg, "from", 0.0, f"music.segments[{index}]")
             stop = seg.get("to", None)
@@ -572,15 +586,19 @@ def _build_music(np, timing: dict, total_samples: int, music_path: Path):
                 int(round(_num(seg, "to", 0.0, f"music.segments[{index}]") * SR)),
             )
             if src_end <= src_start:
-                warn(f"music.segments[{index}] 的 from/to 区间为空（from={start}, to={stop}），已跳过")
-                skipped += 1
-                continue
+                error(
+                    f"music.segments[{index}] 的 from/to 区间为空"
+                    f"（from={start}, to={stop}）：这一段摆进片子就是静音。"
+                    "from 必须小于 to（单位：秒）"
+                )
             chunk = raw[src_start:src_end]
             at_sample = int(round(at * SR))
             if at_sample >= total_samples:
-                warn(f"music.segments[{index}] 的 at={at}s 已经超出片长，实际听不到")
-                skipped += 1
-                continue
+                error(
+                    f"music.segments[{index}] 的 at={at}s 已经不短于片长 "
+                    f"{total_samples / SR:.2f}s：这一段实际听不到，配乐会比写的少一块。"
+                    "请改 at 或检查 timing.json 的 duration"
+                )
             if not _place_with_xfade(np, out, chunk, at_sample, xfade):
                 # at_sample < 片长、但内容整段落在片尾之后（chunk 为空的边界）
                 warn(f"music.segments[{index}] 没有内容落在片长以内（at={at}s），已跳过")
@@ -1157,6 +1175,93 @@ def _print_env_table(np, samples, intervals):
 
 
 # ===========================================================================
+# 自测（--selftest / scripts/selftest.py 可挑）
+# ===========================================================================
+#
+# 纯函数级自测：不碰 ffmpeg/numpy、不读 timing.json，任何机器/CI 都能跑。
+# 重点覆盖 R5-MX-01 的「量不到响度 = 闸门失败」口径，以及历史上真写错过的
+# 母带模式预测 / loudnorm 字段改名。
+
+def _selftest() -> int:
+    """跑纯函数自测；全部通过返回 0，任一失败打印 ERROR 并返回 1。"""
+    failures = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+
+    # --- R5-MX-01：量不到成品响度必须按失败处理（None 不能静默放行） ---
+    check("_loudness_gate_fail(None)", _loudness_gate_fail(None), True)
+    check("_loudness_gate_fail(-14.0)", _loudness_gate_fail(-14.0), False)
+    check("_loudness_gate_fail(-15.9)", _loudness_gate_fail(-15.9), False)
+    check("_loudness_gate_fail(-16.1)", _loudness_gate_fail(-16.1), True)
+    check("_loudness_gate_fail(-11.9)", _loudness_gate_fail(-11.9), True)
+    check("_loudness_deviation_fail(None) 仍是 False（旧口径保留）",
+          _loudness_deviation_fail(None), False)
+
+    # --- 母带模式预测（PLR > 13-0.05 或 LRA > 11 回落动态） ---
+    check("_predict_master_mode PLR 超预算",
+          _predict_master_mode({"measured_i": "-16.0", "measured_tp": "-2.0",
+                                "measured_lra": "5.0"})[0],
+          MASTER_MODE_PLR_FALLBACK)
+    check("_predict_master_mode 线性",
+          _predict_master_mode({"measured_i": "-14.0", "measured_tp": "-2.5",
+                                "measured_lra": "5.0"})[0],
+          MASTER_MODE_LINEAR)
+    check("_predict_master_mode LRA=11.0 仍是线性",
+          _predict_master_mode({"measured_i": "-14.0", "measured_tp": "-6.0",
+                                "measured_lra": "11.0"})[0],
+          MASTER_MODE_LINEAR)
+    check("_predict_master_mode LRA>11 回落动态",
+          _predict_master_mode({"measured_i": "-14.0", "measured_tp": "-6.0",
+                                "measured_lra": "12.0"})[0],
+          MASTER_MODE_PLR_FALLBACK)
+    check("_predict_master_mode 空测量值",
+          _predict_master_mode(None)[0], MASTER_MODE_LINEAR)
+
+    # --- 人声余量阈值（回落时 8 dB，否则 6 dB） ---
+    check("_margin_threshold_db 回落", _margin_threshold_db(MASTER_MODE_PLR_FALLBACK),
+          VO_MARGIN_PLR_FALLBACK_DB)
+    check("_margin_threshold_db 线性", _margin_threshold_db(MASTER_MODE_LINEAR),
+          VO_MARGIN_FAIL_DB)
+
+    # --- loudnorm JSON：input_* 必须改名成 measured_*（否则两遍母带静默退化成单遍） ---
+    sample = (
+        "[Parsed_loudnorm_0 @ 0000] {\n"
+        '  "input_i" : "-17.60",\n'
+        '  "input_tp" : "-2.10",\n'
+        '  "input_lra" : "5.20",\n'
+        '  "input_thresh" : "-27.60",\n'
+        '  "target_offset" : "0.10"\n'
+        '}'
+    )
+    measured = _parse_loudnorm_json(sample)
+    check("_parse_loudnorm_json 非空", isinstance(measured, dict), True)
+    if isinstance(measured, dict):
+        check("_parse_loudnorm_json measured_i", measured.get("measured_i"), "-17.60")
+        check("_parse_loudnorm_json measured_tp", measured.get("measured_tp"), "-2.10")
+        check("_parse_loudnorm_json measured_lra", measured.get("measured_lra"), "5.20")
+        check("_parse_loudnorm_json measured_thresh", measured.get("measured_thresh"), "-27.60")
+        check("_parse_loudnorm_json target_offset", measured.get("target_offset"), "0.10")
+    check("_parse_loudnorm_json 无 JSON", _parse_loudnorm_json("nothing here"), None)
+
+    # --- ebur128 Summary 解析（-inf 视为量不到） ---
+    check("_parse_ebur128 正常", _parse_ebur128(
+        "Summary:\n  Integrated loudness:\n    I: -15.6 LUFS\n"
+        "  True peak:\n    Peak: -1.1 dBFS\n"), (-15.6, -1.1))
+    check("_parse_ebur128 -inf", _parse_ebur128(
+        "Summary:\n    I: -inf LUFS\n    Peak: -inf dBFS\n"), (None, None))
+
+    if failures:
+        for message in failures:
+            sys.stderr.write(f"ERROR: selftest — {message}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
+        return 1
+    print("OK: selftest — 响度闸门 / 母带模式预测 / 人声余量阈值 / loudnorm / ebur128 全部通过")
+    return 0
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
@@ -1169,7 +1274,8 @@ def main(argv=None) -> int:
         epilog=(
             "默认输出：public/<timing.json 的 music.file>（模板里是 public/audio/music.wav）\n"
             "退出码：0 通过；1 有 ERROR（缺 ffmpeg / 缺配乐 / 人声余量 <6 dB——"
-            "母带 PLR 回落成动态模式时该阈值自动抬到 8 dB / 母带失败）。"
+            "母带 PLR 回落成动态模式时该阈值自动抬到 8 dB / 母带失败 / 成品响度量不到）。\n"
+            "纯函数自测（不需要 ffmpeg/numpy）：python scripts/mix.py --selftest"
         ),
     )
     parser.add_argument("--no-vo", action="store_true",
@@ -1179,7 +1285,11 @@ def main(argv=None) -> int:
     parser.add_argument("--no-sfx", action="store_true", help="关掉 numpy 合成的音效（drop/转场音）")
     parser.add_argument("--out", default=None,
                         help="输出路径（相对项目根）；默认 public/<music.file>，--no-vo 时默认 out/mix-music.wav")
+    parser.add_argument("--selftest", action="store_true",
+                        help="只跑纯函数自测（不混音、不需要 ffmpeg/numpy）")
     args = parser.parse_args(argv)
+    if args.selftest:
+        return _selftest()
 
     _require_ffmpeg()
     np = _require_numpy()
@@ -1319,7 +1429,7 @@ def main(argv=None) -> int:
     log(f"输出：{_rel(out_path)}（{out_path.stat().st_size / 1024 / 1024:.1f} MB）")
     log(f"总时长：{duration:.2f} 秒（{total_samples} 采样）")
     if integrated is None:
-        warn("母带后响度复测失败（ebur128 没有输出可解析的结果）")
+        warn("母带后响度复测失败（ebur128 没有输出可解析的结果）：响度闸门无法判定，下面按失败处理")
     else:
         flag = "OK" if TARGET_LUFS - 1.0 <= integrated <= TARGET_LUFS + 1.0 else "偏差偏大"
         log(f"母带后响度：{integrated:.1f} LUFS（目标 {TARGET_LUFS:.0f}，{flag}）")
@@ -1383,7 +1493,19 @@ def main(argv=None) -> int:
             % (margin_threshold_db,
                "；本次是 PLR 回落后的加严阈值" if plr_fallback else "")
         )
-    if _loudness_deviation_fail(integrated):
+    # 响度闸门（R5-MX-01）：母带后响应复测失败 = 闸门无法判定，必须按失败处理。
+    # 以前 integrated 为 None 时只打 WARN，`_loudness_deviation_fail(None)` 又返回
+    # False，等于「量不到响度」也能 exit 0 交付；check_video.py 对同样情形是 ERROR。
+    if _loudness_gate_fail(integrated):
+        if integrated is None:
+            error(
+                "母带后响度复测失败，量不到成品响度（-14 LUFS / 真峰值闸门无法判定）。"
+                "闸门失效不等于通过，本次混音按失败处理。"
+                "最常见原因是本机 ffmpeg 太精简（没编 ebur128 滤镜，例如 Remotion 自带的 "
+                "compositor 构建）：装完整 ffmpeg（winget install Gyan.FFmpeg / "
+                "brew install ffmpeg / apt install ffmpeg）后重跑；成片响度复核用 "
+                "check_video.py 也需要完整 ffmpeg"
+            )
         error(
             f"母带响度 {integrated:.1f} LUFS 偏离目标 {TARGET_LUFS:.0f} LUFS 超过 "
             f"{LOUDNESS_DEVIATION_FAIL_DB:.0f} dB：loudnorm 没把响度拉到位，"

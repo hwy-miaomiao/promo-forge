@@ -179,7 +179,12 @@ const typeScale = (base: number): Record<string, TypeStep> => ({
   subtitle: { size: base * 0.0407, weight: 600, lineHeight: 1.35, letterSpacing: "0" },
   /** 正文 */
   body: { size: base * 0.0315, weight: 400, lineHeight: 1.5, letterSpacing: "0.01em" },
-  /** 屏上大字 / 字幕：比正文大一档，手机上一眼能读完 */
+  /**
+   * 屏上大字：比正文大一档，手机上一眼能读完。
+   * ❗字幕层的字号**不要**再用 `caption.size`：它按屏宽缩放（1080 宽 → 51.9px），
+   * 而硬字幕 ASS 的字号按画布高度与左右安全区换算（1080×1920 → 66px、1920×1080 → 41px）。
+   * 画面内字幕请用下面的 `captionFontSize()`，与 `scripts/subtitles.py` 同一口径（R5-TPL-03）。
+   */
   caption: { size: base * 0.0481, weight: 800, lineHeight: 1.28, letterSpacing: "0.01em" },
   /** 标签、角标 */
   label: { size: base * 0.0241, weight: 600, lineHeight: 1.3, letterSpacing: "0.08em" },
@@ -191,6 +196,55 @@ export type TypeScale = ReturnType<typeof typeScale>;
 
 /** 默认字号阶梯（竖屏基准）。场景里优先用 useType()，跑马灯等处可直接读它。 */
 export const TYPE: TypeScale = typeScale(TYPE_BASE_WIDTH.vertical);
+
+/* ------------------------------------------------------- 画面内字幕口径（R5-TPL-03） */
+
+/**
+ * 画面内字幕（<Caption>）与硬字幕（ASS）必须是**同一口径**：字号、左右安全区、
+ * 每行预留高度都由下面这几个常量算，`scripts/subtitles.py` 里有一一对应的同名常量：
+ *   CAPTION_FONT_SCALE  ↔ FONT_SCALE = 0.038
+ *   CAPTION_FONT_SIZE_MIN ↔ FONT_SIZE_MIN = 12
+ *   CAPTION_SAFE_LEFT / _RIGHT ↔ SAFE_LEFT = 0.06 / SAFE_RIGHT = 0.14
+ * 改任何一边都要同步另一边（脚本侧不在 src/ 里，见 fixes 报告的「需 Lead 同步」）。
+ *
+ * 为什么不能直接用 `TYPE.caption.size`（= 屏宽 × 0.0481）：硬字幕字号是
+ * `min(画布高 × 0.038, 左右安全区可用宽度 / maxChars)`，竖屏 1080×1920 是 66px、
+ * 横版 1920×1080 是 41px；字号阶梯给的是 51.9px / 61.6px —— 竖屏小 21%、横版大 50%，
+ * 两条字幕路交付出来的片子字号对不上（R5-TPL-03）。
+ */
+export const CAPTION_FONT_SCALE = 0.038;
+export const CAPTION_FONT_SIZE_MIN = 12;
+export const CAPTION_SAFE_LEFT = 0.06;
+export const CAPTION_SAFE_RIGHT = 0.14;
+/** 每行字幕的上下内边距（em，单边）：行高预留按 `CAPTION_PAD_Y × 2` 算。 */
+export const CAPTION_PAD_Y = 0.22;
+/** 多行字幕的行间距（em）。 */
+export const CAPTION_GAP = 0.18;
+
+/** 字幕左右安全区（px）：与 ASS 的 MarginL / MarginR 完全一致。 */
+export const captionSideInsets = (width: number): { left: number; right: number } => ({
+  left: Math.round(width * CAPTION_SAFE_LEFT),
+  right: Math.round(width * CAPTION_SAFE_RIGHT),
+});
+
+/**
+ * 画面内字幕字号（px）：
+ * `max(FONT_SIZE_MIN, min(round(画布高 × 0.038), floor(左右安全区可用宽度 / maxChars)))`
+ * —— 与 `scripts/subtitles.py` 的 `_build_ass()` 同一公式（R5-TPL-03）。
+ */
+export const captionFontSize = (width: number, height: number, maxChars: number): number => {
+  const { left, right } = captionSideInsets(width);
+  const availW = Math.max(1, width - left - right);
+  const sizeByHeight = Math.round(height * CAPTION_FONT_SCALE);
+  return Math.max(CAPTION_FONT_SIZE_MIN, Math.min(sizeByHeight, Math.floor(availW / Math.max(1, maxChars))));
+};
+
+/** 字幕带高度（px）：`maxLines` 行字幕一共占多高（不含底部 bottom 距离）。 */
+export const captionBandHeight = (width: number, height: number, maxChars: number, maxLines: number): number => {
+  const size = captionFontSize(width, height, maxChars);
+  const line = size * (TYPE.caption.lineHeight + CAPTION_PAD_Y * 2);
+  return maxLines * line + (maxLines - 1) * size * CAPTION_GAP;
+};
 
 /**
  * 按当前画面算出字号阶梯。横版用 1280 而不是 1920 做基准：
