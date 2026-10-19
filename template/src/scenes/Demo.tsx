@@ -22,7 +22,7 @@ import { AbsoluteFill, useVideoConfig } from "remotion";
 import { SceneFrame, useSceneTime } from "../components/Scene";
 import { Stage } from "../components/Stage";
 import { PhoneFrame } from "../components/PhoneFrame";
-import { PALETTE, SAFE, alpha, captionBandHeight, isVertical, safePadding, useType } from "../lib/theme";
+import { PALETTE, SAFE, alpha, captionBandHeight, captionBottomPx, isVertical, safePadding, useType } from "../lib/theme";
 import { FONT } from "../lib/fonts";
 import { EASE, clamp, impulse, loop, ramp, riseIn, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
@@ -321,7 +321,7 @@ export const Demo: React.FC = () => {
   // 手机高度不能超过「内容盒高 − 标题 − 小结 − 三步条 − 字幕带」。
   // 字幕带高度按 Caption.tsx 的口径算（底边 captions.bottom + maxLines 行 + 行距），不再写死 0.3 屏高。
   // 字号与硬字幕 ASS 同源（lib/theme 的 captionBandHeight / captionFontSize，R5-TPL-03）。
-  const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
+  const captionBottom = TIMING.captions.enabled ? captionBottomPx(height, TIMING.captions.bottom) : 0;
   const capBand = TIMING.captions.enabled
     ? captionBottom + captionBandHeight(width, height, TIMING.captions.maxChars, TIMING.captions.maxLines)
     : 0;

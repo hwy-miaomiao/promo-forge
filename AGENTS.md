@@ -165,6 +165,11 @@ python scripts/tts.py audit      # 检查每句时长是否落在窗口内、有
   右侧 14% 留白，侵入平台互动按钮区。**画面内 `<Caption>` 与硬字幕现在用同一个公式**：`src/lib/theme.ts` 的
   `captionFontSize()` / `captionSideInsets()`（左右按 6% / 14% 收边）↔ `subtitles.py` 的 `FONT_SCALE = 0.038` / `SAFE_LEFT` / `SAFE_RIGHT`，
   改一边必须同步另一边（模板已用 4 组画布/字数对账）。
+- **ASS 的 `Fontsize` 是行高、不是 em**：libass 用字体自己的 `(hhea.ascent − hhea.descent)/unitsPerEm` 做归一，
+  同一个 `Fontsize` 在不同字体上实际字面大小不同 —— 微软雅黑该比值 ≈1.32（只按 `Fontsize` 的 ≈0.758 em），
+  SimHei / SimSun ≈1.0。所以上面公式算出的 66px 是 **em 像素**，`subtitles.py ass` / `burn` 写 ASS 时会按字体
+  度量自动换算（微软雅黑：em 66px → `Fontsize≈87.1`，烧进画面才和 `<Caption>` 一样大）；`ass --fontsize`
+  传的也是 em 像素口径。别直接把 66 抄进 ASS（不换算时微软雅黑上会小约 24% 且不报错，见 `references/踩坑记录.md` #49）。
 - 断行**不许拆词**：优先标点/语义边界，`URL`/英文单词/数字整段不可拆，装不下就整词下移；只有单个词
   本身比整行还宽才从中间硬切并 WARN。因此一句话若放不进 2 行，`subtitles.py srt/ass/burn` 会**直接
   ERROR**（不是静默多一行）：回去删字，或调大 `captions.maxChars`、调小字号对应的画面文案。
@@ -234,8 +239,18 @@ python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预
   才算失败；配置回显 `Timeout: 30000 ms` 不算（`check_video.py` 的 `_RX_LOG_TIMEOUT`，R5-CV-02）。
 - **日志编码**：不要用 PowerShell `>` 写日志（默认 UTF-16）；脚本会识别 UTF-16 BOM / 无 BOM 的 UTF-16 日志
   并打 WARN 说明（`_decode_log_bytes`），但仍推荐 `--log` 用 UTF-8（`... | Out-File -Encoding utf8 out/render.log`）。
+- **空渲染日志 = ERROR**：日志文件存在但 0 字节 / 0 行等于没跑闸门（不是「没报错」），要重跑渲染并确认日志有内容；
+  只有确实不需要检查时才显式加 `--no-log`（`check_video.py` 的 `check_render_log`）。
+- **混合 / 非 UTF-8 日志也要扫报错词**：编码可疑（UTF-16、GBK 或混合编码）时脚本会 WARN 留痕，并额外按
+  latin-1 兜底扫描 ASCII 报错词——UTF-16 / GBK 日志里的 `Error:` / `failed to load` / `cannot be decoded`
+  同样拦得住（`_decode_log_bytes` + latin-1 兜底扫描）。
 - **音轨必须覆盖全片**：有音轨但比视频短 >0.3 秒 = ERROR（片尾静音 silencedetect 只查音频流内部，查不到这段；
   `check_video.py` 的 `AUDIO_SHORTER_TOLERANCE_S`）；渲染命令别用 `-shortest` 截音轨。
+- **常驻 >1 条音轨 = WARN**：只有第一条音轨参与响度 / 空档 / 音轨时长检查，第二条起不参与；出现这条 WARN
+  先确认不是混音文件被重复 mux（`check_video.py` 的 `check_spec` 音轨段）。
+- **带 rotate 元数据的成片按「显示尺寸」判规格**：解码 / 播放会按 rotation 旋转，coded 尺寸与实际显示可能相反；
+  脚本会 WARN 并按显示尺寸判分辨率与画幅，逐场景抽帧和联系表也用显示尺寸（Remotion 正常产物不应带 rotate；
+  确属横屏交付时用 `--expect` 显式声明，见 `check_video.py` 的 `check_spec` / `extract_frames`）。
 
 ### 阶段 10 · 渲染与交付
 
@@ -326,7 +341,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
 {
   "slug": "acme-app",
   "title": "Acme 记账",
-  "fps": 60,
+  "fps": 60,               // 必须有限正数且 0 < fps ≤ 240；字符串/布尔/0/负/NaN/Inf 都是 ERROR（check_assets.py 校验，R6-TPL-03）
   "width": 1080,          // 竖屏 1080×1920；横版改 1920×1080
   "height": 1920,
   "aspect": "9:16",       // "9:16" | "16:9"
@@ -359,7 +374,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
       { "id": "01", "scene": "hook", "at": 0.6, "text": "每天记账要花十分钟？" }
     ]
   },
-  "captions": { "enabled": true, "maxChars": 13, "maxLines": 2, "bottom": 0.18 },
+  "captions": { "enabled": true, "maxChars": 13, "maxLines": 2, "bottom": 0.18 },  // bottom/top 是画布高度比例：若存在必须是 0~1 的有限数，越界 ERROR（check_assets.py 校验，R6-TPL-03）
   "brand": { "name": "Acme", "url": "acme.com", "logo": "img/logo.png",
              "colors": { "bg": "#0B0B12", "fg": "#FFFFFF", "accent": "#33E1A1" } }
 }
@@ -367,6 +382,8 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
 
 约定：`at`、`start`、`end`、`drop` 一律是**秒**（浮点）；`beat/bar` 是**秒**；帧数由脚本或组件用 `Math.round(秒 × fps)` 换算。
 `voice.lines` 每句必须有 `id/scene/at/text`（缺字段、非对象行、`voice.lines` 不是数组都是 **ERROR**，由 `check_assets.py` 校验，不再默认 `at = 0`）。
+`fps` 必须有限正数且 `0 < fps ≤ 240`：字符串（如 `"60"`）、布尔、0、负数、NaN、Inf 都是 **ERROR**。它是帧号换算（秒 × fps）和渲染命令 `--fps` 的直接输入，写错会一路带到渲染阶段才炸（`check_assets.py` 的 `check_timing_structure`，R6-TPL-03）。
+`captions.bottom` / `captions.top` 若存在，必须是 `0~1` 的有限数（画布高度比例；模板默认 `bottom=0.18`）：越界（如 `1.5`）是 **ERROR** —— 画面内 `<Caption>` 与硬字幕都按它定位，越界会把字幕推出画面或压到平台互动按钮区却不报错（同一函数校验）。
 
 ## 6. 技术栈与脚本速查
 
@@ -376,6 +393,11 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 （`esbuild: Failed to install correctly`）；`doctor.py` 会把这行拦下来（低于 10.4 判 MISSING）。
 没装 pnpm 可以 `npm install` 兜底（`doctor.py` 只报 WARN），但 npm 不认 `allowBuilds`，esbuild 需要手动确认。
 模板依赖：Remotion 4 + React 19 + Vite（网页播放版）；不引入 Tailwind、GSAP 等额外框架，画面用内联样式 + 少量全局 CSS。
+
+**烧硬字幕需要 ffmpeg 6+（带 libass）**：`subtitles.py burn` 用 `-/filter_complex` 从文件读滤镜图
+（避免 `-vf "ass=路径"` 的三层转义），2018 年的旧构建不认这个写法（报 `Unrecognized option '/filter_complex'`）；
+Remotion 自带的 compositor 精简构建只能渲、不能烧字幕。装完整版 ffmpeg（实测 7.1 可用）后再跑 burn，
+细节见 `references/踩坑记录.md` #50。
 
 可选 `.env`：只有 `tts.py`（`ELEVENLABS_API_KEY`）与 `doctor.py`（体检时读同一个 key）会解析**项目根**的 `.env`；
 `capture.py` / `music.py` 等其余脚本只读**真实环境变量**（`os.environ`）。所以代理 / 镜像 / `PLAYWRIGHT_DOWNLOAD_HOST`
@@ -395,7 +417,7 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 | `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` / `--selftest` |
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` / `--selftest`（纯函数自测，不读素材） |
 | `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log] [--fps] [--lufs-min] [--lufs-max] [--silence]` / `--selftest` |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；6 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查） | 无 |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；7 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查） | 无 |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（同步范围与「未纳入比对」清单见 `--help`） | `[--diff] [--apply] [--force]` / `--selftest` |
 
@@ -404,8 +426,8 @@ Node ≥18、Python ≥3.9、ffmpeg/ffprobe 是硬依赖。**依赖管理用 pnp
 | 闸门 | 通过条件 |
 | --- | --- |
 | `doctor.py` | 无 MISSING（WARN 可接受） |
-| `scripts/selftest.py` | 6 个脚本的 `--selftest`（`check_assets` / `check_video` / `mix` / `doctor` / `deliver` / `sync_template`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描 / 源码 AST 扫描容忍 UTF-8 BOM，共 9 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
-| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空、`at` 是数字——不再默认 `at = 0`）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
+| `scripts/selftest.py` | 7 个脚本的 `--selftest`（`check_assets` / `check_video` / `mix` / `subtitles` / `doctor` / `deliver` / `sync_template`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描 / 源码 AST 扫描容忍 UTF-8 BOM，共 10 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
+| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`timing.json` 数值口径合法**（`fps` 必须是有限正数且 `0 < fps ≤ 240`，字符串/布尔/0/负/NaN/Inf = ERROR；`captions.bottom` / `captions.top` 若存在必须是 `0~1` 的有限数，越界 = ERROR，R6-TPL-03）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空、`at` 是数字——不再默认 `at = 0`）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
 | `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；**音轨时长覆盖全片**（音轨比视频短 >0.3 秒 = ERROR，片尾静音 silencedetect 查不到）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`），日志会按字节识别 UTF-8/UTF-16 编码（UTF-16 打 WARN 留痕），超时只认失败语义（`_RX_LOG_TIMEOUT`）不认配置回显；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
 | `mix.py` | 母带后响度复测成功（-14 LUFS ±2 dB）；**测不到成品响度 = ERROR**（闸门失效不等于通过；需要完整版 ffmpeg 的 ebur128，compositor 精简构建跑不通）；每句人声比音乐高 ≥6 dB |
 | `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO`：脚本已自动截掉低能量拖音，重跑仍报说明尾巴能量不低，需人工试听确认） |

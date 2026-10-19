@@ -246,6 +246,34 @@ export const captionBandHeight = (width: number, height: number, maxChars: numbe
   return maxLines * line + (maxLines - 1) * size * CAPTION_GAP;
 };
 
+/* ------------------------------------------- 字幕底部距离口径（R6，与 ASS MarginV 同源） */
+
+/** 字幕离底边至少这么高（相对画面高）：与 subtitles.py 的 SAFE_BOTTOM = 0.18 一致。 */
+export const CAPTION_SAFE_BOTTOM = 0.18;
+/** 字幕最多顶到画面上部这个位置（相对画面高）：与 subtitles.py 的 SAFE_TOP = 0.10 一致。 */
+export const CAPTION_SAFE_TOP = 0.1;
+
+/**
+ * 字幕底边距离（px）：与 `scripts/subtitles.py` 的 MarginV 换算同一口径（R6-TPL）。
+ *
+ * 脚本侧（`_build_ass()`）对 `captions.bottom` 做了三步兜底，画面内 <Caption> 以前一步
+ * 都没做，于是同一个 timing.json 会渲出两种位置、而且都是「退出码 0」的静默错误：
+ *   1) 不是数字（null / 字符串 / NaN）→ 按 SAFE_BOTTOM；
+ *   2) 不在 0~1 之间（例如用户把 0.18 写成 18 或 1.5）→ 按 SAFE_BOTTOM（脚本还会 WARN）；
+ *   3) 换算出的底距落在底部安全区里 → 抬到 SAFE_BOTTOM × 画布高；顶到上部安全区 → 降到
+ *      (1 - SAFE_TOP) × 画布高。
+ * 以前 bottom=1.5 会把字幕整层推出画面（抽帧只剩背景）、还会把 Hook/Demo 预留的字幕带
+ * 算成 3000+px（Demo 手机机身被压扁），渲染仍退出 0。
+ */
+export const captionBottomPx = (height: number, bottom: unknown): number => {
+  const numeric =
+    typeof bottom === "number" ? bottom : typeof bottom === "string" && bottom.trim() !== "" ? Number(bottom) : Number.NaN;
+  const ratio = Number.isFinite(numeric) && numeric > 0 && numeric < 1 ? numeric : CAPTION_SAFE_BOTTOM;
+  const vMin = Math.round(height * CAPTION_SAFE_BOTTOM);
+  const vMax = Math.round(height * (1 - CAPTION_SAFE_TOP));
+  return Math.min(vMax, Math.max(vMin, Math.round(ratio * height)));
+};
+
 /**
  * 按当前画面算出字号阶梯。横版用 1280 而不是 1920 做基准：
  * 1920 宽的画面通常被当桌面网页看，视距更近，字反而要收敛一点。

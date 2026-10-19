@@ -741,9 +741,16 @@ def cmd_grid(args: argparse.Namespace) -> int:
 
     C.log("")
     C.log("4 个拍位的平均起音能量（高的那个就是 downbeat，即每小节第 1 拍）：")
+    # k 是「相对 phase」的拍位序号；downbeat_index 是强拍落在 phase 后的第几个拍位。
+    # 直接标「第 k+1 拍」时，只要 downbeat_index != 0 就会把 downbeat 行标成第 2/3/4 拍，
+    # 与下面按 downbeat 起算的时间轴「小节内第 N 拍」自相矛盾（实测 120BPM 鼓点轨
+    # downbeat_index=1 时：表里 downbeat 标成「第 2 拍」，时间轴同一拍标成「小节内第 1 拍」）。
+    # 统一换算成小节内拍序：beat_strengths[downbeat_index] 才是小节第 1 拍。
+    down_idx = int(info["downbeat_index"])
     for k, s in enumerate(info["beat_strengths"]):
-        mark = "  <= downbeat" if k == info["downbeat_index"] else ""
-        C.log(f"  第 {k + 1} 拍：{s:.3f}{mark}")
+        beat_no = (k - down_idx) % int(BAR_BEATS) + 1
+        mark = "  <= downbeat" if k == down_idx else ""
+        C.log(f"  小节内第 {beat_no} 拍：{s:.3f}{mark}")
 
     # 时间轴要对齐三个口径（AGENTS.md 阶段 5 / references/配乐与卡点.md）：
     #   · 区间内相对时间 t（info["downbeat"] 是**相对分析区间起点**的，--from 20 时它是 0.006 而不是 20.006）

@@ -257,6 +257,16 @@ def _resolve(path_text: str) -> Path:
     return path if path.is_absolute() else (PROJECT_ROOT / path)
 
 
+def _is_finite_number(value) -> bool:
+    """R6-CA-01：判断是不是有限数字（bool 不算，NaN/±Inf 不算）。
+
+    json.loads 默认接受 1e999（Infinity）和 NaN；这些值进入增益/时间计算后
+    会让整条混音链变成 NaN，必须在读配置时挡掉。
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def _num(cfg: dict, key: str, default, where: str) -> float:
     """取值 + 校验的数字读取工具：坏值一律一行 `ERROR:` + 非零退出，绝不抛裸 traceback。
 
@@ -276,11 +286,18 @@ def _num(cfg: dict, key: str, default, where: str) -> float:
         error(f"{where} 的 {key} 不是数字：{value!r}（要数字，不要引号、不要单位后缀，"
               f"例如 {key}: 3.6）")
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         error(f"{where} 的 {key} 不是数字：{value!r}（要数字，不要引号、不要单位后缀，"
               f"例如 {key}: 3.6）")
         raise
+    # R6-CA-01（mix 侧）：Python 的 json.loads 默认接受非标准 NaN / Infinity，裸 float()
+    # 会把 NaN 一路带进混音链（music.gain / voice.rmsDb / voice.duckDb / at …），算出
+    # NaN 电平后照样写 wav，闸门却可能读不出异常。NaN/±Inf 一律当坏配置，一行 ERROR 退出。
+    if not _is_finite_number(number):
+        error(f"{where} 的 {key} 不是有限数字：{value!r}（NaN/Infinity 不允许，"
+              "会污染整条混音链）")
+    return number
 
 
 def _cfg_num(cfg: dict, key: str, default: float = 0.0, where: str = "") -> float:
@@ -1199,6 +1216,11 @@ def _selftest() -> int:
     check("_loudness_deviation_fail(None) 仍是 False（旧口径保留）",
           _loudness_deviation_fail(None), False)
 
+    # --- R6-CA-01（mix 侧）：NaN / Infinity 不许进入增益与时间计算 ---
+    for raw, want in ((1.5, True), (0, True), (True, False), (float("nan"), False),
+                      (float("inf"), False), (float("-inf"), False), ("1", False)):
+        check(f"_is_finite_number({raw!r})", _is_finite_number(raw), want)
+
     # --- 母带模式预测（PLR > 13-0.05 或 LRA > 11 回落动态） ---
     check("_predict_master_mode PLR 超预算",
           _predict_master_mode({"measured_i": "-16.0", "measured_tp": "-2.0",
@@ -1257,7 +1279,8 @@ def _selftest() -> int:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
-    print("OK: selftest — 响度闸门 / 母带模式预测 / 人声余量阈值 / loudnorm / ebur128 全部通过")
+    print("OK: selftest — 响度闸门 / 母带模式预测 / 人声余量阈值 / loudnorm / ebur128 / "
+          "数值有限性 全部通过")
     return 0
 
 

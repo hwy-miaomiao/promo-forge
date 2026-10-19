@@ -1065,6 +1065,7 @@ def cmd_audit(args) -> int:
     stale = 0
     window_errors = 0   # 窗口非法（line_window 抛错）的句数，最后按审核不通过处理
     window_details: list = []   # [(句号, 原因)]，汇总时报全，不要只报第一句
+    unreadable = 0      # 音频读不出来（ffprobe/ffmpeg 失败）的句数，同样审核不通过
     for line in lines:
         line_id = str(line.get("id", "")).strip()
         text = str(line.get("text", "") or "")
@@ -1095,8 +1096,21 @@ def cmd_audit(args) -> int:
             rows.append((line_id, text, window, 0.0, -window, "MISSING"))
             errors += 1
             continue
-        duration = _duration_of(path)
-        tail_ms = _tail_ms(path)
+        try:
+            duration = _duration_of(path)
+            tail_ms = _tail_ms(path)
+        except SystemExit:
+            # _duration_of 先走 ffprobe_json，它失败时会先打 ERROR 行再 sys.exit()；
+            # SystemExit 不是 Exception，原来没人接住 → 一句坏音频就让整个 audit 表都
+            # 打不出来（实测：03.mp3 换成非音频内容后，stderr 只有 ffprobe 的 ERROR，
+            # 表格/汇总全消失）。这里记一行 ERROR 继续审下一句，走完表格再统一退 1。
+            unreadable += 1
+            rows.append((line_id, text, window, 0.0, -window, "ERROR"))
+            warn(
+                f"第 {line_id} 句音频读不出来（ffprobe/ffmpeg 失败，见上面的 ERROR 行）："
+                f"{_rel(path)}；这句要重做：python scripts/tts.py all --only {line_id}"
+            )
+            continue
         margin = window - duration
         needed = _needed_ratio(duration, window)
         # 一律按实测判：report.json 里的 status 只是「上次生成时那个窗口」下的结论，
@@ -1138,7 +1152,7 @@ def cmd_audit(args) -> int:
         )
     log("")
 
-    if errors or window_errors:
+    if errors or window_errors or unreadable:
         if window_details:
             # 把每一句的窗口原因都打在 ERROR 汇总里（上面只有 WARN 逐句行，
             # 有些 CI 只抓 stderr 的 ERROR 行看，所以这里必须带全）。
@@ -1146,10 +1160,12 @@ def cmd_audit(args) -> int:
             for line_id, why in window_details:
                 log(f"  窗口非法 第 {line_id} 句：{why}")
         error(
-            f"审核不通过：{errors} 句 TOO_LONG/MISSING、{window_errors} 句窗口非法"
-            f"（共 {errors + window_errors} 句，上面每句都有对应行）。"
+            f"审核不通过：{errors} 句 TOO_LONG/MISSING、{window_errors} 句窗口非法、"
+            f"{unreadable} 句音频读不出来"
+            f"（共 {errors + window_errors + unreadable} 句，上面每句都有对应行）。"
             f"字数超窗口必须改稿删字（AGENTS.md 阶段 7），不允许靠加速硬压；"
-            f"窗口非法说明 at 太密或排到了场景结束 / 下一句之后。"
+            f"窗口非法说明 at 太密或排到了场景结束 / 下一句之后；"
+            f"音频读不出来说明文件损坏，重跑 `python scripts/tts.py all` 重做。"
             f"{_audit_tip(rows, window_details)}"
             f"改完重跑 `python scripts/tts.py all`"
         )

@@ -959,6 +959,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             im = bg
         elif fmt == "jpg":
             im = im.convert("RGB")
+        elif fmt == "png" and im.mode in ("CMYK", "YCbCr", "LAB", "HSV"):
+            # Pillow 的 PNG 编码器不支持 CMYK 等模式，原样 save 会抛
+            # OSError: cannot write mode CMYK as PNG → 这张图被 WARN 跳过（只它一张时整条
+            # 命令退 1「没有任何文件被处理」）。--format png 又正是文档推荐给「保留透明」用的，
+            # 而 CMYK 源图在印前/设计导出的 jpg 里很常见。转 RGB 再写（和 jpg 分支一致）。
+            im = im.convert("RGB")
 
         if need_resize:
             im = im.resize((new_w, new_h), resample)

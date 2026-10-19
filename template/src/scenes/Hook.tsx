@@ -21,7 +21,7 @@ import type React from "react";
 import { AbsoluteFill, useVideoConfig } from "remotion";
 import { SceneFrame, useSceneTime } from "../components/Scene";
 import { Stage } from "../components/Stage";
-import { PALETTE, SAFE, alpha, captionBandHeight, isVertical, safePadding, useType } from "../lib/theme";
+import { PALETTE, SAFE, alpha, captionBandHeight, captionBottomPx, isVertical, safePadding, useType } from "../lib/theme";
 import { FONT } from "../lib/fonts";
 import { EASE, clamp, impulse, loop, ramp, riseIn, shake, stagger } from "../lib/anim";
 import { TIMING } from "../lib/timing";
@@ -108,7 +108,7 @@ export const Hook: React.FC = () => {
   // 字幕带高度按 Caption.tsx 的口径算：底边 captions.bottom + maxLines 行 + 行距。
   // 字号与硬字幕 ASS 同源（lib/theme 的 captionBandHeight / captionFontSize，R5-TPL-03），
   // 字幕字号一改这里自动跟着变，不会再出现"字号改了但让位没改"的压字。
-  const captionBottom = TIMING.captions.enabled ? Math.round(height * TIMING.captions.bottom) : 0;
+  const captionBottom = TIMING.captions.enabled ? captionBottomPx(height, TIMING.captions.bottom) : 0;
   const capBand = TIMING.captions.enabled
     ? captionBottom + captionBandHeight(width, height, TIMING.captions.maxChars, TIMING.captions.maxLines)
     : 0;

@@ -47,12 +47,15 @@ AI 看不到画面，所以这里把「字幕读得完、不串场、不出安�
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -267,9 +270,16 @@ def fmt_ass_time(seconds: float) -> str:
 
 # --- 文本与折行 -----------------------------------------------------------
 
+#: C0/C1 控制字符（保留 \t\n\r：它们交给下面的空白正则会变成空格）。
+#: **必须剥掉**：SRT 正文只要含一个 NUL(0x00)/BEL(0x07)，ffmpeg 的 srt demuxer 就会把
+#: 整份字幕文件读成 0 条（实测 `-f srt` 往返输出 "Output file is empty"），而脚本
+#: 自己 rc=0 看不出问题（R6-subs-01）。ASS 的 Dialogue 行同样会被污染。
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
 def _clean_text(text: Any) -> str:
-    """去掉换行与多余空白（换行由折行逻辑统一生成）。"""
-    raw = str(text or "")
+    """去掉换行与多余空白（换行由折行逻辑统一生成），并剥掉 C0/C1 控制字符。"""
+    raw = CONTROL_CHARS_RE.sub("", str(text or ""))
     for ch in SPACE_CHARS:
         raw = raw.replace(ch, " ")
     return re.sub(r"\s+", " ", raw).strip()
@@ -893,6 +903,61 @@ def _fc_match(name: str) -> Optional[Tuple[str, Path]]:
     return family_text.strip(), font_file
 
 
+#: 字体「行高 / em」比例缓存（族名 -> (ascender-descender)/unitsPerEm；量不出记 None）。
+#:
+#: ASS 的 Fontsize 语义**不是 em 高**，而是「ascender−descender 的像素高」：libass 用
+#: 字体自己的 hhea 行高做归一，同一个 Fontsize 在不同字体上实际字面大小不同。实测
+#: （ffmpeg 7.1 + libass，1080×1920，Fontsize 66，13 个全角字「一二三四五六七八九十一二三」）：
+#:
+#:   - ``msyh.ttc``（asc 2167 / desc -536 / upem 2048 → 比值 1.320）：实宽 648px，实际 em≈50.0px
+#:   - ``simhei.ttf`` / ``simsun.ttc``（220 / -36 / 256 → 1.000）：实宽 850 / 849px，实际 em≈66px
+#:   - ``Deng.ttf``（1659 / -475 / 2048 → 1.042）：实宽 816px，实际 em≈63.3px
+#:   - 2018 与 7.1 两个 ffmpeg 构建（fontconfig / DirectWrite provider）都是 0.75 左右，结论一致
+#:
+#: 所以按 AGENTS 公式算出的 66px 字号写进 ASS 后，微软雅黑上实际只有约 50px 大——硬字幕
+#: 比画面里同一公式的 ``<Caption>`` 小约 24%，且不报任何错。修法：写 ASS 的 Fontsize 乘上
+#: 这个比值，让 libass 渲出来的 em 高 = AGENTS 公式要的像素数（R6-subs-06）。
+_FONT_HEIGHT_RATIO_CACHE: Dict[str, Optional[float]] = {}
+FONT_RATIO_MIN = 0.8
+FONT_RATIO_MAX = 2.0
+
+
+def _font_height_ratio(family: str) -> Optional[float]:
+    """族名对应字体的 ``(hhea.ascent - hhea.descent) / unitsPerEm``；量不出返回 None。
+
+    只用来给 ASS Fontsize 做补偿（见上面缓存注释的实测数字）。量不出（族名是
+    ``sans-serif`` 这类通用名 / 没装 fontTools / 字体坏）就返回 None，调用方按 1.0
+    处理——宁可字号回到旧行为，也不能因为量一个比例把烧录搞挂。
+    """
+    key = str(family or "").strip()
+    if not key:
+        return None
+    if key in _FONT_HEIGHT_RATIO_CACHE:
+        return _FONT_HEIGHT_RATIO_CACHE[key]
+
+    font_file = _family_available(key)
+    if font_file is None:
+        matched = _fc_match(key)
+        if matched is not None and _family_matches_request(key, [matched[0]]):
+            font_file = matched[1]
+
+    ratio: Optional[float] = None
+    if font_file is not None:
+        try:
+            from fontTools.ttLib import TTFont  # 模板依赖里已有 fontTools
+
+            with TTFont(str(font_file), fontNumber=0, lazy=True) as tt:
+                upem = float(tt["head"].unitsPerEm)
+                hhea = tt["hhea"]
+                raw = (float(hhea.ascent) - float(hhea.descent)) / upem
+            if math.isfinite(raw) and FONT_RATIO_MIN <= raw <= FONT_RATIO_MAX:
+                ratio = raw
+        except Exception:  # noqa: BLE001 - 量不出比例不该中断烧录，退回旧行为
+            ratio = None
+    _FONT_HEIGHT_RATIO_CACHE[key] = ratio
+    return ratio
+
+
 # --- 颜色 -----------------------------------------------------------------
 
 def _hex_to_ass_color(value: Any, alpha: int = 0) -> str:
@@ -1140,11 +1205,32 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
         if not isinstance(item, dict):
             continue
         line_id = str(item.get("id", "")).strip() or f"#{order}"
-        text = _clean_text(item.get("text"))
+        raw_text = item.get("text")
+        if isinstance(raw_text, str) and CONTROL_CHARS_RE.search(raw_text):
+            warn(
+                f"第 {line_id} 句的 text 含控制字符（NUL/BEL 等不可见字符），已剥掉："
+                "它们会让 SRT/ASS 里的字幕整份读不出来（R6-subs-01）"
+            )
+        text = _clean_text(raw_text)
         if not text:
-            error(f"第 {line_id} 句没有 text 字段，无法生成字幕（AGENTS.md 阶段 7：每句要有 id/scene/at/text）")
+            if raw_text is None or raw_text == "":
+                error(
+                    f"第 {line_id} 句没有 text 字段，无法生成字幕"
+                    "（AGENTS.md 阶段 7：每句要有 id/scene/at/text）"
+                )
+            error(
+                f"第 {line_id} 句的 text={raw_text!r} 只有空白字符（清洗后为空），无法生成字幕："
+                "请写实际文案，或把这句从 voice.lines 里删掉"
+            )
         scene = str(item.get("scene", "") or "")
         at = _num(item.get("at"), 0.0)
+        if not math.isfinite(at) or at < 0:
+            # NaN/Infinity 会让所有区间比较恒为 False，最后被 _split_ms 的 max(0, …) 夹成
+            # 00:00:00,000 --> 00:00:00,000 的零时长字幕，rc 还是 0；负数同理（R6-subs-02）。
+            error(
+                f"第 {line_id} 句的 at={at:g} 不合法：at 必须是不小于 0 的有限秒数"
+                "（AGENTS.md §5；timing.json 里不要写 NaN / Infinity / 负数）"
+            )
 
         # 起点取 timing.json 的 at（字幕可以比人声略早出现，但不早于这句的 at）。
         start = at
@@ -1311,7 +1397,10 @@ def check_voice_windows(timing: Dict[str, Any], raw_lines: List[Any]) -> int:
 
 def _write_srt(cues: List[Cue], path: Path) -> None:
     blocks = []
-    for index, cue in enumerate(cues, start=1):
+    # SRT 消费端默认按文件顺序读；timing.json 里 voice.lines 万一是乱序（不按 at 升序），
+    # 直接照抄会让时间轴非单调（R6-subs-03）。这里按开始时间稳定排序；已排序的项目输出不变。
+    ordered = sorted(enumerate(cues), key=lambda pair: (pair[1].start, pair[1].end, pair[0]))
+    for index, (_, cue) in enumerate(ordered, start=1):
         body = "\r\n".join(cue.lines)
         blocks.append(
             f"{index}\r\n{fmt_srt_time(cue.start)} --> {fmt_srt_time(cue.end)}\r\n{body}\r\n"
@@ -1437,6 +1526,17 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
     # 改一句就可能引入子集外的字，所以这里照旧走系统字体更稳；但要提醒用户：
     # 若模板画面用的是自带字体，字幕字形可能和画面不完全一致。
     _warn_about_project_font(cfg, family)
+    # ASS 的 Fontsize 不是 em 高：libass 按字体 (ascender−descender) 归一（实测数字见
+    # _font_height_ratio 的注释）。把比例乘回去，烧进画面的字才真的等于上面按 AGENTS
+    # 公式算出的 em 像素高；不乘的话微软雅黑实际只有 ~76%，硬字幕比画面 <Caption> 小一截。
+    ratio = _font_height_ratio(family)
+    ass_size = round(size * (ratio or 1.0), 1)
+    if ratio is not None and abs(ratio - 1.0) > 0.01:
+        log(
+            f"ASS 字号补偿：{family} 的 (ascender−descender)/em={ratio:.3f}，"
+            f"em {size:g}px → 写进 ASS 的 Fontsize={ass_size:g}"
+            f"（不补偿实测只有 {size / ratio:.1f}px，R6-subs-06）"
+        )
     primary = _hex_to_ass_color(colors.get("fg", "#FFFFFF"))
     outline_colour = _hex_to_ass_color(colors.get("bg", "#000000"))
 
@@ -1445,7 +1545,7 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
         [
             "Default",
             family,
-            f"{size:g}",
+            f"{ass_size:g}",
             primary,
             _hex_to_ass_color(colors.get("accent", "#FFFFFF")),
             outline_colour,
@@ -1492,8 +1592,8 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
         error(f"字幕写不进 {path}：{exc}")
 
     log(
-        f"ASS 样式：字体 {family}，字号 {size:g}"
-        f"（画布 {play_w}×{play_h} 的 {size / play_h:.1%}；上限 = min(高度×{FONT_SCALE:g}, "
+        f"ASS 样式：字体 {family}，字号 {size:g}（em，写进 ASS 的 Fontsize={ass_size:g}；"
+        f"画布 {play_w}×{play_h} 的 {size / play_h:.1%}；上限 = min(高度×{FONT_SCALE:g}, "
         f"{avail_w}px / {max_chars} 字)），"
         f"MarginV {margin_v}（离底边，对应 captions.bottom={margin_v / play_h:.3f}），"
         f"左右留白 {margin_l}/{margin_r}"
@@ -1610,6 +1710,17 @@ def cmd_srt(args) -> int:
     cues = build_cues(timing)
     _write_srt(cues, out)
     _print_cues(cues)
+
+    # SRT 没有转义语法：文案里的字面 \N/\n/\h 在部分播放器/工具里会被当成换行指令
+    # （ffmpeg 的 srt demuxer 实测就会把 \N 变成换行），看到的内容与 ASS/硬字幕不一致。
+    # 脚本没法把字面反斜杠无损写进 SRT，只能明确提醒（R6-subs-04）。
+    backslash_ids = [c.line_id for c in cues if re.search(r"\\[Nnh]", c.text)]
+    if backslash_ids:
+        warn(
+            "SRT 不支持反斜杠转义：这些句子的 text 里有 \\N / \\n / \\h，部分播放器会把 \\N 当换行，"
+            f"看到的字会和 ASS/硬字幕不一致（{'、'.join(backslash_ids)}）。"
+            "要逐字一致请改文案（不要写反斜杠转义序列），或只用 ASS/硬字幕这条路"
+        )
 
     estimated = [c for c in cues if c.vo_s is None]
     log("")
@@ -1865,6 +1976,199 @@ def cmd_burn(args) -> int:
 # main
 # ===========================================================================
 
+# ===========================================================================
+# 自测（--selftest / scripts/selftest.py 可挑）
+# ===========================================================================
+#
+# 纯函数级自测：不碰 ffmpeg、不读 timing.json、不联网，任何机器与 CI 都能跑。
+# 覆盖 Round 6 修过的回归点：ASS 文本转义、字号行高补偿、控制字符清洗、负 at/NaN、
+# 纯空白 text、SRT 乱序排序、收边/跨场景、maxLines 硬闸门（正反两向都测）。
+
+_SELFTEST_BASE_TIMING = {
+    "slug": "selftest",
+    "title": "自测",
+    "fps": 30,
+    "width": 1080,
+    "height": 1920,
+    "aspect": "9:16",
+    "duration": 10.0,
+    "scenes": [{"name": "main", "start": 0.0, "end": 10.0, "note": ""}],
+    "voice": {"lines": []},
+    "captions": {"enabled": True, "maxChars": 13, "maxLines": 2, "bottom": 0.18},
+    "brand": {"name": "T", "url": "t.example", "logo": "",
+              "colors": {"bg": "#000000", "fg": "#FFFFFF", "accent": "#33E1A1"}},
+}
+
+
+def _selftest() -> int:
+    """跑纯函数自测；全部通过返回 0，任一失败打印 ERROR 行并返回 1。"""
+    failures: List[str] = []
+    passed = 0
+
+    def check(name: str, got: Any, want: Any) -> None:
+        nonlocal passed
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+        else:
+            passed += 1
+
+    def expect_error(name: str, fn, needle: str) -> None:
+        nonlocal passed
+        buf_err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(buf_err):
+                fn()
+        except SystemExit as exc:
+            code = int(exc.code or 0)
+            text = buf_err.getvalue()
+            if code == 0:
+                failures.append(f"{name}: 期望非零退出，实际 rc=0")
+            elif needle not in text:
+                failures.append(f"{name}: ERROR 文案里找不到 {needle!r}，实际 {text!r}")
+            else:
+                passed += 1
+            return
+        except Exception as exc:  # noqa: BLE001 - 自测里任何异常都算失败
+            failures.append(f"{name}: 期望打印 ERROR 行，实际抛 {type(exc).__name__}: {exc}")
+            return
+        failures.append(f"{name}: 期望打印 ERROR 行，实际正常返回")
+
+    def make_timing(lines, scenes=None, duration=10.0, captions=None):
+        timing = json.loads(json.dumps(_SELFTEST_BASE_TIMING))
+        timing["voice"]["lines"] = lines
+        if scenes is not None:
+            timing["scenes"] = scenes
+        timing["duration"] = duration
+        if captions is not None:
+            timing["captions"] = captions
+        return timing
+
+    def one_line(at=1.0, text="测试一句", line_id="L1", scene="main"):
+        return {"id": line_id, "scene": scene, "at": at, "text": text}
+
+    def capture_cues(timing):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            cues = build_cues(timing)
+        return cues, out.getvalue()
+
+    originals: Dict[str, Any] = {}
+
+    def patch(name: str, value: Any) -> None:
+        if name not in originals:
+            originals[name] = globals()[name]
+        globals()[name] = value
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="subtitles-selftest-") as tmp:
+            root = Path(tmp)
+            (root / "audio-src" / "vo").mkdir(parents=True, exist_ok=True)
+            # 这个进程里把项目根指到临时目录：不读真实 audio-src/vo，也不写项目文件。
+            patch("PROJECT_ROOT", root)
+            patch("fonts_config", lambda: {"roles": {}, "brand": {}})
+            patch("_resolve_font_family", lambda cfg, text="": "TestFont")
+
+            # --- 1) ASS 文本转义（R6-subs-02：{ } \N \h 会被 libass 当语义字符） ---
+            check("_escape_ass_text 花括号", _escape_ass_text("{over} ABCD"), r"\{over\} ABCD")
+            check("_escape_ass_text 反斜杠插零宽空格",
+                  _escape_ass_text("C:\\new"), "C:\\" + ASS_ZWSP + "new")
+            check("_escape_ass_text 不再留下字面 \\N",
+                  "\\N" in _escape_ass_text("AB\\NCD"), False)
+
+            # --- 2) ASS 样式与字号行高补偿（R6-subs-06） ---
+            patch("_font_height_ratio", lambda family: 1.3198)
+            timing = make_timing([one_line(at=1.0, text="{over} ABCD")])
+            cues, _ = capture_cues(timing)
+            ass_path = root / "out" / "a.ass"
+
+            def build_ass(ass_file=None):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    return _build_ass(cues, timing, ass_file or ass_path, None)
+
+            ass_text = build_ass()
+            style = next(line for line in ass_text.splitlines() if line.startswith("Style: "))
+            fields = style[len("Style: "):].split(",")
+            check("ASS Style 字段数", len(fields), 23)
+            check("ASS 事件行含转义花括号", r"\{over\}" in ass_text, True)
+            check("ASS 事件行无裸 {over}", "{over}" in ass_text.split("Dialogue: ")[-1], False)
+            check("ASS 字号补偿 66em×1.3198", fields[2].strip(), "87.1")
+            patch("_font_height_ratio", lambda family: None)
+            style2 = next(line for line in build_ass().splitlines()
+                          if line.startswith("Style: "))
+            check("ASS 量不出比例不补偿", style2[len("Style: "):].split(",")[2].strip(), "66")
+
+            # --- 3) 控制字符清洗（R6-subs-01：NUL/BEL 会让 SRT/ASS 整份读不出来） ---
+            check("_clean_text 剥 NUL/BEL/ESC", _clean_text("a\x00b\x07c\x1bd"), "abcd")
+            cues, warnings = capture_cues(make_timing([one_line(text="a\x00b\x07c")]))
+            check("cue 文本已剥控制字符", cues[0].text, "abc")
+            check("控制字符会 WARN", "控制字符" in warnings, True)
+
+            # --- 4) at 合法性（R6-subs-02：负 / NaN 不许静默变零时长字幕） ---
+            expect_error("负 at 报错", lambda: build_cues(make_timing([one_line(at=-5.0)])), "不合法")
+            expect_error("NaN at 报错",
+                         lambda: build_cues(make_timing([one_line(at=float("nan"))])), "不合法")
+
+            # --- 5) 纯空白 / 缺 text（R6-subs-05：文案要能指出真实原因） ---
+            expect_error("纯空白 text 报错",
+                         lambda: build_cues(make_timing(
+                             [{"id": "W1", "scene": "main", "at": 1.0, "text": "\u3000\u3000"}])),
+                         "只有空白字符")
+            expect_error("缺 text 字段报错",
+                         lambda: build_cues(make_timing([{"id": "W2", "scene": "main", "at": 1.0}])),
+                         "没有 text 字段")
+
+            # --- 6) SRT 乱序排序（R6-subs-03：时间轴必须单调） ---
+            cues, _ = capture_cues(make_timing([
+                one_line(at=8.0, text="八", line_id="A"),
+                one_line(at=2.0, text="二", line_id="B"),
+                one_line(at=5.0, text="五", line_id="C"),
+            ]))
+            srt_path = root / "out" / "b.srt"
+            _write_srt(cues, srt_path)
+            srt_text = srt_path.read_text(encoding="utf-8")
+            times = re.findall(r"(\d\d:\d\d:\d\d,\d{3}) --> ", srt_text)
+            check("SRT 时间轴单调不降", times, sorted(times))
+
+            # --- 7) 收边 / 跨场景（R5 修过、R6 不许回归） ---
+            scenes = [{"name": "s1", "start": 0.0, "end": 5.0, "note": ""},
+                      {"name": "s2", "start": 5.0, "end": 10.0, "note": ""}]
+            cues, _ = capture_cues(make_timing(
+                [one_line(at=4.9, text="一二三四五六七八九十一二三", line_id="E1", scene="s1"),
+                 one_line(at=5.05, text="下一句", line_id="E2", scene="s2")],
+                scenes=scenes))
+            check("收边终点不越过场景末端", cues[0].end <= 5.0, True)
+            check("收边终点不压到下一句", cues[0].end <= cues[1].start, True)
+            expect_error("场景内没位置时 ERROR",
+                         lambda: build_cues(make_timing([one_line(at=12.0)])), "没有位置写字幕")
+
+            # --- 8) 折行硬闸门（maxLines 是硬要求，正反两向都测） ---
+            expect_error("maxLines=1 超行 ERROR",
+                         lambda: build_cues(make_timing(
+                             [one_line(text="一二三四五六七八九十一二三四五六七")],
+                             captions={"enabled": True, "maxChars": 13, "maxLines": 1,
+                                       "bottom": 0.18})),
+                         "超过 captions.maxLines=1")
+            expect_error("maxLines=0 直接 ERROR",
+                         lambda: build_cues(make_timing(
+                             [one_line()],
+                             captions={"enabled": True, "maxChars": 13, "maxLines": 0,
+                                       "bottom": 0.18})),
+                         "不合法：必须是正整数")
+    finally:
+        for name, value in originals.items():
+            globals()[name] = value
+
+    if failures:
+        for message in failures:
+            sys.stderr.write("ERROR: selftest — %s\n" % message)
+        sys.stderr.write("ERROR: selftest — %d 项失败\n" % len(failures))
+        return 1
+    print("OK: selftest — %d 项断言通过（ASS 转义 / 字号补偿 / 控制字符 / at 合法性 / "
+          "空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门）" % passed)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subtitles.py",
@@ -1881,9 +2185,12 @@ def build_parser() -> argparse.ArgumentParser:
             "\n"
             "时间轴口径：起点取 timing.json 的 voice.lines[].at，终点 = 起点 + 实测配音时长\n"
             "（不足则用「字数/6+0.35」秒兜底），且不越过该句所属场景的窗口末端。\n"
-            "退出码：0 成功（含按字数估算的 WARN）；1 有 ERROR（缺 ffmpeg / 无旁白稿 / 写不出文件 / 烧录失败）。"
+            "退出码：0 成功（含按字数估算的 WARN）；1 有 ERROR（缺 ffmpeg / 无旁白稿 / 写不出文件 / 烧录失败）。\n"
+            "纯函数自测（不需要 ffmpeg/网络）：python scripts/subtitles.py --selftest"
         ),
     )
+    parser.add_argument("--selftest", action="store_true",
+                        help="只跑纯函数自测（不读 timing.json、不需要 ffmpeg/网络）")
     sub = parser.add_subparsers(dest="cmd", metavar="<子命令>")
 
     p_srt = sub.add_parser("srt", help="生成 SRT 字幕（时间轴用真实配音时长）")
@@ -1916,6 +2223,8 @@ def main(argv=None) -> int:
     _force_utf8()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "selftest", False):
+        return _selftest()
     if not getattr(args, "cmd", None):
         # 不带子命令 = 只打印帮助（AGENTS.md 第 7 节：不要静默通过，但这不是错误）。
         parser.print_help()

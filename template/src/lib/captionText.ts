@@ -49,7 +49,11 @@ export const isWideChar = (ch: string): boolean => {
     (cp >= 0xfe10 && cp <= 0xfe19) || // 竖排标点
     (cp >= 0xfe30 && cp <= 0xfe6f) || // CJK 兼容形式
     (cp >= 0xff00 && cp <= 0xff60) || // 全角 ASCII（「，」「！」「？」等）
-    (cp >= 0xffe0 && cp <= 0xffe6) // 全角符号
+    (cp >= 0xffe0 && cp <= 0xffe6) || // 全角符号
+    // 以下三个区段在 UTF-16 里是代理对（BMP 之外），只按 codePointAt 判断才准：
+    (cp >= 0x1b000 && cp <= 0x1b2ff) || // 假名补充 / 假名扩展
+    (cp >= 0x1f000 && cp <= 0x1faff) || // 麻将牌、扑克、emoji（EAW 多为 W）
+    (cp >= 0x20000 && cp <= 0x3fffd) // CJK 扩展 B~G（如「𠮷」U+20BB7）
   );
 };
 
@@ -98,8 +102,11 @@ export const splitAtoms = (text: string): string[] => {
       atoms.push(match[0]);
       i += match[0].length;
     } else {
-      atoms.push(text[i]);
-      i += 1;
+      // 必须按 code point 取字：BMP 之外的「𠮷」这类字是一个代理对，
+      // 按 text[i] 取会被切成两个原子（R6：与 Python 逐字符迭代对齐）。
+      const ch = String.fromCodePoint(text.codePointAt(i) as number);
+      atoms.push(ch);
+      i += ch.length;
     }
   }
   return atoms;
@@ -181,8 +188,8 @@ const wrapLine = (text: string, width: number): { cut: number; overflow: number 
   return { cut: atomsChars(atoms, fit), overflow: 0 };
 };
 
-/** 第二行以「单个字 + 收尾标点」开头 = 中文词被拆开的指纹。 */
-const LONELY_HEAD_RE = /^[^\s，。、；：！？,.;:!?…—]\s*[，。、；：！？,.;:!?…—]/;
+/** 第二行以「单个字 + 收尾标点」开头 = 中文词被拆开的指纹（u 让「𠮷」按一个 code point 算）。 */
+const LONELY_HEAD_RE = /^[^\s，。、；：！？,.;:!?…—]\s*[，。、；：！？,.;:!?…—]/u;
 
 export const lonelyHead = (tail: string): boolean => LONELY_HEAD_RE.test(tail);
 

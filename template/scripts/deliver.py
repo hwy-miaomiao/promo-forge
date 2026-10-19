@@ -791,16 +791,29 @@ def _check_resolution(m: Media, p: Dict[str, Any]) -> Check:
     }
     if (m.width, m.height) in variants:
         return _mk("分辨率", value, rule, "OK", conf, variants[(m.width, m.height)])
-    # 竖屏但尺寸不是推荐值（例如 720×1280）：能发，但清晰度吃亏
+    # 竖屏但尺寸不是推荐值（例如 720×1280）：能发，但清晰度吃亏。
+    # conf=project 表示这条数字来自 AGENTS.md 的本项目交付规范（视频号分辨率），
+    # 而 AGENTS.md 第 7 节闸门表把「视频号分辨率按 1080×1920」列为硬规矩 → 必须 ERROR。
+    # 只判 WARN 会让交付闸门（0 ERROR 才算过）对违反本项目规范的文件假绿。
     if m.height > m.width:
-        return _mk("分辨率", value, rule, "WARN", conf,
-                   f"竖屏方向对，但推荐值是 {rec_w}×{rec_h}；"
+        level = "ERROR" if conf == "project" else "WARN"
+        prefix = ("这是本项目交付规范（AGENTS.md 第 1 节：竖屏 1080×1920，"
+                  "第 7 节列为硬规矩），交付闸门按硬规矩判 ERROR，不是平台拒收限制；"
+                  if level == "ERROR" else "")
+        return _mk("分辨率", value, rule, level, conf,
+                   prefix + f"竖屏方向对，但推荐值是 {rec_w}×{rec_h}；"
                    "低于它平台会放大（发虚），高于它会被二压。"
                    "建议按 timing.json 的 width/height 重渲（render:1080 出 1080×1920）")
     # 横屏但不是标准 16:9（例如 1280×720 仍是标准比例、只是分辨率低于推荐值）：
-    # 推荐值只是推荐值，横版又明确被 AGENTS.md 允许，所以这里一律 WARN，不判 ERROR。
-    return _mk("分辨率", value, rule, "WARN", conf,
-               f"这是横屏画面，{p['name']} 的推荐值是竖版 {rec_w}×{rec_h}，对应横版 {rec_h}×{rec_w}。"
+    # 横版本身被 AGENTS.md 第 1 节允许（1920×1080 在 variants 里已判 OK），
+    # 这里只处理「横版但分辨率不是项目标准的 1920×1080」——conf=project 时同样是硬规矩。
+    level = "ERROR" if conf == "project" else "WARN"
+    prefix = ("这是横屏画面，但分辨率不是本项目交付规范（AGENTS.md 第 1 节："
+              "首选竖屏 1080×1920，可选横版 1920×1080），交付闸门按硬规矩判 ERROR；"
+              if level == "ERROR" else "")
+    return _mk("分辨率", value, rule, level, conf,
+               prefix + f"这是横屏画面，{p['name']} 的推荐值是竖版 {rec_w}×{rec_h}，"
+               f"对应横版 {rec_h}×{rec_w}，当前是 {value}。"
                "横版是规范允许的形态（AGENTS.md 第 1 节：首选竖屏，可选 1920×1080 横版），"
                "要竖屏就改 timing.json 的 aspect 为 9:16、width/height 换成 1080/1920 后重渲")
 
@@ -1646,25 +1659,31 @@ def _cover_out_dir(value: str) -> Path:
 #: 封面候选的文件名模式（本功能自己的固定产物）。
 COVER_CANDIDATE_RE = re.compile(r"^cover-\d+\.png$")
 
+#: 中间帧的文件名模式：``_<mp4 文件名>-frame-<序号>.png``。
+#: 匹配**任意** stem：同一个 --out 目录换一支成片重跑时，上一支片子的中间帧也要算本功能产物，
+#: 否则旧 stem 的 ``_旧片-frame-1.png`` 会一直堆在目录里（R6 实测换片后残留旧帧）。
+COVER_FRAME_RE = re.compile(r"^_.+-frame-\d+\.png$")
 
-def _cover_frame_re(base_name: str):
-    """中间帧的文件名模式：``_<mp4 文件名>-frame-<序号>.png``。"""
-    return re.compile(r"^_" + re.escape(base_name) + r"-frame-\d+\.png$")
 
-
-def _clean_stale_cover_outputs(out_dir: Path, base_name: str) -> List[Path]:
-    """删掉同一输出目录里上一轮留下的 ``cover-N.png`` / ``_<stem>-frame-N.png``。
+def _clean_stale_cover_outputs(out_dir: Path, keep=()) -> List[Path]:
+    """删掉输出目录里上一轮留下的本功能产物，``keep`` 里的文件名（本轮刚写的帧）不删。
 
     为什么需要：``--frames`` 变少时旧的 ``cover-2.png`` / ``cover-3.png`` 不会被本轮覆盖；
-    它们留在目录里会被误当成本轮候选（换过标题时还是旧文案），而日志与联系表只反映本轮。
-    只匹配本功能生成的文件名（固定前缀 + 序号），用户自己放进目录的其它文件一律不动。
+    换过标题时它们还是旧文案，换过片子时旧 ``_旧片-frame-*.png`` 也会残留。它们留在目录里
+    会被误当成本轮候选（日志与联系表只反映本轮）。``_sheet.jpg`` 同样清掉——它是上一轮的
+    联系表，本轮会重建；留着会让「候选已更新、联系表还是旧图」自相矛盾。
+
+    只匹配本功能生成的文件名（固定 ``cover-N.png`` / ``_*-frame-N.png`` / ``_sheet.jpg``），
+    用户自己放进目录的其它文件一律不动。
     """
-    frame_re = _cover_frame_re(base_name)
+    keep_names = {str(name) for name in keep}
     removed: List[Path] = []
     for path in sorted(out_dir.iterdir()):
-        if not path.is_file():
+        if not path.is_file() or path.name in keep_names:
             continue
-        if COVER_CANDIDATE_RE.match(path.name) or frame_re.match(path.name):
+        if (COVER_CANDIDATE_RE.match(path.name)
+                or COVER_FRAME_RE.match(path.name)
+                or path.name == SHEET_NAME):
             try:
                 path.unlink()
                 removed.append(path)
@@ -1732,9 +1751,22 @@ def cmd_cover(args: argparse.Namespace) -> int:
     log(f"安全区：上 {SAFE_TOP:.0%} / 下 {SAFE_BOTTOM:.0%} / 左 {SAFE_LEFT:.0%} / 右 {SAFE_RIGHT:.0%}"
         f"（AGENTS.md 第 4 节；右侧留给平台互动按钮）")
 
-    # 同一 --out 目录重跑时，上一轮帧数更多会留下旧的 cover-N.png / 中间帧（换过标题时还是旧文案）。
-    # 先清掉这些本功能固定命名的文件再写，保证目录里只剩本轮候选。
-    stale = _clean_stale_cover_outputs(out_dir, base_name)
+    # 两阶段：先把本轮所有时间点抽完帧，再清理上一轮残留。
+    # 为什么不能先清：抽帧是 cover 最常见的硬失败（成片损坏 / 时刻解不出画面），
+    # 先删旧候选会让「上一轮已经验证过的好封面」在失败重跑时被删光（R6 实测：坏 mp4 重跑
+    # 把 cover-1..3.png 删了、旧 _sheet.jpg 还留着，自相矛盾）。
+    if not seconds:
+        error("没有可用的抽帧时刻（--frames 里没有任何有效秒数）。请显式传至少一个时刻，例如 "
+              "--frames 3.6,21.7,43.2")
+    frames: List[Tuple[int, float, Path]] = []
+    for index, second in enumerate(seconds, start=1):
+        frame_path = out_dir / f"_{base_name}-frame-{index}.png"
+        _extract_frame(mp4, second, frame_path)
+        frames.append((index, second, frame_path))
+
+    # 抽帧全部成功后，才清掉上一轮本功能固定命名的残留（旧候选 / 旧中间帧 / 旧联系表）；
+    # 本轮刚写的帧用 keep 保护，用户自己放进目录的其它文件一律不动。
+    stale = _clean_stale_cover_outputs(out_dir, keep={path.name for _index, _second, path in frames})
     if stale:
         log(f"已清理上一轮残留：{len(stale)} 个文件（"
             + "、".join(path.name for path in stale[:6]) + ("…" if len(stale) > 6 else "") + "）")
@@ -1742,10 +1774,8 @@ def cmd_cover(args: argparse.Namespace) -> int:
 
     results: List[Dict[str, Any]] = []
     failed = 0
-    for index, second in enumerate(seconds, start=1):
-        frame_path = out_dir / f"_{base_name}-frame-{index}.png"
+    for index, second, frame_path in frames:
         cover_path = out_dir / f"cover-{index}.png"
-        _extract_frame(mp4, second, frame_path)
 
         Image, ImageDraw, _ = _pil()
         with Image.open(frame_path) as src:
@@ -2023,7 +2053,19 @@ def _selftest() -> int:
         res = _check_resolution(_FakeMedia(), p)
         assert res.level == "OK" and res.conf == "project", \
             f"视频号分辨率应为 OK/project，实际 {res.level}/{res.conf}"
-        return "视频号官方建议值只判 WARN，文案含「建议」不含「硬限制/要求」"
+        # conf=project 的项目规范（AGENTS.md 第 1 / 7 节：视频号 1080×1920）违反时必须 ERROR，
+        # 否则交付闸门（0 ERROR）会对违反本项目规范的文件假绿——R6 实测 720×1280 曾只报 WARN。
+        small = _check_resolution(_FakeMedia(width=720, height=1280), p)
+        assert small.level == "ERROR" and small.conf == "project", \
+            f"视频号 720×1280 违反本项目规范应 ERROR，实际 {small.level}/{small.conf}"
+        assert "本项目" in small.advice, small.advice
+        small_third = _check_resolution(_FakeMedia(width=720, height=1280), PLATFORMS["douyin"])
+        assert small_third.level == "WARN" and small_third.conf == "thirdparty", \
+            f"抖音 720×1280 是 thirdparty 口径，只应 WARN，实际 {small_third.level}/{small_third.conf}"
+        horiz = _check_resolution(_FakeMedia(width=1280, height=720), p)
+        assert horiz.level == "ERROR" and horiz.conf == "project", \
+            f"视频号 1280×720（非 1920×1080 横版）违反本项目规范应 ERROR，实际 {horiz.level}/{horiz.conf}"
+        return "视频号官方建议值只判 WARN，文案含「建议」不含「硬限制/要求」；project 档违反判 ERROR"
 
     def fps_thresholds() -> str:
         p = PLATFORMS["shipinhao"]
@@ -2088,18 +2130,20 @@ def _selftest() -> int:
     def stale_cleanup() -> str:
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
-            keep = ["other.png", "cover-abc.png", "note.txt", "_other-frame-1.png"]
-            stale = ["cover-1.png", "cover-2.png", "cover-9.png",
-                     "_demo-frame-1.png", "_demo-frame-2.png"]
+            # keep = 本轮刚抽出的中间帧；其它本功能命名（旧候选 / 旧中间帧 / 旧联系表）都该清掉，
+            # 包括换片子重跑时上一支片子的中间帧（_other-frame-1.png）。
+            keep = ["other.png", "cover-abc.png", "note.txt", "_demo-frame-1.png"]
+            stale = ["cover-1.png", "cover-2.png", "cover-9.png", SHEET_NAME,
+                     "_demo-frame-2.png", "_other-frame-1.png"]
             for name in keep + stale:
                 (out_dir / name).write_bytes(b"x")
-            removed = _clean_stale_cover_outputs(out_dir, "demo")
+            removed = _clean_stale_cover_outputs(out_dir, keep={"_demo-frame-1.png"})
             removed_names = {path.name for path in removed}
             assert removed_names == set(stale), f"清理集合不对：{sorted(removed_names)}"
             remaining = {path.name for path in out_dir.iterdir()}
             assert remaining == set(keep), \
                 f"误删了不该动的文件：{sorted(remaining - set(keep))}"
-        return "重跑清理只删本功能固定命名的旧候选/中间帧，其它文件不动"
+        return "重跑清理只删本功能固定命名的旧候选/中间帧/旧联系表，本轮帧与用户文件不动"
 
     def system_exit_propagates() -> str:
         """check_video 复用失败可以兜底，但 ``sys.exit()`` 这类真失败绝不能被兜底吞掉。

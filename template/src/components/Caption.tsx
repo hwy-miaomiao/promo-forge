@@ -25,6 +25,7 @@ import {
   CAPTION_PAD_Y,
   PALETTE,
   alpha,
+  captionBottomPx,
   captionFontSize,
   captionSideInsets,
   useType,
@@ -112,8 +113,10 @@ export const Caption: React.FC<CaptionProps> = ({ bottom }) => {
   const insets = captionSideInsets(width);
   const availW = Math.max(1, width - insets.left - insets.right);
 
-  // 底部距离：用比例而不是像素，换画幅时字幕自动跟着走
-  const bottomPx = Math.round(height * (bottom ?? cfg.bottom));
+  // 底部距离：用比例而不是像素，换画幅时字幕自动跟着走。
+  // 与硬字幕的 MarginV 同口径（R6）：非法值 / 落在安全区外的值会被夹回安全区，
+  // 不能像以前那样直接把 bottom=1.5 乘成 2880px 把整层字幕推出画面（渲染却退出 0）。
+  const bottomPx = captionBottomPx(height, bottom ?? cfg.bottom);
 
   return (
     <AbsoluteFill

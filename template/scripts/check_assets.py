@@ -91,6 +91,10 @@ SHORT_FILM_S = 45.0
 # 场景衔接、duration 的容差（timing.json 里都是浮点秒）。
 TIME_EPS = 1e-6
 
+# 帧率护栏（R6-TPL-03）：timing.json 的 fps 是「秒 × fps = 帧号」换算与渲染命令的依据，
+# 必须有限正数。模板默认 60；上限按「高帧率但合理」取 240，再高基本都是多写了一个 0。
+MAX_FPS = 240.0
+
 # 引用 public/ 素材的三种写法，全部要抓：
 #   1. staticFile("img/x.png")  —— Remotion 官方写法
 #   2. assetUrl("img/x.png")    —— 本模板 src/assets.ts 的等价助手（网页版也用它）
@@ -247,6 +251,24 @@ def _positive_number(value):
     except (TypeError, ValueError):
         return None
     if not 0 < number < float("inf"):
+        return None
+    return number
+
+
+def _finite_number(value):
+    """把数字字段转成 float；非数字 / 布尔 / NaN / ±Inf 一律 None（调用方报 ERROR）。
+
+    R6-CA-01：Python 的 json.loads 默认接受非标准 NaN / Infinity。裸 `float()` 解析后
+    再比大小的话，NaN 与任何数比较都是 False，会绕过所有范围判断 ——
+    `duration: NaN` / `voice.lines[].at: NaN` / `music.beat: NaN` 都能 0 ERROR 通过。
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
         return None
     return number
 
@@ -601,11 +623,9 @@ def check_timing_structure(report: Report, timing: dict) -> None:
     # 前面那 2 秒既没有画面也没有字幕（Promo 的 <Sequence> 从 0 开始，场景组件在自己窗口外
     # return null，屏幕上就是黑的），但下面的 OK 文案会写「0 ~ N 秒」，看起来一切正常
     # —— 声明的 [0, duration] 覆盖不到开头那段，成片还比 duration 短。
-    try:
-        first_start = float(scenes[0].get("start"))
-    except (TypeError, ValueError):
-        first_start = None
-        problems.append("第一个场景的 start 不是数字（必须从 0 开始）")
+    first_start = _finite_number(scenes[0].get("start"))
+    if first_start is None:
+        problems.append("第一个场景的 start 不是有限数字（NaN/Infinity 也不行；必须从 0 开始）")
     if first_start is not None and abs(first_start) > 1e-4:
         problems.append(
             f"第一个场景「{scenes[0].get('name', '#0')}」start={first_start:g}，不是 0："
@@ -616,11 +636,10 @@ def check_timing_structure(report: Report, timing: dict) -> None:
     previous = None
     for index, scene in enumerate(scenes):
         name = scene.get("name", f"#{index}")
-        try:
-            start = float(scene.get("start"))
-            end = float(scene.get("end"))
-        except (TypeError, ValueError):
-            problems.append(f"场景「{name}」的 start/end 不是数字")
+        start = _finite_number(scene.get("start"))
+        end = _finite_number(scene.get("end"))
+        if start is None or end is None:
+            problems.append(f"场景「{name}」的 start/end 不是有限数字（NaN/Infinity 也不行）")
             continue
         if end <= start:
             problems.append(f"场景「{name}」end({end:g}) ≤ start({start:g})")
@@ -644,17 +663,10 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         )
 
     # duration == 最后一个场景的 end
-    try:
-        last_end = float(scenes[-1].get("end"))
-    except (TypeError, ValueError):
-        last_end = None
-    duration = timing.get("duration")
-    try:
-        duration = float(duration)
-    except (TypeError, ValueError):
-        duration = None
+    last_end = _finite_number(scenes[-1].get("end"))
+    duration = _finite_number(timing.get("duration"))
     if duration is None:
-        report.fail(item, "duration 缺失或不是数字（单位：秒）")
+        report.fail(item, "duration 缺失或不是有限数字（单位：秒；JSON 里不允许写 NaN/Infinity）")
     elif last_end is not None and abs(duration - last_end) > TIME_EPS:
         report.fail(
             item,
@@ -676,11 +688,8 @@ def check_timing_structure(report: Report, timing: dict) -> None:
             "竖屏成片用 9:16，横版用 16:9；自定义比例不在契约里",
         )
     else:
-        try:
-            width = float(timing.get("width"))
-            height = float(timing.get("height"))
-        except (TypeError, ValueError):
-            width = height = None
+        width = _finite_number(timing.get("width"))
+        height = _finite_number(timing.get("height"))
         want_w, want_h = allowed_aspects[aspect]
         if width is None or height is None or width <= 0 or height <= 0:
             report.fail(
@@ -697,6 +706,28 @@ def check_timing_structure(report: Report, timing: dict) -> None:
             )
         else:
             report.ok(item, f"aspect={aspect} 与 width×height={width:g}×{height:g} 一致")
+
+    # 帧率契约（R6-TPL-03）：fps 必须是有限正数、且在合理范围内。
+    # 以前只被 check_video 拿来比成片帧率、被 stills/渲染命令消费 —— fps=0 或 "60"
+    # 在 check_assets 这里 0 ERROR 照过，到 stills/渲染阶段才硬失败或静默错帧。
+    # 字符串也不行：渲染命令会把它拼进 --fps 参数。
+    fps_value = timing.get("fps")
+    if isinstance(fps_value, bool) or not isinstance(fps_value, (int, float)):
+        report.fail(
+            item,
+            f"fps={fps_value!r} 不是数字：必须是有限正数（模板默认 60，上限 {MAX_FPS:g}）。"
+            "帧号换算（秒 × fps）和渲染命令都读它，写字符串/布尔会一路带到渲染阶段才炸",
+        )
+    else:
+        fps_number = _finite_number(fps_value)
+        if fps_number is None or fps_number <= 0 or fps_number > MAX_FPS:
+            report.fail(
+                item,
+                f"fps={fps_value!r} 不是合理帧率：要求 0 < fps ≤ {MAX_FPS:g} 的有限数"
+                "（模板默认 60）。0/负数会让帧号换算恒为 0，NaN/Infinity 直接算不出帧",
+            )
+        else:
+            report.ok(item, f"fps={fps_number:g}（0 < fps ≤ {MAX_FPS:g}）")
 
     # 字幕安全区：单行 ≤13 字、最多 2 行（AGENTS.md 阶段 7）
     captions = _sub_dict(timing, "captions", report, item, "{enabled, maxChars, maxLines, bottom}")
@@ -716,6 +747,36 @@ def check_timing_structure(report: Report, timing: dict) -> None:
             "它是「最多几行」的判据，不是数字就没法算容量（默认 2）",
         )
         max_lines = 2.0
+    # 字幕位置（R6-TPL-03）：captions.bottom / captions.top 是画布高度的比例，必须 0~1 的有限数。
+    # 以前 bottom=1.5 也 0 ERROR 照过 —— 画面内 <Caption> 与硬字幕都按它定位，越界会把字幕
+    # 推出画面或压到平台互动按钮区，而且不报错，要到成片/投平台才发现。模板默认 bottom=0.18。
+    # 类型与 fps 同口径：必须是 int/float（布尔不算），字符串不放过 —— 渲染侧 Number() 虽然能
+    # 把 "0.3" 强转成 0.3，但那只是掩盖类型契约问题；timing.json 是唯一事实来源，类型错了就是错。
+    positions_ok = []
+    for position_key in ("bottom", "top"):
+        if position_key not in captions:
+            continue
+        raw_position = captions.get(position_key)
+        if isinstance(raw_position, bool) or not isinstance(raw_position, (int, float)):
+            report.fail(
+                item,
+                f"captions.{position_key}={raw_position!r} 必须是 0~1 的有限数（不要写字符串）："
+                "与 fps 同口径，类型必须是数字。渲染侧 Number() 会强转，但 timing.json 是唯一"
+                "事实来源，类型写错这里不拦就只是被渲染掩盖",
+            )
+            continue
+        position_value = _finite_number(raw_position)
+        if position_value is None or not (0.0 <= position_value <= 1.0):
+            report.fail(
+                item,
+                f"captions.{position_key}={raw_position!r} 必须是 0~1 的有限数"
+                "（画布高度的比例；模板默认 bottom=0.18，0 贴底、1 贴顶）。"
+                "越界会让画面内字幕和硬字幕一起定位到画面外/平台按钮区，且渲染不报错",
+            )
+        else:
+            positions_ok.append(f"{position_key}={position_value:g}")
+    if positions_ok:
+        report.ok(item, "字幕位置 " + "、".join(positions_ok) + " 都在 0~1 内")
     too_long = []
     for line in (_obj(timing.get("voice")).get("lines", []) or []):
         if not isinstance(line, dict):
@@ -740,34 +801,37 @@ def check_music_fields(report: Report, timing: dict) -> None:
     # 其它消费点（check_audio 等）用 _obj 静默归一，避免同一个字段刷出多条。
     music = _sub_dict(timing, "music", report, item, "{file, source, offset, beat, bar, drop, gain}")
     problems = []
+    beat = bar = None
     for key in ("beat", "bar"):
-        try:
-            value = float(music.get(key))
-        except (TypeError, ValueError):
-            problems.append(f"music.{key} 缺失或不是数字")
+        value = _finite_number(music.get(key))
+        if value is None:
+            problems.append(f"music.{key} 缺失或不是有限数字（NaN/Infinity 也不行；单位：秒）")
             continue
+        if key == "beat":
+            beat = value
+        else:
+            bar = value
         if value <= 0:
             problems.append(f"music.{key}={value:g} 必须 > 0（单位：秒）")
-    try:
-        beat = float(music.get("beat"))
-        bar = float(music.get("bar"))
-        if beat > 0 and bar > 0 and bar < beat - 1e-9:
-            problems.append(f"music.bar={bar:g} 比 music.beat={beat:g} 还短，一个小节不可能少于 1 拍")
-    except (TypeError, ValueError):
-        pass
+    if beat is not None and bar is not None and beat > 0 and bar > 0 and bar < beat - 1e-9:
+        problems.append(f"music.bar={bar:g} 比 music.beat={beat:g} 还短，一个小节不可能少于 1 拍")
 
     drop = music.get("drop")
     if drop not in (None, ""):
-        try:
-            drop_value = float(drop)
-            if drop_value < 0:
-                problems.append(f"music.drop={drop_value:g} 不能是负数（它是第一次爆发的视频时间）")
-            elif drop_value > 4.0:
-                problems.append(
-                    f"music.drop={drop_value:g}s 晚于第 4 秒——AGENTS.md 阶段 5 要求最晚第 4 秒完成第一次爆发"
-                )
-        except (TypeError, ValueError):
-            problems.append(f"music.drop={drop!r} 不是数字")
+        drop_value = _finite_number(drop)
+        if drop_value is None:
+            problems.append(f"music.drop={drop!r} 不是有限数字（NaN/Infinity 也不行）")
+        elif drop_value < 0:
+            problems.append(f"music.drop={drop_value:g} 不能是负数（它是第一次爆发的视频时间）")
+        elif drop_value > 4.0:
+            problems.append(
+                f"music.drop={drop_value:g}s 晚于第 4 秒——AGENTS.md 阶段 5 要求最晚第 4 秒完成第一次爆发"
+            )
+
+    gain = music.get("gain")
+    if gain not in (None, ""):
+        if _finite_number(gain) is None:
+            problems.append(f"music.gain={gain!r} 不是有限数字（NaN/Infinity 也不行）")
 
     # music.segments（剪接片段）的结构校验（R5-CA-03）：
     # 契约见 AGENTS.md 阶段 5：每段是 {"at": 视频时间, "from": 音乐起点, "to": 音乐终点}
@@ -967,10 +1031,13 @@ def check_voice_lines(report: Report, timing: dict) -> None:
         if isinstance(at_raw, bool) or not isinstance(at_raw, (int, float, str)):
             report.fail(item, f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头）")
             continue
-        try:
-            float(at_raw)
-        except (TypeError, ValueError):
-            report.fail(item, f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头）")
+        at_value = _finite_number(at_raw)
+        if at_value is None:
+            report.fail(
+                item,
+                f"第 {line_id} 句的 at={at_raw!r} 不是有限数字（单位：秒，相对片头；"
+                "JSON 里不允许写 NaN/Infinity）",
+            )
             continue
         lines.append(line)
     if not lines:
@@ -1099,6 +1166,10 @@ def check_images(report: Report, timing: dict) -> None:
         try:
             with Image.open(path) as image:
                 width, height = image.size
+                # R6-CA-02：只读头部尺寸会放过「头部有效、数据截断」的图（传输中断 /
+                # 磁盘写满 / 拷贝没完成），到渲染时那张图才会报 image file is truncated。
+                # 这里强制完整解码一遍，坏图在闸门阶段就拦下。
+                image.load()
         except Exception as exc:  # noqa: BLE001 - Pillow 抛的异常类型很多
             unreadable.append((path, str(exc)))
             continue
@@ -1108,7 +1179,11 @@ def check_images(report: Report, timing: dict) -> None:
             large.append((path, width, height))
 
     for path, exc in unreadable:
-        report.fail(item, f"{_rel(path)} 无法用 Pillow 打开（{exc}）；渲染时很可能读不出来")
+        report.fail(
+            item,
+            f"{_rel(path)} 无法完整读取（{exc}）；头部损坏或数据截断都会这样，渲染时读不出来。"
+            "截断的截图请重新截/重新拷贝",
+        )
 
     for path, width, height in small:
         report.warn(
@@ -1624,6 +1699,7 @@ def _selftest() -> int:
 
     # --- json 读取：带 UTF-8 BOM 的 timing/fonts 也要能读（R5-CA-01） ---
     import contextlib
+    import copy
     import io
     import tempfile
 
@@ -1672,13 +1748,103 @@ def _selftest() -> int:
     check("voice.lines 非对象行 → ERROR", _voice_errors([1, 2]) > 0, True)
     check("voice.lines 非数组 → ERROR", _voice_errors("oops") > 0, True)
 
+    # --- 数值有限性（R6-CA-01）：NaN / Infinity 是坏配置，不许静默放行 ---
+    for value, want in (("1.5", 1.5), (2, 2.0), (None, None), (True, None),
+                        ("nan", None), (float("nan"), None),
+                        ("inf", None), (float("inf"), None), ("abc", None)):
+        check(f"_finite_number({value!r})", _finite_number(value), want)
+
+    base_timing = {
+        "slug": "selftest", "fps": 60, "width": 1080, "height": 1920, "aspect": "9:16",
+        "duration": 10.0,
+        "scenes": [{"name": "s1", "start": 0.0, "end": 10.0}],
+        "captions": {"maxChars": 13, "maxLines": 2, "bottom": 0.18},
+        "music": dict(base_music),
+        "voice": {"lines": []},
+    }
+
+    def _timing_structure_errors(mutate) -> int:
+        # deepcopy：下面的夹具会改嵌套的 scenes/captions，浅拷贝会让改动串到下一个用例。
+        timing_fixture = copy.deepcopy(base_timing)
+        mutate(timing_fixture)
+        return _collect_report_errors(
+            lambda report: check_timing_structure(report, timing_fixture))
+
+    check("timing 正常 → 0 ERROR", _timing_structure_errors(lambda t: None), 0)
+    check("timing duration=NaN → ERROR",
+          _timing_structure_errors(lambda t: t.__setitem__("duration", float("nan"))) > 0, True)
+    check("timing 场景 end=NaN → ERROR",
+          _timing_structure_errors(
+              lambda t: t["scenes"][0].__setitem__("end", float("nan"))) > 0, True)
+    check("timing 场景 start=Infinity → ERROR",
+          _timing_structure_errors(
+              lambda t: t["scenes"][0].__setitem__("start", float("inf"))) > 0, True)
+    # --- fps / 字幕位置（R6-TPL-03）：坏帧率与越界字幕位置以前 0 ERROR 照过闸门 ---
+    check("timing fps=0 → ERROR",
+          _timing_structure_errors(lambda t: t.__setitem__("fps", 0)) > 0, True)
+    check("timing fps 字符串 → ERROR",
+          _timing_structure_errors(lambda t: t.__setitem__("fps", "60")) > 0, True)
+    check("timing captions.bottom=1.5 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("bottom", 1.5)) > 0, True)
+    check("timing captions.bottom=0.05 → 0 ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("bottom", 0.05)), 0)
+    # 类型与 fps 同口径（R6 复验 minor）：字符串/布尔/NaN 都必须 ERROR，不能靠 _finite_number 放行数字串。
+    check("timing captions.bottom 字符串 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("bottom", "0.3")) > 0, True)
+    check("timing captions.bottom 布尔 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("bottom", True)) > 0, True)
+    check("timing captions.bottom=NaN → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("bottom", float("nan"))) > 0, True)
+    check("timing captions.top 字符串 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("top", "0.1")) > 0, True)
+    check("music.beat=NaN → ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, beat=float("nan"))})) > 0, True)
+    check("music.gain=NaN → ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, gain=float("nan"))})) > 0, True)
+    check("voice at=NaN → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": float("nan"), "text": "文案"}]) > 0, True)
+
+    # --- 截断图片（R6-CA-02）：头部有效、数据截断，必须 ERROR ---
+    try:
+        from PIL import Image as _PILImage  # type: ignore  # noqa: F401
+        has_pillow = True
+    except ImportError:
+        has_pillow = False
+    if has_pillow:
+        global PROJECT_ROOT
+        original_root = PROJECT_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                PROJECT_ROOT = Path(tmpdir)
+                img_dir = PROJECT_ROOT / "public" / "img"
+                img_dir.mkdir(parents=True)
+                # 1×1 PNG 的头部：IHDR 完整、IDAT 截断 —— Pillow 能读出 size，
+                # 但 load() 必抛 "image file is truncated"。
+                (img_dir / "broken.png").write_bytes(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+                    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc")
+                check("截断 PNG → ERROR",
+                      _collect_report_errors(lambda report: check_images(report, {})) > 0, True)
+            finally:
+                PROJECT_ROOT = original_root
+    else:
+        check("截断 PNG 检查跳过（没有 Pillow）", True, True)
+
     if failures:
         for message in failures:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
     print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
-          "music.segments / voice.lines 全部通过")
+          "music.segments / voice.lines / 数值有限性 / 截断图片 / fps / 字幕位置 全部通过")
     return 0
 
 

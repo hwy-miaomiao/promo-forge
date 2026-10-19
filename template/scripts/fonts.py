@@ -162,6 +162,13 @@ def _read_fonts_cfg() -> Dict[str, Any]:
         raw = C.FONTS_PATH.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         C.error(f"读不到 {C.rel(C.FONTS_PATH)}：文件不存在（模板里必须有这个文件）")
+    except UnicodeDecodeError as exc:
+        # UnicodeDecodeError 是 ValueError 子类，不是 OSError；不单独接住就会裸 traceback
+        # （R6-fonts-01：GBK 存过的 fonts.json 实测直接抛栈，连 ERROR: 行都没有）。
+        C.error(
+            f"{C.rel(C.FONTS_PATH)} 不是 UTF-8 编码：{exc}"
+            "（用编辑器另存为 UTF-8，别存成 GBK/ANSI）"
+        )
     except OSError as exc:
         C.error(f"读不了 {C.rel(C.FONTS_PATH)}：{exc}")
     try:

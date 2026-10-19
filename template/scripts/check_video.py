@@ -258,12 +258,13 @@ def _log_error_hit(line: str) -> bool:
     # 就 return False，真错误被整行吞掉。现在先把「0 errors / No errors」片段抠掉，
     # 剩下的文字里还有错误信号就不豁免，交给后面的 count/ERROR/WORD 判。
     residual = _RX_LOG_ZERO.sub(" ", rest)
-    if _RX_LOG_ZERO.search(rest) and not (
-        _RX_LOG_ERROR_COUNT.search(residual)
-        or _RX_LOG_ERROR.search(residual)
-        or _RX_LOG_ERROR_WORD.search(residual)
-    ):
-        return False
+    if _RX_LOG_ZERO.search(rest):
+        # R6-CV-04：残文里只认 `errors?:` 冒号形式与「N errors」计数，不再认裸 error
+        # 单词 —— `Errors: 0 (error handler installed)` 只是在说明零错误，不该误报。
+        # 真正的同行错误 `Error: … (Errors: 0)` 的 `Error:` 仍在 residual 里，照样命中。
+        return bool(
+            _RX_LOG_ERROR_COUNT.search(residual) or _RX_LOG_ERROR.search(residual)
+        )
     count = _RX_LOG_ERROR_COUNT.search(residual)
     if count:
         return int(count.group(1)) > 0
@@ -568,6 +569,32 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
     width = int(video.get("width") or 0)
     height = int(video.get("height") or 0)
 
+    # R6-CV-03：mp4 可以带 rotate 元数据。ffprobe 的 width/height 是 **coded** 尺寸，
+    # 播放器（以及 ffmpeg 解码端）会按 rotate 把画面转 90°，实际显示尺寸正好反过来。
+    # 只看 coded 尺寸会把「coded 1080×1920、显示 1920×1080」的横版成片判成 9:16 通过，
+    # 而抽帧/联系表又是旋转后的，两边口径自相矛盾。这里统一按显示尺寸判。
+    rotation = 0
+    for side in video.get("side_data_list") or []:
+        try:
+            rotation = int(round(float(side.get("rotation", 0) or 0)))
+        except (TypeError, ValueError):
+            continue
+        if rotation:
+            break
+    if not rotation:
+        try:
+            rotation = int(round(float((video.get("tags") or {}).get("rotate", 0) or 0)))
+        except (TypeError, ValueError):
+            rotation = 0
+    if abs(rotation) % 180 == 90:
+        report.warn(
+            item,
+            f"视频带 rotate={rotation}° 元数据：解码/播放时会旋转 90°，实际显示尺寸是 "
+            f"{height}×{width}，不是 ffprobe 的 coded {width}×{height}。"
+            "Remotion 正常产物不应带 rotate，确认不是外部工具二次写入；下面按显示尺寸判",
+        )
+        width, height = height, width
+
     # --- 分辨率 ---
     if expect:
         match = re.match(r"^\s*(\d+)\s*[x×*]\s*(\d+)\s*$", expect)
@@ -686,6 +713,16 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
             "并确认 Remotion 里用 staticFile 把它挂到了 <Audio> 上，再重新渲染",
         )
     else:
+        audio_streams = [s for s in (probe.get("streams") or [])
+                         if s.get("codec_type") == "audio"]
+        if len(audio_streams) > 1:
+            # R6-CV-05：多条音轨时后面的会被静默忽略（响度/空档/时长都只查第一条），
+            # Remotion 成片正常只有一条；多出来通常意味着 mix.py 输出被重复 mux。
+            report.warn(
+                item,
+                f"检测到 {len(audio_streams)} 条音轨，只有第一条参与响度/空档/音轨时长检查。"
+                "Remotion 成片正常应只有一条音轨，多出来的请确认不是混音文件被重复 mux",
+            )
         report.ok(
             item,
             "有音轨（编码 %s，%s Hz，%s 声道）"
@@ -755,9 +792,30 @@ def check_render_log(report: Report, log_path: Path, required: bool = True) -> N
     text, encoding_note = _decode_log_bytes(raw)
     if encoding_note:
         report.warn(item, encoding_note)
+    if not text.strip():
+        # R6-CV-01：文件存在但 0 行 = 日志闸门没有真的跑过（重定向建了空文件 / 进程
+        # 在启动阶段就被中断 / 磁盘问题）。这和「日志缺失」一样让闸门失效，不能当通过。
+        report.fail(
+            item,
+            f"{_rel(log_path)} 是空的（0 行）：日志存在但没有任何内容，等于渲染日志闸门没跑。"
+            "正常 render script 会写入渲染进度与结果；请确认重定向没有写错文件、"
+            "进程没有在启动阶段被中断，然后重跑渲染",
+        )
+        return
+
+    # R6-CV-02：混合编码（例如前段 UTF-8、后段 UTF-16）只能猜出一种编码，猜错时
+    # ASCII 的 `Error:` 会被藏掉。编码不是干净 UTF-8 时额外用 latin-1 兜底扫一遍
+    # （latin-1 逐字节保留，ASCII 模式不会丢），按行去重后合并进命中判定。
+    scan_lines = text.splitlines()
+    if encoding_note:
+        seen = {line.strip() for line in scan_lines}
+        for line in raw.decode("latin-1").splitlines():
+            stripped = line.strip()
+            if stripped and stripped not in seen:
+                scan_lines.append(line)
 
     hits = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(scan_lines, start=1):
         # AGENTS.md 阶段 9 的词是整行 `.lower()` 之后做子串匹配的（旧实现如此），
         # `Cannot be decoded` / `Failed to load resource` 都要命中；`TimeoutError`
         # 走 `_log_error_hit` 的超时语义正则，不裸匹配 `Timeout`（R5-CV-02）。
@@ -1222,6 +1280,9 @@ def _selftest() -> int:
         "[ERROR:gpu_init.cc(481)] Passthrough is not supported, GL is disabled",
         # R5-CV-02：渲染参数回显不是报错
         "Timeout: 30000 ms (page load budget)",
+        # R6-CV-04：零错误汇总行里提到 error 字样只是在说明没出错，不是报错
+        "Errors: 0 (error handler installed)",
+        "0 errors; error callback not invoked",
     )
     log_true = (
         "Unhandled exception; 0 errors",
@@ -1282,17 +1343,43 @@ def _selftest() -> int:
             check_render_log(report, same_line)
         check("同行 Error:+(Errors: 0) → ERROR", report.errors > 0, True)
 
+        # R6-CV-01：文件存在但 0 行，等于日志闸门没跑，不能当通过
+        empty_log = tmp / "empty.log"
+        empty_log.write_bytes(b"")
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_render_log(report, empty_log)
+        check("空日志（0 行）→ ERROR", report.errors > 0, True)
+
+        # R6-CV-02：混合编码（UTF-8 段 + UTF-16 尾）里 ASCII 的 Error: 不能被藏掉
+        mixed = tmp / "mixed.log"
+        mixed.write_bytes(
+            b"Rendering...\nError: boom\n"
+            + b"\xff\xfe" + "Done\n".encode("utf-16-le"))
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_render_log(report, mixed)
+        check("混合编码日志里的 Error: → ERROR", report.errors > 0, True)
+
     # --- 音轨比视频短：check_spec 必须 ERROR（R5-CV-04，fake ffprobe 数据） ---
-    def _spec_errors(video_dur: float, audio_dur) -> tuple:
-        streams = [
-            {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
-             "width": 1080, "height": 1920, "r_frame_rate": "60/1",
-             "avg_frame_rate": "60/1", "duration": f"{video_dur:.3f}"},
-            {"codec_type": "audio", "codec_name": "aac", "sample_rate": "48000",
-             "channels": 2},
-        ]
-        if audio_dur is not None:
-            streams[1]["duration"] = f"{audio_dur:.3f}"
+    def _spec_errors(video_dur: float, audio_dur, rotation: int = 0,
+                     audio_count: int = 1) -> tuple:
+        video_stream = {
+            "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+            "width": 1080, "height": 1920, "r_frame_rate": "60/1",
+            "avg_frame_rate": "60/1", "duration": f"{video_dur:.3f}",
+        }
+        if rotation:
+            video_stream["side_data_list"] = [{"rotation": rotation}]
+        streams = [video_stream]
+        for _index in range(audio_count):
+            audio = {"codec_type": "audio", "codec_name": "aac",
+                     "sample_rate": "48000", "channels": 2}
+            if audio_dur is not None:
+                audio["duration"] = f"{audio_dur:.3f}"
+            streams.append(audio)
         probe_fixture = {
             "format": {"duration": f"{video_dur:.3f}", "size": "1"},
             "streams": streams,
@@ -1314,6 +1401,12 @@ def _selftest() -> int:
     check("check_spec 音轨短 0.2s（容差内）→ 0 ERROR", errors, 0)
     errors, warnings = _spec_errors(45.0, None)
     check("check_spec 无音轨时长 → 0 ERROR 但有 WARN", (errors, warnings > 0), (0, True))
+    # R6-CV-03：coded 1080×1920 + rotate=90 实际显示 1920×1080，不能按 9:16 通过
+    errors, _warnings = _spec_errors(45.0, 45.0, rotation=90)
+    check("check_spec rotate=90 → 显示尺寸横版 → ERROR", errors > 0, True)
+    # R6-CV-05：多条音轨要留下 WARN，不能静默只查第一条
+    errors, warnings = _spec_errors(45.0, 45.0, audio_count=2)
+    check("check_spec 两条音轨 → WARN", (errors, warnings > 0), (0, True))
 
     # --- ffprobe 帧率分数 ---
     check("_parse_fraction('60/1')", _parse_fraction("60/1"), 60.0)
@@ -1372,8 +1465,8 @@ def _selftest() -> int:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
-    print("OK: selftest — 渲染日志判定 / 日志编码 / 帧率分数 / ebur128 / loudnorm / "
-          "silencedetect / 抽帧时刻 / 音轨时长 全部通过")
+    print("OK: selftest — 渲染日志判定 / 日志编码 / 空日志 / 混合编码 / 帧率分数 / "
+          "ebur128 / loudnorm / silencedetect / 抽帧时刻 / 音轨时长 / rotate / 多音轨 全部通过")
     return 0
 
 

@@ -102,6 +102,20 @@ except ImportError as exc:  # pragma: no cover
     )
 
 
+# ---------------------------------------------------------------------------
+# 项目根：取脚本所在目录的父目录的**逻辑路径**（不 resolve）
+# ---------------------------------------------------------------------------
+# 为什么不用 _common.PROJECT_ROOT：它内部是 Path(__file__).resolve().parent.parent，
+# 会解析目录联接 / 符号链接。项目用 junction（Windows）或 symlink（Unix）共享
+# template/scripts 时，resolve() 会跟着联接跳到模板目录，被误判成「当前目录就是模板本体」
+# 而直接拒绝运行（R6 实测）。这里保留逻辑路径，junction 项目才能正常比对。
+def _logical_project_root(script_path: Path) -> Path:
+    return Path(script_path).absolute().parent.parent
+
+
+LOGICAL_PROJECT_ROOT = _logical_project_root(Path(__file__))
+
+
 # ===========================================================================
 # 常量
 # ===========================================================================
@@ -252,7 +266,8 @@ def locate_template(cli_value):
         attempts.append(f"PROMO_FORGE_TEMPLATE={env_value}")
 
     # 克隆用法：<仓库>/outputs/<slug>/ → <仓库>/template
-    sibling = PROJECT_ROOT.parent.parent / "template"
+    # 用逻辑项目根（不 resolve），junction 项目也能找对 ../.. 那一层
+    sibling = LOGICAL_PROJECT_ROOT.parent.parent / "template"
     found = _normalize_template_candidate(str(sibling))
     if found:
         return found, "相对当前项目 ../..（克隆用法）"
@@ -784,10 +799,52 @@ def _selftest() -> int:
             assert copied_again == 0, f"没有差异时应 0 覆盖，实际 {copied_again}"
         return "apply：备份 / 默认跳过本地较新 / 不删多余 / 重复执行幂等"
 
+    def logical_root_not_resolved() -> str:
+        """项目用目录联接 / 符号链接共享 template/scripts 时，项目根必须保持逻辑路径。
+
+        回归背景（R6）：``_common.PROJECT_ROOT`` 是 ``__file__.resolve().parent.parent``，
+        项目 scripts 是 junction 指向模板 scripts 时会被解析成模板目录，于是 main 误判
+        「当前目录就是模板本体」直接拒绝运行。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real" / "scripts"
+            real.mkdir(parents=True)
+            (real / "sync_template.py").write_text("", encoding="utf-8")
+            proj = base / "project"
+            proj.mkdir(parents=True)
+            link = proj / "scripts"
+            created = False
+            if os.name == "nt":
+                import subprocess
+
+                proc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(real)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                created = proc.returncode == 0 and link.is_dir()
+            else:
+                try:
+                    os.symlink(real, link, target_is_directory=True)
+                    created = link.is_dir()
+                except OSError:
+                    created = False
+            if not created:
+                # 系统不允许建目录联接（受限文件系统 / 无权限）：退化成纯路径语义断言，
+                # 不让环境问题把自测搞红。
+                assert _logical_project_root(proj / "scripts" / "sync_template.py") == proj
+                return "逻辑项目根 = 脚本所在目录的父目录（系统不允许建联接，跳过真实联接用例）"
+            logical = _logical_project_root(link / "sync_template.py")
+            resolved = Path(link / "sync_template.py").resolve().parent.parent
+            assert logical == proj, f"junction 项目的逻辑根被解析到了联接目标：{logical}"
+            assert resolved == real.parent, f"对照断言：resolve() 应跑到 {real.parent}，实际 {resolved}"
+            assert logical != resolved, "逻辑根实现退化成 resolve() 了（junction 项目会被误判成模板本体）"
+        return "逻辑项目根不被 junction/symlink 解析（共享 scripts 的项目不会误判成模板本体）"
+
     named_checks = (
         ("同步分类不重叠（通用 vs 项目自有）", classification),
         ("通用文件集合稳定 + 项目自有边界守卫", common_set_stable),
         ("路径 / 模板目录归一化", path_normalization),
+        ("逻辑项目根不被目录联接解析（junction 不误判模板本体）", logical_root_not_resolved),
         ("compare 六种状态判定", compare_states),
         ("--diff 只读且能打印差异", diff_is_read_only),
         ("--apply 安全语义（备份 / 跳过 / 不删 / 幂等）", apply_is_safe),
@@ -843,7 +900,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(raw_argv)
 
     template_dir, source = locate_template(args.template)
-    project_dir = PROJECT_ROOT.resolve()
+    # 用逻辑项目根（不 resolve）：项目用 junction / symlink 共享 template/scripts 时，
+    # resolve() 会把项目根解析成模板目录，从而误报「当前目录就是模板本体」（R6 实测）。
+    project_dir = LOGICAL_PROJECT_ROOT
 
     if template_dir == project_dir:
         error(

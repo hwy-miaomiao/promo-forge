@@ -130,7 +130,7 @@ promo-forge/
 | `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格（视频号的官方「建议值」只判 WARN），并出三张候选封面 |
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口、`voice.lines` / `music.segments` 结构 |
 | `scripts/check_video.py` | 成片闸门：规格、音轨（含是否覆盖全片）、响度、空档、渲染日志（编码 / 超时语义）+ 逐场景抽帧联系表 |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：6 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查） |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：7 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查，共 10 项） |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖；`--help` 会列出同步范围与「未纳入比对」清单） |
 
@@ -141,12 +141,12 @@ promo-forge/
 脚本里那些容易写错的纯函数逻辑（注释剥离、渲染日志强信号、时间/响度解析、字幕折行、版本解析等）有一组自测，不依赖素材、不需要 ffmpeg、不联网，一条命令全跑：
 
 ```bash
-python template/scripts/selftest.py    # 6 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 9 项）；全过退出码 0
+python template/scripts/selftest.py    # 7 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 10 项）；全过退出码 0
 ```
 
-每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`mix.py`、`doctor.py`、`deliver.py`、`sync_template.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
+每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`mix.py`、`subtitles.py`、`doctor.py`、`deliver.py`、`sync_template.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
 
-除 6 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
+除 7 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
 
 CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
 
