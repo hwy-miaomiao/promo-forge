@@ -889,6 +889,26 @@ def cmd_crop(args: argparse.Namespace) -> int:
 
 FMT_EXT = {"jpg": ".jpg", "jpeg": ".jpg", "png": ".png", "webp": ".webp"}
 
+#: 浏览器/Chromium 能直接可靠解码的色彩模式。
+#: JPEG 的 CMYK（印前/设计导出的图很常见）在 Chromium 里没有颜色管理，常被渲染成
+#: 反色/偏色；16 位灰度、浮点图等也可能解不出来。prepare 的「原样复制」分支必须
+#: 避开这些模式（R7-PY-09：以前 cmyk.jpg 会原样复制进 public/，页面端颜色错误），
+#: 统一重编码成 sRGB 的 RGB（或对应格式的安全模式）再导出。
+_SAFE_MODES = {
+    "jpg": ("RGB", "L"),
+    "jpeg": ("RGB", "L"),
+    "png": ("RGB", "RGBA", "L", "LA", "P", "I;16", "I;16B", "I;16L"),
+    "webp": ("RGB", "RGBA"),
+}
+
+#: 需要转成 RGB 才能可靠交付给浏览器的「非安全」模式（各格式的转换分支共用）。
+_UNSAFE_CONVERT_MODES = ("CMYK", "YCbCr", "LAB", "HSV", "I", "F")
+
+
+def _browser_safe_mode(fmt: str, mode: str) -> bool:
+    """这个色彩模式能否原样交给浏览器（copy 不重编码）？口径见 _SAFE_MODES。"""
+    return mode in _SAFE_MODES.get(fmt, ("RGB",))
+
 
 def cmd_prepare(args: argparse.Namespace) -> int:
     Image, _, _, _ = _pil()
@@ -937,12 +957,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         need_resize = w > args.max
         new_w, new_h = (args.max, max(1, int(round(h * args.max / w)))) if need_resize else (w, h)
         same_format = f.suffix.lower() == FMT_EXT[fmt]
+        source_mode = im.mode
         if same and not need_resize and same_format:
             C.warn(f"{C.rel(f)} 已经符合要求（{w}x{h} {fmt}），跳过")
             total_after += before
             continue
-        if (not need_resize) and same_format and not same:
-            # 尺寸与格式都不用改：原样复制，避免再压一次掉画质
+        if (not need_resize) and same_format and not same and _browser_safe_mode(fmt, source_mode):
+            # 尺寸与格式都不用改、色彩模式浏览器也认：原样复制，避免再压一次掉画质。
+            # CMYK 等浏览器不认的模式不复制（见 _SAFE_MODES 注释），走下面的重编码。
             shutil.copy2(f, target)
             after = target.stat().st_size
             total_after += after
@@ -959,11 +981,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             im = bg
         elif fmt == "jpg":
             im = im.convert("RGB")
-        elif fmt == "png" and im.mode in ("CMYK", "YCbCr", "LAB", "HSV"):
+        elif fmt == "png" and im.mode in _UNSAFE_CONVERT_MODES:
             # Pillow 的 PNG 编码器不支持 CMYK 等模式，原样 save 会抛
             # OSError: cannot write mode CMYK as PNG → 这张图被 WARN 跳过（只它一张时整条
             # 命令退 1「没有任何文件被处理」）。--format png 又正是文档推荐给「保留透明」用的，
             # 而 CMYK 源图在印前/设计导出的 jpg 里很常见。转 RGB 再写（和 jpg 分支一致）。
+            im = im.convert("RGB")
+        elif fmt == "webp" and im.mode in _UNSAFE_CONVERT_MODES:
+            # WebP 编码器只认 RGB/RGBA，CMYK 等模式原样 save 会 OSError → 整张被跳过。
             im = im.convert("RGB")
 
         if need_resize:
@@ -992,7 +1017,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             pct = (after - before) / before * 100
             saved = f"{pct:+.0f}%"
         rows.append([name, f"{w}x{h}", f"{new_w}x{new_h}", C.human(before), C.human(after) + " " + saved,
-                     "缩了" if need_resize else "只转格式"])
+                     "缩了" if need_resize
+                     else ("转 sRGB" if (same_format and not _browser_safe_mode(fmt, source_mode))
+                           else "只转格式")])
 
     if not rows:
         C.error("没有任何文件被处理（见上面的 WARN）")
@@ -1067,6 +1094,86 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 自测（--selftest）
+# ---------------------------------------------------------------------------
+
+def _selftest() -> int:
+    """纯逻辑自测 + 临时目录里用 Pillow 现场造图跑 prepare（R7-PY-09 回归）。
+
+    不读项目素材、不联网、不依赖 ffmpeg；没装 Pillow 时跳过 prepare E2E（本脚本的
+    ``prepare``/``info`` 本来就依赖 Pillow，缺了会自己报错）。
+    """
+    failures: List[str] = []
+    passed = 0
+
+    def check(name: str, got: Any, want: Any) -> None:
+        nonlocal passed
+        if got != want:
+            failures.append(f"{name}: 期望 {want!r}，实际 {got!r}")
+        else:
+            passed += 1
+
+    # --- 色彩模式安全矩阵（PY-09）：浏览器不认的模式不能走「原样复制」 ---
+    for fmt, mode, want in (
+        ("jpg", "CMYK", False),
+        ("jpg", "RGB", True),
+        ("jpg", "L", True),
+        ("png", "RGBA", True),
+        ("png", "CMYK", False),
+        ("webp", "RGBA", True),
+        ("webp", "CMYK", False),
+    ):
+        check(f"_browser_safe_mode({fmt}, {mode})", _browser_safe_mode(fmt, mode), want)
+
+    try:
+        from PIL import Image  # type: ignore  # noqa: F401
+    except ImportError:
+        Image = None  # type: ignore
+    if Image is None:
+        check("prepare 色彩模式 E2E 跳过（没有 Pillow）", True, True)
+    else:
+        import contextlib
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src = tmp_path / "raw"
+            dst = tmp_path / "out"
+            src.mkdir()
+            Image.new("CMYK", (40, 30), (0, 0, 0, 0)).save(src / "cmyk.jpg", format="JPEG")
+            Image.new("RGB", (40, 30), (200, 30, 40)).save(src / "rgb.jpg", format="JPEG")
+            namespace = argparse.Namespace(
+                src=str(src), dst=str(dst), max=1600, format="jpg", quality=90)
+            buffer = io.StringIO()
+            code = 0
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                try:
+                    code = cmd_prepare(namespace)
+                except SystemExit as exc:
+                    code = int(exc.code or 0)
+            check("prepare 处理 CMYK+RGB 两张 → rc=0", code, 0)
+            out_cmyk = dst / "cmyk.jpg"
+            check("prepare CMYK JPEG 有输出", out_cmyk.is_file(), True)
+            if out_cmyk.is_file():
+                with Image.open(out_cmyk) as reopened:
+                    check("prepare CMYK JPEG 输出是 RGB（浏览器可解码）", reopened.mode, "RGB")
+            out_rgb = dst / "rgb.jpg"
+            check("prepare 正常 RGB JPEG 仍原样复制（体积不变）",
+                  out_rgb.stat().st_size if out_rgb.is_file() else None,
+                  (src / "rgb.jpg").stat().st_size)
+
+    if failures:
+        for message in failures:
+            sys.stderr.write(f"ERROR: selftest — {message}\n")
+        sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
+        return 1
+    print("OK: selftest — %d 项断言通过（CMYK 等非浏览器安全色彩模式转 sRGB / 正常 RGB 原样复制）"
+          % passed)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1086,6 +1193,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version="media.py 1.0")
+    p.add_argument("--selftest", action="store_true",
+                   help="只跑纯逻辑自测（不读素材、不联网；prepare 用例需要 Pillow）")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="子命令")
 
     g = sub.add_parser("grab", help="抓 Markdown 里所有图片 URL 并下载",
@@ -1145,7 +1254,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # subparsers 是 required 的，--selftest 必须在解析前短路，否则会被当成缺子命令。
+    if "--selftest" in raw:
+        return _selftest()
+    args = build_parser().parse_args(raw)
     return int(args.func(args) or 0)
 
 

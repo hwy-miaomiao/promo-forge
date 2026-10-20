@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -198,7 +199,10 @@ _RX_LOG_STRONG = (
     # 原生崩溃
     re.compile(r"\bsegmentation fault\b|\bcore dumped\b", re.IGNORECASE),
     # Node 的模块解析失败：错误码 + 报错原文两种真实文案
-    re.compile(r"\bMODULE_NOT_FOUND\b"),
+    # R7-PY-08：Node 的 ERR_MODULE_NOT_FOUND 以 "_" 前缀出现，旧正则 `\bMODULE_NOT_FOUND\b`
+    # 在 "_" 与 "M" 之间没有词边界，裸写法会静默漏报。现在同时命中带 ERR_ 前缀与裸写法，
+    # 但要求 M 前面不是字母（避免误伤 XMODULE_NOT_FOUND 这种造出来的串）。
+    re.compile(r"(?<![A-Za-z])MODULE_NOT_FOUND\b"),
     re.compile(r"cannot find module", re.IGNORECASE),
     re.compile(r"unable to resolve module", re.IGNORECASE),
     # ffmpeg / ffprobe 读到坏输入
@@ -602,6 +606,9 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
             error(f"--expect 格式不对：{expect!r}。请写成 WxH，例如 1080x1920 或 2160x3840。")
         target_w, target_h = int(match.group(1)), int(match.group(2))
         source = "--expect"
+        if target_w <= 0 or target_h <= 0:
+            error(f"--expect 要求宽高都是正数，收到 {expect!r}。0×0 之类会让分辨率检查"
+                  "被整段跳过（等于假通过）；请写成 WxH，例如 1080x1920。")
     else:
         try:
             target_w, target_h = int(timing.get("width")), int(timing.get("height"))
@@ -628,6 +635,14 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
                 f"也不是它的整数倍缩放。横竖屏搞反或尺寸写错都会导致平台二压变形；"
                 f"请核对 timing.json 的 width/height，或显式传 --expect {width}x{height}",
             )
+    else:
+        # target_w/target_h 为 0 时旧代码整段跳过分辨率检查（假通过）。--expect 分支
+        # 已经在上面直接报错；能走到这里的是 timing.json 声明了 0/负数，也必须 ERROR。
+        report.fail(
+            item,
+            f"timing.json 的 width/height 是 {target_w}×{target_h}，不是正数，分辨率检查"
+            f"没法比对（0 会让整段跳过，等于假通过）；请把 width/height 写成 1080/1920",
+        )
 
     # --- 像素格式与编码 ---
     codec = str(video.get("codec_name") or "?")
@@ -650,10 +665,16 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
     # --- 帧率 ---
     actual_fps = _parse_fraction(video.get("r_frame_rate")) or _parse_fraction(video.get("avg_frame_rate"))
     if fps_override is not None:
-        target_fps, fps_source = float(fps_override), "--fps"
-        if target_fps <= 0:
+        fps_source = "--fps"
+        try:
+            target_fps = float(fps_override)
+        except (TypeError, ValueError):
+            target_fps = float("nan")
+        if not math.isfinite(target_fps) or target_fps <= 0:
             report.fail(item, f"--fps 给的是 {target_fps:g}，不是有效帧率；要么去掉 --fps，"
                               "要么给正数（预览版用 --fps 30）")
+            # 置 0 让后面的比对不再给出第二条「帧率不一致」：invalid 值只报一次
+            target_fps = 0.0
     else:
         fps_source = "timing.json"
         try:
@@ -661,11 +682,14 @@ def check_spec(report: Report, probe: dict, timing: dict, path: Path,
         except (TypeError, ValueError):
             target_fps = 0.0
             report.fail(item, "timing.json 的 fps 不是数字，无法比对帧率")
-        if target_fps <= 0:
+        if not math.isfinite(target_fps) or target_fps <= 0:
             # timing.json 的 fps 是 0/负数时，容差判定 abs(actual-0) <= 1 对 30fps 以下
-            # 的产物一律为真，会静默报「帧率通过」——这类畸形值必须显式报错
+            # 的产物一律为真，会静默报「帧率通过」——这类畸形值必须显式报错。
+            # NaN 更危险：`nan <= 0` 和 `nan > 0` 同时为 False，旧代码会绕过报错和比对
+            # 两条路（假绿），所以这里必须用 math.isfinite 显式拦截。
             report.fail(item, f"timing.json 的 fps 是 {target_fps:g}，不是有效帧率；"
                               "改回 60（或预览用的 30）再重渲")
+            target_fps = 0.0
     if target_fps > 0:
         if actual_fps <= 0:
             report.warn(item, "ffprobe 没报出帧率，跳过帧率比对（可能是可变帧率文件）")
@@ -1297,6 +1321,9 @@ def _selftest() -> int:
         "Command timed out after 30000 ms",
         # R5-CV-03：同一行的真错误不能被「Errors: 0」豁免吞掉
         "Error: frame write failed (Errors: 0)",
+        # R7-PY-08：ERR_MODULE_NOT_FOUND 带下划线前缀，旧 \b 词边界会漏报
+        "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'x'",
+        "ERR_MODULE_NOT_FOUND",
     )
     for line in log_false:
         check(f"日志应无报错：{line[:40]!r}", _log_error_hit(line), False)
@@ -1365,7 +1392,8 @@ def _selftest() -> int:
 
     # --- 音轨比视频短：check_spec 必须 ERROR（R5-CV-04，fake ffprobe 数据） ---
     def _spec_errors(video_dur: float, audio_dur, rotation: int = 0,
-                     audio_count: int = 1) -> tuple:
+                     audio_count: int = 1, expect=None, fps_override=None,
+                     timing_fps=60, timing_w=1080, timing_h=1920) -> tuple:
         video_stream = {
             "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
             "width": 1080, "height": 1920, "r_frame_rate": "60/1",
@@ -1385,12 +1413,12 @@ def _selftest() -> int:
             "streams": streams,
         }
         report = Report(strict=False)
-        timing_fixture = {"width": 1080, "height": 1920, "fps": 60,
+        timing_fixture = {"width": timing_w, "height": timing_h, "fps": timing_fps,
                           "duration": video_dur}
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
             check_spec(report, probe_fixture, timing_fixture,
-                       Path("out/final-1080p.mp4"), None, None)
+                       Path("out/final-1080p.mp4"), expect, fps_override)
         return report.errors, report.warnings
 
     errors, _warnings = _spec_errors(45.0, 40.0)
@@ -1407,6 +1435,29 @@ def _selftest() -> int:
     # R6-CV-05：多条音轨要留下 WARN，不能静默只查第一条
     errors, warnings = _spec_errors(45.0, 45.0, audio_count=2)
     check("check_spec 两条音轨 → WARN", (errors, warnings > 0), (0, True))
+    # R7-PY-03：--fps 的 NaN/Infinity 曾被 float() 收下后同时绕过 `<=0` 与 `>0` 两条
+    # 分支，帧率检查整段静默跳过（假绿）。NaN 是特别隐蔽的：两个比较都为 False。
+    errors, _warnings = _spec_errors(45.0, 45.0, fps_override=float("nan"))
+    check("check_spec --fps nan → ERROR（不许静默跳过）", errors > 0, True)
+    errors, _warnings = _spec_errors(45.0, 45.0, fps_override=float("inf"))
+    check("check_spec --fps inf → ERROR", errors > 0, True)
+    errors, _warnings = _spec_errors(45.0, 45.0, timing_fps=float("nan"))
+    check("check_spec timing.json fps=NaN → ERROR", errors > 0, True)
+    errors, _warnings = _spec_errors(45.0, 45.0, fps_override=60.0)
+    check("check_spec --fps 60 → 0 ERROR", errors, 0)
+    # R7-PY-04：--expect 0x0 / 0x1920 曾被 `if target_w and target_h` 整段跳过（假绿）
+    for bad_expect in ("0x0", "0x1920", "1920x0"):
+        raised = False
+        try:
+            _spec_errors(45.0, 45.0, expect=bad_expect)
+        except SystemExit:
+            raised = True
+        check(f"check_spec --expect {bad_expect} → 干净报错退出", raised, True)
+    errors, _warnings = _spec_errors(45.0, 45.0, expect="1080x1920")
+    check("check_spec --expect 1080x1920 → 0 ERROR", errors, 0)
+    # timing.json 的 width/height 为 0 也必须 ERROR（同一处假绿的另一条路径）
+    errors, _warnings = _spec_errors(45.0, 45.0, timing_w=0)
+    check("check_spec timing.json width=0 → ERROR", errors > 0, True)
 
     # --- ffprobe 帧率分数 ---
     check("_parse_fraction('60/1')", _parse_fraction("60/1"), 60.0)

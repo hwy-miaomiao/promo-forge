@@ -11,9 +11,13 @@
 两个子命令：
 
 ``check``
-    对这一支 mp4 逐平台打印检查表（时长 / 分辨率与画幅 / 帧率 / 码率 / 文件体积 /
-    音轨 / 响度），每项给 ``OK`` / ``WARN`` / ``ERROR`` 与「怎么改」的一句话建议。
-    有 ERROR 时非零退出（AGENTS.md 第 7 节语义：发现问题就非零退出并打印 ERROR: 行）。
+    对这一支 mp4 先做两组**全局检查**（所有平台共用）：① 完整解码一遍
+    （``ffmpeg -v error -xerror``，ffprobe 只读元数据，不能证明文件可播）；
+    ② 旋转元数据（``rotate=90`` 时按播放器显示尺寸判定，并与 ``timing.json``
+    声明比对）。然后逐平台打印检查表（时长 / 分辨率与画幅 / 帧率 / 码率 /
+    文件体积 / 音轨 / 响度），每项给 ``OK`` / ``WARN`` / ``ERROR`` 与「怎么改」
+    的一句话建议。有 ERROR 时非零退出（AGENTS.md 第 7 节语义：发现问题就非零
+    退出并打印 ERROR: 行）。
 
 ``cover``
     从成片里抽 3 帧候选，每帧生成一张 1080×1920 封面：叠加品牌名 + 一行标题。
@@ -86,7 +90,8 @@ https://open.douyin.com/platform/resource/docs/openapi/video-management/douyin/c
 
 依赖
 ----
-必需：ffmpeg / ffprobe（硬依赖）、``src/timing.json``、``scripts/_common.py``。
+必需：ffmpeg / ffprobe（硬依赖，``check`` 会用 ffmpeg 完整解码一遍成片）、
+``src/timing.json``、``scripts/_common.py``。
 封面还必需：Pillow（缺了 ``cover`` 直接 ERROR，``check`` 不受影响）。
 复用 ``scripts/check_video.py`` 的解析实现（``_parse_fraction`` / ``_parse_ebur128`` /
 ``_ffprobe``），不重复造轮子；读不到它时退回本文件里的等价实现。
@@ -112,6 +117,7 @@ import json
 import math
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -179,6 +185,11 @@ DEFAULT_LUFS_MIN = -16.0
 DEFAULT_LUFS_MAX = -12.0
 #: 真峰值安全线。来源：AGENTS.md 阶段 8（目标 -1 dBFS，超过 -0.5 dBTP 有削波风险）。
 TRUE_PEAK_WARN_DBTP = -0.5
+
+#: 完整解码校验的超时（秒）。1080p/45s 的成片实测约 1.3s，600s 是给长片留的余量。
+#: 注意：ffprobe 只能读元数据，moov 完整但 mdat 被截断的文件照样「看起来正常」，
+#: 必须真解码一遍才能发现。见 ``_decode_failure``。
+DECODE_TIMEOUT_S = 600
 
 #: 竖屏安全区（相对画面高/宽）。来源：AGENTS.md 第 4 节
 #: 「上 10%、下 18%、左 6%、右 14%（右侧留给平台互动按钮）」，
@@ -623,6 +634,64 @@ def _pick_stream(probe: Dict[str, Any], kind: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _display_rotation(video: Optional[Dict[str, Any]]) -> int:
+    """读视频流的显示旋转角（度）。没写旋转元数据返回 0。
+
+    优先读 ``side_data_list`` 里 displaymatrix 的 ``rotation``（新版 ffmpeg 用这个）；
+    老文件只有 ``tags.rotate``，一并兼容。口径与 ``check_video.py`` 一致：
+    旋转 90/270 时「编码尺寸」与「播放器显示尺寸」宽高互换。
+    """
+    if not video:
+        return 0
+    for item in video.get("side_data_list") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            value = float(item.get("rotation"))
+        except (TypeError, ValueError):
+            continue
+        if value:
+            return int(round(value))
+    tags = video.get("tags") or {}
+    try:
+        value = float(tags.get("rotate"))
+    except (TypeError, ValueError):
+        return 0
+    return int(round(value))
+
+
+def _decode_verdict(returncode: int, stderr_text: str) -> Optional[str]:
+    """把一次完整解码的 (退出码, stderr) 判成 None=通过 / 字符串=失败原因。
+
+    判据：``ffmpeg -v error -xerror`` 下**任何 stderr 都算失败**，不只看退出码。
+    实测截断的 mp4：不加 ``-xerror`` 时 ffmpeg 读到 EOF 就正常退出（rc=0），但
+    ``-v error`` 仍会打出 ``Invalid NAL unit size`` / ``partial file`` 这类解码错误行；
+    完整成片实测 0 行。所以「rc==0 且 stderr 干净」才算解码通过。
+    """
+    lines = [line.strip() for line in (stderr_text or "").splitlines() if line.strip()]
+    if returncode == 0 and not lines:
+        return None
+    brief = "；".join(_dtrim(line, 160) for line in lines[:3]) or f"ffmpeg 退出码 {returncode}"
+    if returncode != 0:
+        return f"解码中断（ffmpeg 退出码 {returncode}）：{brief}"
+    return f"解码过程中报错：{brief}"
+
+
+def _decode_failure(path: Path) -> Optional[str]:
+    """完整解码一遍成片的视频流与音频流；通过返回 None，失败返回原因。"""
+    command = ["ffmpeg", "-hide_banner", "-v", "error", "-xerror", "-nostdin",
+               "-i", str(path), "-f", "null", "-"]
+    try:
+        proc = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=DECODE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"解码校验没跑起来（{type(exc).__name__}: {exc}）"
+    text = proc.stderr.decode("utf-8", errors="replace")
+    return _decode_verdict(proc.returncode, text)
+
+
 # ===========================================================================
 # 成片事实（一次探测，所有平台共用）
 # ===========================================================================
@@ -638,8 +707,18 @@ class Media:
         fmt = self.probe.get("format") or {}
         self.format = fmt
 
-        self.width = int((self.video or {}).get("width") or 0)
-        self.height = int((self.video or {}).get("height") or 0)
+        #: 编码尺寸（ffprobe 的 width/height）。
+        self.coded_width = int((self.video or {}).get("width") or 0)
+        self.coded_height = int((self.video or {}).get("height") or 0)
+        #: 显示旋转角；90/270 时播放器会把画面转过来，宽高互换。
+        self.rotation = _display_rotation(self.video)
+        #: 播放器里观众看到的尺寸（旋转后的显示尺寸）。所有平台判定必须用它：
+        #: 用编码尺寸会让「1080×1920 + rotate=90」这种实际横版的文件按 9:16 假绿
+        #: （R7 PY-02；check_video.py 从 R6 起就按显示尺寸判，两边口径要一致）。
+        if self.rotation % 180 == 90:
+            self.width, self.height = self.coded_height, self.coded_width
+        else:
+            self.width, self.height = self.coded_width, self.coded_height
         #: 有没有视频流。没有视频流的文件（纯音频 mp4、被 ffmpeg -vn 处理过的产物）
         #: 必须直接判 ERROR：它的 width/height 都是 0，画幅 0.0 会越出所有平台的区间，
         #: 于是「越界」这件事只能靠副作用偶然被发现——而抖音/小红书/Shorts 的第三方
@@ -732,11 +811,65 @@ def _check_streams(m: Media, p: Dict[str, Any]) -> Check:
     所以这里给 ERROR，其余检查项按「需人工确认」跳过，避免刷出一堆误导性的红字。
     """
     if m.video is not None:
-        return _mk("视频流", f"{m.codec} / {m.width}×{m.height}", "必须有", "OK", "project")
+        value = f"{m.codec} / {m.width}×{m.height}"
+        if m.rotation % 180 == 90:
+            value += (f"（显示尺寸；编码 {m.coded_width}×{m.coded_height}，"
+                      f"旋转 {m.rotation}°——判定一律按显示尺寸）")
+        return _mk("视频流", value, "必须有", "OK", "project")
     return _mk("视频流", "无", "必须有", "ERROR", "project",
                "这个文件里没有视频流（只有音频流或完全是空的），它不是一支能交付的成片。"
                "常见原因：导出时只写了音频、或误把 mix.py 的产物当成了成片。"
                "请回到 `npm run render:1080` 重新渲染，产物应是 out/final-1080p.mp4")
+
+
+def _check_decodable(m: Media, detail: Optional[str]) -> Check:
+    """完整解码校验：ffprobe 只读元数据，不能证明文件真的能播。
+
+    截断的 mp4 只要 moov 还在，ffprobe 就能报出 45s / 1080×1920 / h264 / aac，
+    ``deliver.py check`` 曾因此对「后半段全丢」的文件假绿（R7 PY-01）。这里完整
+    解码一遍（视频流+音频流，见 ``_decode_failure``），解码错误或 stderr 非空即 ERROR。
+    """
+    if not m.has_video:
+        return _mk("可解码性", "?", "完整解码 0 错误", "INFO", "unknown",
+                   "没有视频流，解码校验无从谈起；先按「视频流」那条 ERROR 重新渲染")
+    if detail is None:
+        return _mk("可解码性", "完整解码通过", "完整解码 0 错误", "OK", "project")
+    return _mk("可解码性", "解码失败", "完整解码 0 错误", "ERROR", "project",
+               detail + "。文件可能在渲染、拷贝或上传过程中被截断/损坏；ffprobe 能读出元数据"
+               "不代表能播，请重新渲染 out/final-1080p.mp4 后再交付")
+
+
+def _check_rotation(m: Media, timing: Dict[str, Any]) -> Check:
+    """旋转元数据：判定必须用显示尺寸，且显示方向要与 timing.json 声明一致。
+
+    R7 PY-02：``1080×1920 + rotate=90`` 的样本，观众看到的是 1920×1080 横版，
+    deliver 旧版按编码尺寸判成 9:16 假绿。check_video.py 自 R6 起按显示尺寸与
+    timing.json 比对并判 ERROR；交付预检用同一口径（本项目规范，conf=project）。
+    """
+    if not m.has_video:
+        return _mk("旋转元数据", "?", "按显示尺寸判定", "INFO", "unknown",
+                   "没有视频流，旋转元数据无从谈起；先按「视频流」那条 ERROR 重新渲染")
+    if m.rotation % 180 == 0:
+        note = "无旋转元数据" if not m.rotation else f"旋转 {m.rotation}°（显示尺寸不变）"
+        return _mk("旋转元数据", note, "按显示尺寸判定", "OK", "project")
+    value = f"rot={m.rotation}° · 显示 {m.width}×{m.height}" \
+            f"（编码 {m.coded_width}×{m.coded_height}）"
+    try:
+        declared = (int(timing.get("width") or 0), int(timing.get("height") or 0))
+    except (TypeError, ValueError):
+        declared = (0, 0)
+    if not declared[0] or not declared[1]:
+        return _mk("旋转元数据", value, "按显示尺寸判定", "WARN", "thirdparty",
+                   "timing.json 没声明 width/height，无法核对显示尺寸；请人眼确认播放器里的方向正确")
+    rule = f"显示尺寸应为 timing.json 声明的 {declared[0]}×{declared[1]}"
+    if (m.width, m.height) == declared:
+        return _mk("旋转元数据", value, rule, "OK", "project")
+    return _mk("旋转元数据", value, rule, "ERROR", "project",
+               f"这个文件的编码尺寸是 {m.coded_width}×{m.coded_height}，但带旋转元数据，"
+               f"播放器/平台会转成 {m.width}×{m.height} 显示——观众看到的方向与 timing.json "
+               f"声明的 {declared[0]}×{declared[1]} 相反（check_video.py 同样按显示尺寸判 ERROR）。"
+               "手机拍摄/剪辑软件导出的素材常带这种元数据；请重新渲染成片，不要直接把它当交付件")
+
 
 
 def _check_duration(m: Media, p: Dict[str, Any]) -> Check:
@@ -1074,8 +1207,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"timing.json 声明 {timing.get('width')}×{timing.get('height')} / {timing.get('fps')}fps / "
         f"{timing.get('duration')}s")
     log("")
-    log("正在探测（ffprobe 读规格 + ffmpeg ebur128 量响度，视片长可能需要十几秒）…")
+    log("正在探测（ffprobe 读规格 + 完整解码校验 + ffmpeg ebur128 量响度，视片长可能需要十几秒）…")
     m = Media(path)
+    decode_detail = _decode_failure(path)
     m.measure_loudness()
 
     log("")
@@ -1092,7 +1226,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         ["文件", rel(path)],
         ["文件体积", human(m.file_size) if m.file_size else "?"],
         ["时长", fmt_sec(m.duration)],
-        ["分辨率", f"{m.width}×{m.height}"],
+        ["分辨率", (f"{m.width}×{m.height}（显示；编码 {m.coded_width}×{m.coded_height}，"
+                    f"旋转 {m.rotation}°）" if m.rotation % 180 == 90
+                    else f"{m.width}×{m.height}")],
         ["画幅", f"{m.aspect_label}（{m.aspect:.4f}）"],
         ["帧率", f"{m.fps:g}fps" if m.fps else "?"],
         ["视频编码 / 像素格式", f"{m.codec} / {m.pix_fmt}"],
@@ -1105,8 +1241,25 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "AGENTS.md 阶段 8 / 第 7 节，与 check_video.py 同口径）"],
     ], widths=[20, 62])
 
-    total_errors = 0
-    total_warns = 0
+    # 全局检查：与平台无关、只和「这支文件是不是一支能交付的成片」有关。
+    # 平台检查各自计数，最后和全局一起汇总（0 ERROR 才算过）。
+    global_checks = [_check_rotation(m, timing), _check_decodable(m, decode_detail)]
+    log("")
+    log("-" * 78)
+    log("全局检查（所有平台共用，先于平台口径）")
+    log("-" * 78)
+    _table(["判定", "项", "实测", "口径", "口径性质"],
+           [[TAG[c.level], c.name, c.value, c.rule, CONF_LABEL.get(c.conf, c.conf)]
+            for c in global_checks])
+    global_advice = [c for c in global_checks if c.advice and c.level in ("ERROR", "WARN")]
+    if global_advice:
+        log("")
+        log("  怎么改：")
+        for c in global_advice:
+            log(f"    · [{c.level}] {c.name}：{c.advice}")
+
+    total_errors = sum(1 for c in global_checks if c.level == "ERROR")
+    total_warns = sum(1 for c in global_checks if c.level == "WARN")
     per_platform: List[Tuple[str, int, int]] = []
     for key in keys:
         e, w = _print_platform_block(m, key, args.lufs_min, args.lufs_max)
@@ -1937,9 +2090,12 @@ def cmd_cover(args: argparse.Namespace) -> int:
 # ===========================================================================
 # 自测（--selftest / scripts/selftest.py）
 #
-# 纯离线：不读素材、不需要 ffmpeg / ffprobe / Pillow、不联网。
+# 大部分是纯离线用例：不读素材、不需要 ffmpeg / ffprobe / Pillow、不联网。
 # 覆盖交付线最容易悄悄回归的纯逻辑：平台表 schema、conf 档位 → 文案映射、
-# 帧率/码率阈值、--frames 解析与折行、--out 预检、旧封面清理。
+# 帧率/码率阈值、--frames 解析与折行、--out 预检、旧封面清理、旋转元数据判定。
+# 其中「可解码性 / 旋转元数据」两个用例会用本机 ffmpeg 现场生成 3 秒小样本
+# （不依赖仓库里的大文件）；本机没装 ffmpeg/ffprobe 时这两个用例自动跳过，
+# 不把「缺工具」误判成测试失败。
 # ===========================================================================
 
 class _FakeMedia:
@@ -1949,9 +2105,14 @@ class _FakeMedia:
                  video_bitrate: Optional[int] = 8_000_000, duration: float = 45.0,
                  codec: str = "h264", pix_fmt: str = "yuv420p",
                  audio_codec: str = "aac", file_size: int = 8_900_000,
-                 lufs: Optional[float] = -14.0, true_peak: Optional[float] = -1.0) -> None:
+                 lufs: Optional[float] = -14.0, true_peak: Optional[float] = -1.0,
+                 rotation: int = 0, coded_width: Optional[int] = None,
+                 coded_height: Optional[int] = None) -> None:
         self.width = width
         self.height = height
+        self.rotation = rotation
+        self.coded_width = width if coded_width is None else coded_width
+        self.coded_height = height if coded_height is None else coded_height
         self.has_video = width > 0 and height > 0
         self.fps = fps
         self.video_bitrate = video_bitrate
@@ -2175,6 +2336,81 @@ def _selftest() -> int:
             globals()["_load_check_video"] = original
         return "复用 check_video 抛 SystemExit 时原样传播（不会被兜底吞成假成功）"
 
+    def decode_verdict_matrix() -> str:
+        assert _decode_verdict(0, "") is None
+        assert _decode_verdict(0, "  \n\t ") is None
+        stats = _decode_verdict(
+            0, "[h264 @ 0x1] Invalid NAL unit size (2471 > 36)\n"
+               "[mov,mp4] stream 0, offset 0x4a0b3: partial file")
+        assert stats is not None and "Invalid NAL unit size" in stats, stats
+        assert "partial file" in stats, stats
+        hard = _decode_verdict(-1094995529, "[mov] corrupt input packet in stream 0")
+        assert hard is not None and "退出码" in hard, hard
+        return "rc=0 但 stderr 有解码错误也判失败（截断文件不加 -xerror 时正是这种形态）"
+
+    def decode_and_rotation_e2e() -> str:
+        """现场生成 3 秒小样本，验证「完整文件通过 / 截断文件 ERROR / rotated 按显示尺寸判」。"""
+        if not (has_cmd("ffmpeg") and has_cmd("ffprobe")):
+            return "跳过（本机没装 ffmpeg/ffprobe；解码与旋转的 E2E 只在装了 ffmpeg 的机器上跑）"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "small.mp4"
+            gen = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-y",
+                 "-f", "lavfi", "-i", "testsrc=duration=3:size=320x568:rate=30",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                 "-movflags", "+faststart", str(src)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+            )
+            if gen.returncode != 0 or not src.is_file():
+                return "跳过（本机 ffmpeg 生成测试样本失败，可能缺 libx264 编码器）"
+            # 正样本：完整文件必须解码通过，可解码性判 OK。
+            normal_detail = _decode_failure(src)
+            assert normal_detail is None, f"完整样本被误判为坏文件：{normal_detail}"
+            normal = Media(src)
+            assert normal.rotation == 0, normal.rotation
+            assert (normal.coded_width, normal.coded_height) == (320, 568), \
+                (normal.coded_width, normal.coded_height)
+            assert (normal.width, normal.height) == (320, 568), (normal.width, normal.height)
+            normal_rotate = _check_rotation(normal, {"width": 320, "height": 568})
+            assert normal_rotate.level == "OK", normal_rotate.level
+            ok_row = _check_decodable(normal, normal_detail)
+            assert ok_row.level == "OK", f"完整样本可解码性应 OK，实际 {ok_row.level}"
+            # 截断样本：只留前 60% 字节（moov 在 faststart 下已在前部，ffprobe 照样读得出
+            # 320×568/3s，但后半段 mdat 丢了 → 必须真解码才能发现）。旧版 deliver 对它 0E 假绿。
+            broken = root / "broken.mp4"
+            broken.write_bytes(src.read_bytes()[: int(src.stat().st_size * 0.6)])
+            broken_detail = _decode_failure(broken)
+            assert broken_detail is not None, "截断样本竟然解码通过了（假绿回归）"
+            bad_row = _check_decodable(normal, broken_detail)
+            assert bad_row.level == "ERROR" and bad_row.conf == "project", \
+                f"截断样本可解码性应 ERROR/project，实际 {bad_row.level}/{bad_row.conf}"
+            # 旋转样本：-display_rotation 90 写 displaymatrix；编码 320×568，显示 568×320。
+            rotated = root / "rotated.mp4"
+            rot = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-y",
+                 "-display_rotation", "90", "-i", str(src), "-c", "copy", str(rotated)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+            )
+            if rot.returncode != 0 or not rotated.is_file():
+                return ("完整样本 / 截断样本通过；旋转样本生成失败（本机 ffmpeg 不支持 "
+                        "-display_rotation），旋转判定已由纯逻辑用例覆盖")
+            m_rot = Media(rotated)
+            assert m_rot.rotation % 180 == 90, m_rot.rotation
+            assert (m_rot.coded_width, m_rot.coded_height) == (320, 568), \
+                (m_rot.coded_width, m_rot.coded_height)
+            assert (m_rot.width, m_rot.height) == (568, 320), \
+                f"显示尺寸没按旋转互换：{m_rot.width}×{m_rot.height}"
+            rotate_error = _check_rotation(m_rot, {"width": 320, "height": 568})
+            assert rotate_error.level == "ERROR" and rotate_error.conf == "project", \
+                f"旋转后显示尺寸与 timing 相反应 ERROR/project，实际 " \
+                f"{rotate_error.level}/{rotate_error.conf}"
+            rotate_ok = _check_rotation(m_rot, {"width": 568, "height": 320})
+            assert rotate_ok.level == "OK", f"显示尺寸与声明一致应 OK，实际 {rotate_ok.level}"
+        return ("3 秒样本：完整文件解码 OK；截断文件 ERROR；rot90 显示 568×320 "
+                "且与 timing 声明相反时 ERROR、一致时 OK")
+
     named_checks = (
         ("平台表 schema / conf 档位合法", platform_schema),
         ("conf 档位 → 文案映射（建议档不写成硬限制）", conf_text_mapping),
@@ -2186,6 +2422,8 @@ def _selftest() -> int:
         ("cover --out 预检（指向文件时干净报错）", cover_out_precheck),
         ("cover 重跑清理（只删本功能产物）", stale_cleanup),
         ("SystemExit 不被兜底吞掉（复用 check_video 的失败要传播）", system_exit_propagates),
+        ("解码判定矩阵：stderr 有错即失败", decode_verdict_matrix),
+        ("解码 / 旋转 E2E（现场生成正样本+截断样本+rot90 样本）", decode_and_rotation_e2e),
     )
     for name, func in named_checks:
         check(name, func)
@@ -2197,7 +2435,7 @@ def _selftest() -> int:
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败（共 {total} 项）\n")
         return 1
     print(f"OK: selftest — 平台表 / conf 文案 / 帧率码率阈值 / --frames / 折行 / "
-          f"cover 预检与清理 全部通过（{total} 项）")
+          f"cover 预检与清理 / 解码判定 / 解码与旋转 E2E 全部通过（{total} 项）")
     return 0
 
 
@@ -2215,7 +2453,10 @@ HELP_TEXT = """promo-forge · 平台交付预检 + 封面候选（deliver.py，A
   python scripts/deliver.py --help
 
 check —— 平台交付预检
-  对这一支 mp4 逐平台打印检查表：时长 / 分辨率与画幅 / 帧率 / 码率 / 文件体积 /
+  先做全局检查（所有平台共用）：完整解码一遍（截断/损坏的文件 ffprobe 读得出元数据，
+  但播不了，必须真解码才能发现）+ 旋转元数据（带 rotate=90/270 的文件按播放器显示尺寸
+  判定，并与 timing.json 的 width/height 比对）。
+  再对这一支 mp4 逐平台打印检查表：时长 / 分辨率与画幅 / 帧率 / 码率 / 文件体积 /
   是否有音轨 / 响度是否在 -16~-12 LUFS。每个平台给 OK / WARN / ERROR 与「怎么改」。
   有 ERROR 时非零退出（AGENTS.md 第 7 节）。
   平台参数区分「平台硬限制（官方文档）」「官方建议值（非硬限制）」
@@ -2239,8 +2480,10 @@ cover —— 生成 3 张封面候选
   上 10% / 下 18% / 左 6% / 右 14%（右侧留给平台互动按钮）。
 
 自测（--selftest）
-  纯函数自测（不读素材 / 不需要 ffmpeg / 不联网）：平台表 schema、conf 档位 → 文案映射、
-  帧率/码率阈值、--frames 解析、封面折行、--out 预检、旧封面清理。
+  大部分是纯函数自测（不读素材 / 不需要 ffmpeg / 不联网）：平台表 schema、conf 档位 → 文案映射、
+  帧率/码率阈值、--frames 解析、封面折行、--out 预检、旧封面清理、解码判定矩阵；
+  另有「解码 / 旋转 E2E」用本机 ffmpeg 现场生成 3 秒样本（正样本 + 截断样本 + rot90 样本），
+  本机没装 ffmpeg 时这一项自动跳过、不算失败。
 
 退出码
   check：0 = 所选平台 0 ERROR；1 = 有 ERROR（或缺依赖/文件不存在）。

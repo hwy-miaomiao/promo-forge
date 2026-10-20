@@ -67,8 +67,11 @@ export const captionUntil = (line: VoiceLine, sceneEnd: number): number =>
 
 /**
  * 当前该显示哪一句。
- * 取"at ≤ now 的最后一句"，并保证它不会跨出自己所属场景的窗口 ——
- * 配音是被人为约束在场景窗口内的（tts.py audit 会检查），字幕跟着场景走才不会串场。
+ * 在「at ≤ now 且还没收起」的候选里取 **at 最大**的一句 —— 不能取数组里的最后一项：
+ * `voice.lines` 不保证按 at 升序（脚本只校验每句 at 落在所属场景窗口内），
+ * 一旦数据没排序而两句字幕窗口又重叠，画面会退回显示较早那句（R7-TS-RO3）。
+ * 同时保证字幕不跨出自己所属场景的窗口 —— 配音被人为约束在场景窗口内
+ * （tts.py audit 会检查），字幕跟着场景走才不会串场。
  */
 export const activeLine = (
   now: number,
@@ -81,7 +84,7 @@ export const activeLine = (
       const scene = scenes.find((s) => s.name === line.scene);
       const sceneEnd = scene ? scene.end : Number.POSITIVE_INFINITY;
       // 还没念完（收起时刻按语速估）/ 还在场景里 → 候选；否则视为已经过期
-      if (now <= captionUntil(line, sceneEnd)) found = line;
+      if (now <= captionUntil(line, sceneEnd) && (found === null || line.at >= found.at)) found = line;
     }
   }
   return found;

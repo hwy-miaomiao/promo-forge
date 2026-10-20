@@ -417,7 +417,7 @@ Remotion 自带的 compositor 精简构建只能渲、不能烧字幕。装完�
 | `scripts/deliver.py` | 交付：平台预检 + 候选封面 | `check <mp4> [--platform douyin\|xiaohongshu\|shipinhao\|shorts\|all]` / `cover [<mp4>] [--title "..."] [--out out/covers] [--frames 3.6,21.7,43.2] [--position bottom\|middle\|top]` / `--selftest` |
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` / `--selftest`（纯函数自测，不读素材） |
 | `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log] [--fps] [--lufs-min] [--lufs-max] [--silence]` / `--selftest` |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；7 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查） | 无 |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；8 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查） | 无 |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（同步范围与「未纳入比对」清单见 `--help`） | `[--diff] [--apply] [--force]` / `--selftest` |
 
@@ -426,7 +426,7 @@ Remotion 自带的 compositor 精简构建只能渲、不能烧字幕。装完�
 | 闸门 | 通过条件 |
 | --- | --- |
 | `doctor.py` | 无 MISSING（WARN 可接受） |
-| `scripts/selftest.py` | 7 个脚本的 `--selftest`（`check_assets` / `check_video` / `mix` / `subtitles` / `doctor` / `deliver` / `sync_template`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描 / 源码 AST 扫描容忍 UTF-8 BOM，共 10 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
+| `scripts/selftest.py` | 8 个脚本的 `--selftest`（`check_assets` / `check_video` / `mix` / `subtitles` / `doctor` / `deliver` / `sync_template` / `media`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描 / 源码 AST 扫描容忍 UTF-8 BOM，共 11 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
 | `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`timing.json` 数值口径合法**（`fps` 必须是有限正数且 `0 < fps ≤ 240`，字符串/布尔/0/负/NaN/Inf = ERROR；`captions.bottom` / `captions.top` 若存在必须是 `0~1` 的有限数，越界 = ERROR，R6-TPL-03）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空、`at` 是数字——不再默认 `at = 0`）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
 | `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；**音轨时长覆盖全片**（音轨比视频短 >0.3 秒 = ERROR，片尾静音 silencedetect 查不到）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`），日志会按字节识别 UTF-8/UTF-16 编码（UTF-16 打 WARN 留痕），超时只认失败语义（`_RX_LOG_TIMEOUT`）不认配置回显；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
 | `mix.py` | 母带后响度复测成功（-14 LUFS ±2 dB）；**测不到成品响度 = ERROR**（闸门失效不等于通过；需要完整版 ffmpeg 的 ebur128，compositor 精简构建跑不通）；每句人声比音乐高 ≥6 dB |

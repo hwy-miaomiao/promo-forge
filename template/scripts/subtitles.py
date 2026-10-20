@@ -1477,7 +1477,15 @@ def _build_ass(cues: List[Cue], timing: Dict[str, Any], path: Path, fontsize: Op
     # 再用「左右安全区可用宽度 / maxChars」压一次上限（V36）：只按高度算时
     # 13 个全角字 × 73px = 949px，会超出 6% + 14% 留白后的 864px，侵入两侧安全区。
     if fontsize:
-        size = float(fontsize)
+        # NaN/Infinity 也是「非 0 的真值」，float() 收下后 round(nan*ratio, 1) 还是 nan，
+        # 会被原样写进 ASS 的 Style 行；libass 对 nan 字号不报错、只渲染出错误大小
+        # （实测同一句字幕的墨迹像素从 37586 掉到 7898），等于静默错结果。这里必须挡死。
+        try:
+            size = float(fontsize)
+        except (TypeError, ValueError):
+            error(f"字号不是数字：{fontsize!r}")
+        if not math.isfinite(size) or size <= 0:
+            error(f"字号必须是有限正数，收到 {fontsize!r}（NaN/Infinity 会让 ASS 渲染出错误字号）")
     else:
         size_by_height = round(play_h * FONT_SCALE)
         size = float(max(FONT_SIZE_MIN, min(size_by_height, int(avail_w // max_chars))))
@@ -1738,11 +1746,13 @@ def cmd_ass(args) -> int:
     # FIX-B P2-20 入口闸门：缺 ffmpeg/ffprobe 必须在这里就非零退出。
     # _audio_duration() 会把 _ffprobe 的 SystemExit 吞成「按字数估算」，所以以前
     # 没装 ffprobe 的机器上会打一堆 ERROR 行、却以退出码 0 写出估算出来的字幕。
+    # 参数校验放在环境闸门之前：非法 --fontsize 不该先报「缺 ffmpeg」。
+    if args.fontsize is not None and (not math.isfinite(args.fontsize) or args.fontsize <= 0):
+        error(f"--fontsize 必须是有限正数，收到 {args.fontsize}（NaN/Infinity 会被写成 ASS 字号，"
+              "渲染出错误大小）")
     _ensure_ffmpeg()
     timing = load_timing()
     out = _resolve_user_path(args.out)
-    if args.fontsize is not None and args.fontsize <= 0:
-        error(f"--fontsize 必须是正数，收到 {args.fontsize}")
     log(f"生成 ASS：{_rel(out)}")
     cues = build_cues(timing)
     _build_ass(cues, timing, out, args.fontsize)
@@ -2155,6 +2165,20 @@ def _selftest() -> int:
                              captions={"enabled": True, "maxChars": 13, "maxLines": 0,
                                        "bottom": 0.18})),
                          "不合法：必须是正整数")
+
+            # --- 9) 字号非法必须挡死（R7-PY-05） ---
+            # NaN/Infinity 是「真值」且能通过 float()，旧代码只判 <= 0 会放行，
+            # 最终 ASS Style 里写 `Fontsize: nan`，rc=0 但 libass 渲染出错误大小。
+            nan_args = argparse.Namespace(out=root / "out" / "f.ass", fontsize=float("nan"))
+            expect_error("--fontsize NaN 报错",
+                         lambda: cmd_ass(nan_args), "有限正数")
+            inf_args = argparse.Namespace(out=root / "out" / "f.ass", fontsize=float("inf"))
+            expect_error("--fontsize Infinity 报错",
+                         lambda: cmd_ass(inf_args), "有限正数")
+            expect_error("_build_ass 直接收 NaN 字号也报错",
+                         lambda: _build_ass([], make_timing([one_line()]),
+                                            root / "out" / "f.ass", float("nan")),
+                         "有限正数")
     finally:
         for name, value in originals.items():
             globals()[name] = value
@@ -2165,7 +2189,7 @@ def _selftest() -> int:
         sys.stderr.write("ERROR: selftest — %d 项失败\n" % len(failures))
         return 1
     print("OK: selftest — %d 项断言通过（ASS 转义 / 字号补偿 / 控制字符 / at 合法性 / "
-          "空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门）" % passed)
+          "空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门 / 字号有限性）" % passed)
     return 0
 
 

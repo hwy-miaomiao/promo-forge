@@ -46,6 +46,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -611,6 +612,21 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
 # 2. timing.json 结构
 # ===========================================================================
 
+def _caption_capacity_width(text: str) -> int:
+    """字幕容量用的「字宽」：全角 1 / 半角 0.5，最后四舍五入。
+
+    与 ``subtitles.py`` 的 ``_vis_len``（``_fold_text``/``_build_ass`` 用的同一套宽度
+    模型）保持同一口径：横屏/竖屏排版判「一行放得下几个字」看的是视觉宽度，不是
+    Unicode 码点个数。旧实现用 ``len(text)`` 数字符：27 个半角字符（URL、英文长句、
+    数字串）实际只有 13.5 个全角字宽，2 行 × 13 的容量明明放得下，却会被误报
+    「超过字幕容量」；反过来全角/emoji 与半角的宽度差也被抹平了。
+    """
+    total = 0.0
+    for char in text:
+        total += 1.0 if unicodedata.east_asian_width(char) in ("W", "F") else 0.5
+    return int(round(total))
+
+
 def check_timing_structure(report: Report, timing: dict) -> None:
     item = "timing.json 结构"
     scenes = [s for s in (timing.get("scenes") or []) if isinstance(s, dict)]
@@ -778,17 +794,22 @@ def check_timing_structure(report: Report, timing: dict) -> None:
     if positions_ok:
         report.ok(item, "字幕位置 " + "、".join(positions_ok) + " 都在 0~1 内")
     too_long = []
+    capacity = max_chars * max_lines
     for line in (_obj(timing.get("voice")).get("lines", []) or []):
         if not isinstance(line, dict):
             continue
         text = str(line.get("text", "") or "")
-        if len(text) > max_chars * max_lines:
-            too_long.append((str(line.get("id", "")), len(text)))
+        # R7-PY-06：按视觉宽度（全角 1 / 半角 0.5）判容量，和 subtitles.py 的 _vis_len
+        # 同口径；用 len() 会把 27 个半角字符（13.5 字宽）误报成超过 2 行 × 13 的容量。
+        vis_width = _caption_capacity_width(text)
+        if vis_width > capacity:
+            too_long.append((str(line.get("id", "")), vis_width))
     if too_long:
-        detail = "、".join(f"第 {lid} 句 {n} 字" for lid, n in too_long)
+        detail = "、".join(f"第 {lid} 句 {n} 字宽" for lid, n in too_long)
         report.warn(
             item,
-            f"这些句子超过字幕容量（{max_lines:g} 行 × {max_chars:g} 字）：{detail}。"
+            f"这些句子超过字幕容量（{max_lines:g} 行 × {max_chars:g} 字，按全角 1 / 半角 0.5 "
+            f"的字宽算）：{detail}。"
             "竖屏字幕会挤爆或被迫缩字号，建议拆句或删字",
         )
     else:
@@ -832,6 +853,18 @@ def check_music_fields(report: Report, timing: dict) -> None:
     if gain not in (None, ""):
         if _finite_number(gain) is None:
             problems.append(f"music.gain={gain!r} 不是有限数字（NaN/Infinity 也不行）")
+
+    # R7-PY-07：music.offset 是「视频时间 = 音乐时间 + offset」的网格平移量（秒），
+    # 之前一个字段都没查。NaN/Infinity 会被 mix.py / music.py 的算术一路带进时间轴，
+    # 而这里是渲染前的闸门，必须比消费端更早拦住。负数合法（配乐可以先于画面起），
+    # 所以只校验有限性、不限制符号。
+    offset = music.get("offset")
+    if offset not in (None, ""):
+        if _finite_number(offset) is None:
+            problems.append(
+                f"music.offset={offset!r} 不是有限数字（NaN/Infinity 也不行；单位：秒，"
+                "含义是视频时间 = 音乐时间 + offset）"
+            )
 
     # music.segments（剪接片段）的结构校验（R5-CA-03）：
     # 契约见 AGENTS.md 阶段 5：每段是 {"at": 视频时间, "from": 音乐起点, "to": 音乐终点}
@@ -1803,12 +1836,53 @@ def _selftest() -> int:
     check("timing captions.top 字符串 → ERROR",
           _timing_structure_errors(
               lambda t: t["captions"].__setitem__("top", "0.1")) > 0, True)
+
+    # --- R7-PY-06：字幕容量按视觉字宽（全角 1 / 半角 0.5）算，不再数字符个数 ---
+    # 27 个半角字符（URL/英文/数字串）只有 13.5 个全角字宽，2 行 × 13 放得下；
+    # 旧实现 len() 数出 27+ 字符会误报「超过字幕容量」。
+    def _caption_capacity_output(lines) -> str:
+        timing_fixture = copy.deepcopy(base_timing)
+        timing_fixture["captions"] = {"maxChars": 13, "maxLines": 2, "bottom": 0.18}
+        timing_fixture["voice"] = {"lines": lines}
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_timing_structure(report, timing_fixture)
+        return buffer.getvalue()
+
+    latin_long = "https://example.com/really/long/path"  # 36 个半角字符 ≈ 18 字宽
+    check("纯拉丁/URL 长句不误报超容量",
+          "超过字幕容量" in _caption_capacity_output(
+              [{"id": "01", "scene": "s1", "at": 2.0, "text": latin_long}]), False)
+    cjk_long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七"  # 27 全角字宽 > 26
+    check("真超宽中文仍报超容量",
+          "超过字幕容量" in _caption_capacity_output(
+              [{"id": "01", "scene": "s1", "at": 2.0, "text": cjk_long}]), True)
+    check("_caption_capacity_width('ab')", _caption_capacity_width("ab"), 1)
+    check("_caption_capacity_width('中文')", _caption_capacity_width("中文"), 2)
+
     check("music.beat=NaN → ERROR", _collect_report_errors(
         lambda report: check_music_fields(
             report, {"music": dict(base_music, beat=float("nan"))})) > 0, True)
     check("music.gain=NaN → ERROR", _collect_report_errors(
         lambda report: check_music_fields(
             report, {"music": dict(base_music, gain=float("nan"))})) > 0, True)
+    # --- R7-PY-07：music.offset 必须有限（旧实现完全没校验） ---
+    check("music.offset=NaN → ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, offset=float("nan"))})) > 0, True)
+    check("music.offset=Infinity → ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, offset=float("inf"))})) > 0, True)
+    check("music.offset=1.5 → 0 ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, offset=1.5)})), 0)
+    check("music.offset=-0.5（允许负偏移）→ 0 ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, offset=-0.5)})), 0)
+    check("music.offset='oops' → ERROR", _collect_report_errors(
+        lambda report: check_music_fields(
+            report, {"music": dict(base_music, offset="oops")})) > 0, True)
     check("voice at=NaN → ERROR", _voice_errors(
         [{"id": "01", "scene": "s1", "at": float("nan"), "text": "文案"}]) > 0, True)
 
@@ -1844,7 +1918,8 @@ def _selftest() -> int:
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
     print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
-          "music.segments / voice.lines / 数值有限性 / 截断图片 / fps / 字幕位置 全部通过")
+          "music.segments / music.offset / voice.lines / 数值有限性 / 截断图片 / fps / "
+          "字幕位置 / 字幕容量字宽 全部通过")
     return 0
 
 

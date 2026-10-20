@@ -11,8 +11,8 @@
 折行、版本解析、缓存键、平台表 & conf 档位、字幕字号补偿 / ASS 转义、同步分类与 --diff 只读……
 不读素材、不跑 ffmpeg、不联网、不需要 node，因此可以放心放进 CI 的 Python 矩阵里。
 
-每个脚本自己的 ``--selftest`` 是唯一事实来源（当前 7 个：check_assets / check_video /
-mix / subtitles / doctor / deliver / sync_template）；本文件只负责逐个跑、汇总、把失败原样带出来
+每个脚本自己的 ``--selftest`` 是唯一事实来源（当前 8 个：check_assets / check_video /
+mix / subtitles / doctor / deliver / sync_template / media）；本文件只负责逐个跑、汇总、把失败原样带出来
 （有失败就非零退出）。另外三道静态兜底：Python 3.9 真写盘 smoke、脚本源码 AST 扫描
 （拒绝 3.10+ 写盘参数）、源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 ``-Encoding utf8``
 会写 BOM，不能让合法脚本假红）。
@@ -34,8 +34,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 #: mix.py 的 --selftest 覆盖响度闸门 / 母带模式预测 / 人声余量阈值 / loudnorm / ebur128
 #: （pr-checks 新增，16 条离线断言，不需要 ffmpeg/numpy）。
 #: subtitles.py 的 --selftest 覆盖 ASS 文本转义 / 字号补偿（Fontsize 行高换算）/
-#: 控制字符 / at 合法性 / 空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门
-#: （21 条离线断言，不需要 ffmpeg/网络）。
+#: 控制字符 / at 合法性 / 空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门 /
+#: 字号有限性（24 条离线断言，不需要 ffmpeg/网络）。
+#: media.py 的 --selftest 覆盖 CMYK 等「浏览器不认的色彩模式」转 sRGB（R7-PY-09：
+#: prepare 以前会把 CMYK JPEG 原样复制进 public/，页面端颜色错误）+ 正常 RGB 仍原样复制
+#: （11 条断言；prepare 用例需要 Pillow，缺了自动跳过）。
 TARGETS = (
     "check_assets.py",
     "check_video.py",
@@ -44,6 +47,7 @@ TARGETS = (
     "doctor.py",
     "deliver.py",
     "sync_template.py",
+    "media.py",
 )
 
 #: Python 3.9 写盘 smoke：``Path.write_text(newline=...)`` 是 3.10+ 的参数，而降级测试

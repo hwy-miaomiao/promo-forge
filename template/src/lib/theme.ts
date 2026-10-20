@@ -17,6 +17,7 @@
 import { useVideoConfig } from "remotion";
 import { TIMING, type BrandColors } from "./timing";
 import { FONT } from "./fonts";
+import { normalizeMaxChars, normalizeMaxLines } from "./captionText";
 
 /* ------------------------------------------------------------------ 颜色 */
 
@@ -236,14 +237,18 @@ export const captionFontSize = (width: number, height: number, maxChars: number)
   const { left, right } = captionSideInsets(width);
   const availW = Math.max(1, width - left - right);
   const sizeByHeight = Math.round(height * CAPTION_FONT_SCALE);
-  return Math.max(CAPTION_FONT_SIZE_MIN, Math.min(sizeByHeight, Math.floor(availW / Math.max(1, maxChars))));
+  // maxChars 非法（缺键 / NaN / ≤0）时按脚本 `_int(...,13)` 口径回退，避免字号变 NaN（R7-TS-RO2）。
+  const chars = normalizeMaxChars(maxChars);
+  return Math.max(CAPTION_FONT_SIZE_MIN, Math.min(sizeByHeight, Math.floor(availW / chars)));
 };
 
 /** 字幕带高度（px）：`maxLines` 行字幕一共占多高（不含底部 bottom 距离）。 */
 export const captionBandHeight = (width: number, height: number, maxChars: number, maxLines: number): number => {
   const size = captionFontSize(width, height, maxChars);
+  // maxLines 同上：非法值回退 2，否则会算出 NaN 高度、把场景里的预留空间整块算错（R7-TS-RO2）。
+  const linesCount = normalizeMaxLines(maxLines);
   const line = size * (TYPE.caption.lineHeight + CAPTION_PAD_Y * 2);
-  return maxLines * line + (maxLines - 1) * size * CAPTION_GAP;
+  return linesCount * line + (linesCount - 1) * size * CAPTION_GAP;
 };
 
 /* ------------------------------------------- 字幕底部距离口径（R6，与 ASS MarginV 同源） */
