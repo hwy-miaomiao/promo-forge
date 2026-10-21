@@ -2113,6 +2113,78 @@ def _selftest() -> int:
     else:
         check("截断 PNG 检查跳过（没有 Pillow）", True, True)
 
+    # --- 决策与成本审计（融合项 B：缺账本 WARN；账本存在则结构/需求确认/付费记账/预算 ERROR）---
+    import contextlib as _contextlib
+    import importlib as _importlib
+    import io as _io
+
+    audit = _importlib.import_module("audit")
+
+    def _collect_report(func):
+        report = Report(strict=False)
+        buffer = _io.StringIO()
+        with _contextlib.redirect_stdout(buffer), _contextlib.redirect_stderr(buffer):
+            func(report)
+        return report
+
+    with tempfile.TemporaryDirectory() as tmpdir_decisions:
+        decision_root = Path(tmpdir_decisions)
+        # 1) 缺 decisions.json → 只 WARN（存量项目不被新闸门拦红）
+        missing_report = _collect_report(
+            lambda report: check_decisions(report, root=decision_root))
+        check("决策审计：缺 decisions.json → 0 ERROR", missing_report.errors, 0)
+        check("决策审计：缺 decisions.json → WARN 提示 init", missing_report.warnings, 1)
+        # 2) init 后只有 D001 技术自决基线 → ERROR（阶段 2 需求确认还没落账）
+        audit.init_decisions(root=decision_root, budget=0)
+        check(
+            "决策审计：init 后缺 user_requirement → ERROR",
+            _collect_report_errors(
+                lambda report: check_decisions(report, root=decision_root)) > 0,
+            True,
+        )
+        # 3) 记上用户需求 → 0 ERROR
+        audit.append_decision(
+            root=decision_root, kind="user_requirement",
+            decision="用户确认：45 秒竖屏，零付费路线")
+        check(
+            "决策审计：记上需求确认 → 0 ERROR",
+            _collect_report_errors(
+                lambda report: check_decisions(report, root=decision_root)),
+            0,
+        )
+        # 4) 花了钱却没写付费服务 → ERROR（付费必须逐项记账）
+        audit.append_decision(
+            root=decision_root, kind="technical_self",
+            decision="买了一个素材包", cost=1, paid_service=None)
+        unbooked_report = _collect_report(
+            lambda report: check_decisions(report, root=decision_root))
+        check(
+            "决策审计：花钱未写付费服务 → ERROR",
+            any("paid_service" in line for line in unbooked_report.rows
+                if line.startswith("ERROR:")),
+            True,
+        )
+        # 5) 付费服务超预算 → ERROR（零付费默认预算 0 元）
+        audit.append_decision(
+            root=decision_root, kind="technical_self",
+            decision="试用付费音色", cost=10, paid_service="ElevenLabs")
+        check(
+            "决策审计：超预算 → ERROR",
+            _collect_report_errors(
+                lambda report: check_decisions(report, root=decision_root)) > 0,
+            True,
+        )
+        # 6) decisions 结构坏（空数组）→ ERROR
+        with open(str(decision_root / "decisions.json"), "w",
+                  encoding="utf-8", newline="\n") as handle:
+            handle.write('{"schema_version": 1, "decisions": []}')
+        check(
+            "决策审计：decisions 为空 → ERROR",
+            _collect_report_errors(
+                lambda report: check_decisions(report, root=decision_root)) > 0,
+            True,
+        )
+
     if failures:
         for message in failures:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
@@ -2121,8 +2193,58 @@ def _selftest() -> int:
     print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
           "music.segments / music.offset / music.drop 必填 / voice.lines / id 唯一性 / "
           "数值有限性 / 数字类型口径 / "
-          "截断图片 / fps / 字幕位置 / 字幕容量字宽 / 旁白字数 全部通过")
+          "截断图片 / fps / 字幕位置 / 字幕容量字宽 / 旁白字数 / 决策账本 全部通过")
     return 0
+
+
+# ===========================================================================
+# 决策与成本审计（融合项 B）
+# ===========================================================================
+
+def check_decisions(report: "Report", root=None) -> None:
+    """产物须有 decisions.json，结构完整、金额不超预算；零付费默认通过。
+
+    对应 AGENTS.md 阶段 9 闸门与「只需人拍板三类事」：谁拍板 / 何时 / 花了多少 /
+    用没用付费服务必须逐项记账。**存量项目缺账本只 WARN 提醒**（不突然把老项目
+    拦红）；账本存在时：结构坏、缺 user_requirement（阶段 2 需求确认）、花了钱却
+    没写付费服务、累计金额超预算都是 ERROR（默认预算 0 元，env ``PROMO_BUDGET_CNY``
+    可调）。
+    """
+    try:
+        import audit  # type: ignore  # 同目录脚本；sys.path 已插入 scripts/
+    except ImportError:
+        report.fail("决策审计", "找不到 scripts/audit.py（决策与成本审计闸门缺失）")
+        return
+    base = Path(root) if root is not None else PROJECT_ROOT
+    path = audit.decisions_path(base)
+    if not path.is_file():
+        # P5：存量项目（模板 copy 出来的老目录）还没有账本时降级为 WARN，
+        # 不因为新增闸门把正常渲染流程拦红；交付前应补建。
+        report.warn(
+            "决策审计",
+            "还没建 %s（存量项目可继续；交付前建议跑 python scripts/audit.py init "
+            "补建决策/成本账本）" % (path,))
+        return
+    data, load_err = audit.load_decisions_file(path)
+    if load_err is not None:
+        report.fail("决策审计", f"{load_err}；先跑 python scripts/audit.py init")
+        return
+    assert data is not None
+    results = audit.validate_decisions(data)
+    for row in results:
+        text = f"{row['item']}：{row['message']}"
+        if row["level"] == "ERROR":
+            report.fail("决策审计", text)
+        else:
+            report.warn("决策审计", text)
+    if not any(row["level"] == "ERROR" for row in results):
+        summary = audit.audit_summary(data)
+        report.ok(
+            "决策审计",
+            "%d 条决策 / 累计 ¥%.2f / 预算 ¥%.2f（%s）"
+            % (summary["count"], summary["total_cost_cny"],
+               summary["budget_cny"], summary["budget_source"]),
+        )
 
 
 # ===========================================================================
@@ -2173,6 +2295,9 @@ def main(argv=None) -> int:
     check_scene_assets(report, timing)
     check_fonts(report, timing)
     check_audio(report, timing)
+    # 融合项 B（成本与决策审计）：产物必须带 decisions.json，结构完整且不超预算。
+    # 放在最后：它独立于素材/时间轴，读的是项目根的账本。
+    check_decisions(report)
 
     log("")
     label = f"检查完成：{report.errors} ERROR / {report.warnings} WARN"

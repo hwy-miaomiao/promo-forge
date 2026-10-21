@@ -12,5 +12,8 @@ audio-src/music/*
 audio-src/vo/*
 !audio-src/**/.gitkeep
 .env
+# 阶段 3 的决策账本 / 阶段 10 的发布清单（项目数据，不入模板）
+decisions.json
+publish/
 __pycache__/
 *.pyc

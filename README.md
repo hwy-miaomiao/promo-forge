@@ -32,6 +32,7 @@ promo-forge 把这件事拆成两半：
 | 画面 | AI 生成图凑 | **真实界面 2 倍图截图**（1080 宽画布需要 2160 像素），AI 图只做包装 |
 | 质量 | 渲完就交 | 渲染前后各有**自动闸门**（缺文件、规格、响度、空档、渲染日志报错）+ 逐场景抽帧审图 |
 | 判断 | "感觉节奏太快/太慢" | 全部量化：快切 ≥0.5 秒、网址 ≥2.5 秒、人声高于音乐 ≥6 dB、母带 -14 LUFS |
+| 交付 | 渲完就交 / 自动发布 | **发布合规检查单**（四平台标题/话题/正文/封面/安全区）+ 决策成本账本；只检查、**绝不自动发布** |
 
 ## 快速开始
 
@@ -107,9 +108,10 @@ promo-forge/
 ├── references/      # 八份方法论：需求问询 / 风格方向 / 素材与截图 / 配乐与卡点 / 配音与字幕 / 校验清单 / 踩坑记录 / 案例复盘
 ├── template/        # 复制到项目里的 Remotion 工程模板
 │   ├── src/         #   timing.json（唯一事实来源）+ Root/Promo + 组件 + 场景
-│   ├── scripts/     #   doctor / capture / media / music / tts / mix / subtitles / fonts / deliver / check_assets / check_video / stills / sync_template
+│   ├── scripts/     #   doctor / capture / media / music / tts / mix / subtitles / fonts / deliver / audit / publish_check / check_assets / check_video / stills / sync_template
 │   ├── web/         #   基于 @remotion/player 的网页播放版
 │   └── public/      #   素材与音频（截图、混音结果）
+├── service/         # 可选的 MCP 服务化入口（零依赖 stdio server，把校验闸门暴露给外部编排器）
 └── outputs/         # 克隆用法下的成片目录（git 忽略）
 ```
 
@@ -129,8 +131,10 @@ promo-forge/
 | `scripts/fonts.py` | 字体子集化：把片子里用到的字从系统字体抽成 300 KB 左右的子集并内嵌，换机器不缺字 |
 | `scripts/deliver.py` | 交付：按抖音 / 小红书 / 视频号 / Shorts 预检规格（视频号的官方「建议值」只判 WARN），并出三张候选封面 |
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口、`voice.lines` / `music.segments` 结构 |
-| `scripts/check_video.py` | 成片闸门：规格、音轨（含是否覆盖全片）、响度、空档、渲染日志（编码 / 超时语义）+ 逐场景抽帧联系表 |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：8 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查，共 11 项） |
+| `scripts/check_video.py` | 成片闸门：规格、音轨（含是否覆盖全片）、响度、空档、渲染日志（编码 / 超时语义）+ 逐场景抽帧联系表 + 决策账本 |
+| `scripts/audit.py` | 决策与成本账本：需求确认必填、付费服务逐项记账（含服务名）、默认 0 元预算（零付费）；超预算 / 缺记录 / 花钱未写服务名由闸门报 ERROR，存量项目缺账本只 WARN |
+| `scripts/publish_check.py` | 四平台发布合规检查单：标题 / 话题 / 正文 / 时长 / 封面 / 字幕安全区 + 成片 MP4 容器校验（文本假视频直接 ERROR），输出 `publish/manifest.json`；只检查不发布 |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：10 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查，共 13 项） |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖；`--help` 会列出同步范围与「未纳入比对」清单） |
 
@@ -141,19 +145,36 @@ promo-forge/
 脚本里那些容易写错的纯函数逻辑（注释剥离、渲染日志强信号、时间/响度解析、字幕折行、版本解析等）有一组自测，不依赖素材、不需要 ffmpeg、不联网，一条命令全跑：
 
 ```bash
-python template/scripts/selftest.py    # 8 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 11 项）；全过退出码 0
+python template/scripts/selftest.py    # 10 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 13 项）；全过退出码 0
 ```
 
-每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`mix.py`、`subtitles.py`、`doctor.py`、`deliver.py`、`sync_template.py`、`media.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
+每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`audit.py`、`publish_check.py`、`mix.py`、`subtitles.py`、`doctor.py`、`deliver.py`、`sync_template.py`、`media.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
 
-除 8 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描所有脚本、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
+除 10 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描 `template/scripts` 与 `service/`、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
 
 CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
 
-- Python 3.9 / 3.12 矩阵：`compileall` + `selftest.py` + 行尾必须 LF；
+- Python 3.9 / 3.12 矩阵：`compileall`（`template/scripts` + `service/`）+ `selftest.py` + MCP 服务集成测试 + 行尾必须 LF；
 - Node 22：`npm install` + `tsc --noEmit`（只做类型检查）。
 
 渲染、成片规格、响度、抽帧审图这些重活仍在本地按 AGENTS.md 第 7 节的闸门跑。
+
+## 服务化入口（MCP，可选）
+
+`service/` 把校验闸门暴露成一个**零依赖的 MCP stdio server**，方便 Cursor / Claude Code / n8n 等外部编排器直接调用，不用记脚本参数。它只做校验：不渲染、不联网、不登录平台、不替你发布。
+
+```bash
+python service/mcp_server.py             # JSON-RPC 2.0，按行 framing（一行一条 UTF-8 JSON）
+python service/test_mcp_integration.py   # 零依赖集成测试（起子进程走 initialize / tools/list / tools/call；CI 同款）
+```
+
+五个工具：`check_assets`（渲染前闸门）、`check_video`（成片闸门）、`music_analyze`（BPM / beat / drop 分析）、`publish_check`（发布合规检查单）、`audit_validate`（决策/成本账本校验）。参数一律是项目路径与少量覆盖项，返回结构化 JSON（`exitCode` / `stats` / `structured` / 日志尾部）。工具 schema、请求示例、错误码与 Docker 说明见 [`service/README.md`](service/README.md)；Dockerfile 只装校验依赖，未在本机实测。
+
+## 和 OpenMontage / MoneyPrinterTurbo 的分工
+
+- **OpenMontage**（agent-first 的通用影视生产系统：多条 pipeline、700+ 技能/知识文件、60+ provider、Backlot 本地审片看板）：它更宽，覆盖纪录片 / 口播 / 动画 / 本地化等；promo-forge 更窄更深，只有「竖屏产品宣传片」一条路，但把竖屏安全区、真实界面 2 倍截图配额、母带 -14 LUFS、人声比音乐 ≥6 dB、节拍一致性 ≥0.9 这些**数值闸门**写死进脚本，0 ERROR 才交付。
+- **MoneyPrinterTurbo**（主题/关键词 → 口播短视频：素材库 + TTS + 字幕 + 配乐）：它是「faceless 短视频」的默认入口；promo-forge 不拼素材库，主角是**真实产品界面**（Playwright 2 倍图截图），且交付前必须过发布合规检查单与决策成本账本。
+- 共同点是产物都是 MP4；区别在「谁拍板」和「怎么判定合格」——promo-forge 只有三类事要人拍板（需求确认、试听声音、只有用户能核实的事实），其余交给量化脚本判定并自动出检查单。
 
 ## 常见问题
 
@@ -187,6 +208,14 @@ CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 f
 会按平台报时长、画幅、帧率、码率、体积、音轨、响度。抖音和小红书的官方口径本项目抓不到，那几条标「需人工确认」——只提示、不参与判定，不会因此刷 WARN；
 视频号那几条官方原文用「建议」的（码率 / 画幅）标「官方建议值（非硬限制）」只判 WARN，不是拒收门槛；标「本项目规范（AGENTS.md）」的才是我们自己的硬规矩（必须有音轨/视频流等）。
 封面用 `python scripts/deliver.py cover out/final-1080p.mp4 --title "你的标题"` 一次出三张候选（1080×1920）+ 联系表，记得逐张看图；重跑时会先清掉上一轮本功能留下的 `cover-*.png` / `_{片子名}-frame-*.png`，不会误删其它文件（`<mp4>` 省略时脚本不报错，会静默套用默认值 `out/final-1080p.mp4`）。
+
+**发布前最后一关怎么过？** 先 `python scripts/audit.py init` 建决策/成本账本，再补一条需求确认记录
+`python scripts/audit.py append --kind user_requirement --decision "确认需求与风格"`（不补会被闸门报 ERROR），然后跑
+`python scripts/publish_check.py --strict` —— 它按抖音 / 快手 / 小红书 / 视频号逐平台检查标题、话题、正文、时长、
+封面数量与尺寸、字幕安全区，并校验成片是结构合法的 MP4（`ftyp`+`moov`；有 ffprobe 再验编码/时长/分辨率，
+没有则显式 WARN），输出 `publish/manifest.json` 并给每平台 `publishable` 结论；0 ERROR 才投，
+`--strict` 把 WARN 也当 ERROR（manifest 与退出码用同一份结果）。`deliver.py check` 0 ERROR 时也会自动生成这份检查单。
+它**只检查、不登录、不自动发布**。被外部编排器调用时用 `service/mcp_server.py`（见上文「服务化入口」）。
 
 ## 参与贡献
 

@@ -176,6 +176,60 @@ def _load_check_video() -> Any:
     return _CV or None
 
 
+# ---------------------------------------------------------------------------
+# 复用 scripts/publish_check.py（融合项 A：发布合规清单；按路径显式加载）
+# ---------------------------------------------------------------------------
+_PC: Any = None
+
+
+def _load_publish_check() -> Any:
+    """按文件路径加载同级 publish_check.py；失败返回 None（只影响清单生成）。"""
+    global _PC
+    if _PC is None:
+        path = Path(__file__).resolve().parent / "publish_check.py"
+        if not path.is_file():
+            _PC = False
+        else:
+            try:
+                spec = importlib.util.spec_from_file_location("pf_publish_check", path)
+                module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                spec.loader.exec_module(module)  # type: ignore[union-attr]
+                _PC = module
+            except Exception:  # noqa: BLE001 - 清单是辅助物，加载失败不该让交付预检挂掉
+                _PC = False
+    return _PC or None
+
+
+def _write_publish_manifest(video_path: Path) -> Optional[Path]:
+    """交付预检 0 ERROR 后生成 publish/manifest.json：四平台发布前检查单。
+
+    这是「发布前检查」而不是「发布」：只写标题/话题/封面/时长口径与 ERROR/WARN
+    清单，账号风控与平台合规由人负责（AGENTS.md 阶段 10）。任何异常都只 warn，
+    不影响交付预检的退出码。
+    """
+    publish_check = _load_publish_check()
+    if publish_check is None:
+        warn("没找到 scripts/publish_check.py，跳过发布合规清单生成")
+        return None
+    try:
+        package = publish_check.build_package(PROJECT_ROOT, video=rel(video_path))
+        results = publish_check.validate_package(package)
+        manifest = publish_check.build_manifest(package, results)
+        target = publish_check.write_manifest(PROJECT_ROOT, manifest)
+    except Exception as exc:  # noqa: BLE001 - 辅助清单失败不阻断交付
+        warn(f"发布合规清单生成失败（{exc}），不影响交付预检结果")
+        return None
+    errors = sum(1 for row in results if row.get("level") == "ERROR")
+    warnings = sum(1 for row in results if row.get("level") == "WARN")
+    if errors:
+        warn(f"发布合规清单有 {errors} ERROR / {warnings} WARN（{rel(target)}）："
+             "按清单修标题/话题/封面/文案后再投平台")
+    else:
+        log(f"发布合规清单已生成：{rel(target)}（0 ERROR / {warnings} WARN）；"
+            "这是检查单，不会自动发布")
+    return target
+
+
 # ===========================================================================
 # 阈值常量（每条都标注来源；与 check_video.py 保持一致）
 # ===========================================================================
@@ -1298,6 +1352,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             "修完再跑 `python scripts/deliver.py cover` 出封面候选。")
         return 1
     log("全部平台 0 ERROR。下一步：`python scripts/deliver.py cover` 出 3 张封面候选挑一张。")
+    # 融合项 A：交付预检通过后顺手生成发布合规检查单（publish/manifest.json）。
+    # 只看「能不能发」的硬口径，不做任何自动发布动作。
+    _write_publish_manifest(path)
     return 0
 
 

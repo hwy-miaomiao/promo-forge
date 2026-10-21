@@ -16,6 +16,9 @@ template/out/*
 !template/out/.gitkeep
 # 抽帧/渲染时 chrome 会往当前目录写 debug.log
 template/debug.log
+# 阶段 3 的决策账本 / 阶段 10 的发布清单（项目数据，模板本体不存）
+template/decisions.json
+template/publish/
 template/public/audio/*
 template/public/img/*
 template/public/fonts/*

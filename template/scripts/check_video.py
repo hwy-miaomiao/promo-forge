@@ -1511,14 +1511,117 @@ def _selftest() -> int:
             expected_times.append(second)
     check("抽帧时刻数", len(expected_times), 4)
 
+    # --- 决策与成本审计（融合项 B：成片产物须有 decisions.json，结构完整不超预算）---
+    import importlib as _importlib
+
+    audit = _importlib.import_module("audit")
+    with tempfile.TemporaryDirectory() as tmpdir_audit:
+        audit_root = Path(tmpdir_audit)
+
+        def _audit_report(**kwargs) -> "Report":
+            audit_report = Report(strict=False)
+            audit_buffer = io.StringIO()
+            with contextlib.redirect_stdout(audit_buffer), contextlib.redirect_stderr(audit_buffer):
+                check_audit(audit_report, root=audit_root, **kwargs)
+            return audit_report
+
+        def _audit_errors(**kwargs) -> int:
+            return _audit_report(**kwargs).errors
+
+        missing = _audit_report()
+        check("决策审计：缺 decisions.json → 0 ERROR", missing.errors, 0)
+        check("决策审计：缺 decisions.json → WARN 提示 init", missing.warnings, 1)
+        audit.init_decisions(root=audit_root, budget=0)
+        check("决策审计：init 后缺需求确认 → ERROR", _audit_errors() > 0, True)
+        audit.append_decision(
+            root=audit_root, kind="user_requirement",
+            decision="用户确认：45 秒竖屏，零付费")
+        check("决策审计：记上需求确认 → 0 ERROR", _audit_errors(), 0)
+        audit.append_decision(
+            root=audit_root, kind="technical_self",
+            decision="试用付费音色", cost=10, paid_service="ElevenLabs")
+        check("决策审计：超预算 → ERROR", _audit_errors() > 0, True)
+        check("决策审计：--budget-cny 覆盖预算后放行", _audit_errors(budget_cny=20.0), 0)
+
+        # 花了钱却没写付费服务（用独立临时目录，避免污染上面的预算用例）
+        with tempfile.TemporaryDirectory() as tmpdir_unbooked:
+            unbooked_root = Path(tmpdir_unbooked)
+            audit.init_decisions(root=unbooked_root, budget=0)
+            audit.append_decision(
+                root=unbooked_root, kind="user_requirement",
+                decision="用户确认：45 秒竖屏，零付费")
+            audit.append_decision(
+                root=unbooked_root, kind="technical_self",
+                decision="买了一个素材包", cost=1, paid_service=None)
+            unbooked_report = Report(strict=False)
+            unbooked_buffer = io.StringIO()
+            with contextlib.redirect_stdout(unbooked_buffer), \
+                    contextlib.redirect_stderr(unbooked_buffer):
+                check_audit(unbooked_report, root=unbooked_root)
+            check("决策审计：花钱未写付费服务 → ERROR", unbooked_report.errors > 0, True)
+
     if failures:
         for message in failures:
             sys.stderr.write(f"ERROR: selftest — {message}\n")
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
     print("OK: selftest — 渲染日志判定 / 日志编码 / 空日志 / 混合编码 / 帧率分数 / "
-          "ebur128 / loudnorm / silencedetect / 抽帧时刻 / 音轨时长 / rotate / 多音轨 全部通过")
+          "ebur128 / loudnorm / silencedetect / 抽帧时刻 / 音轨时长 / rotate / 多音轨 / "
+          "决策成本审计 全部通过")
     return 0
+
+
+# ===========================================================================
+# 决策与成本审计（融合项 B）
+# ===========================================================================
+
+def check_audit(report: "Report", decisions_path=None, budget_cny=None, root=None) -> None:
+    """成片产物须有 decisions.json：结构完整、金额不超预算；零付费默认通过。
+
+    对应 AGENTS.md 阶段 9 闸门与「只需人拍板三类事」。存量项目缺账本只 WARN
+    提醒（交付前应补 init）；账本存在时：结构坏、缺 user_requirement（阶段 2
+    需求确认）、花了钱没写付费服务、累计金额超预算 = ERROR；
+    ``budget_cny`` 参数可临时覆盖预算上限（默认按 ``PROMO_BUDGET_CNY`` →
+    decisions.json → 0 元）。本函数零依赖（不需要 ffmpeg），所以在 main 里排在
+    ffmpeg 环境检查之前执行。
+    """
+    try:
+        import audit  # type: ignore  # 同目录脚本；sys.path 已插入 scripts/
+    except ImportError:
+        report.fail("决策审计", "找不到 scripts/audit.py（决策与成本审计闸门缺失）")
+        return
+    if decisions_path is not None:
+        path = _resolve_project_path(decisions_path)
+    else:
+        base = Path(root) if root is not None else PROJECT_ROOT
+        path = audit.decisions_path(base)
+    if not path.is_file():
+        # P5：存量项目缺账本只 WARN 提醒（交付前应补 init），不把新增闸门做成硬拦。
+        report.warn(
+            "决策审计",
+            "还没建 %s（存量项目可继续；交付前建议跑 python scripts/audit.py init "
+            "补建决策/成本账本）" % (path,))
+        return
+    data, load_err = audit.load_decisions_file(path)
+    if load_err is not None:
+        report.fail("决策审计", f"{load_err}；先跑 python scripts/audit.py init")
+        return
+    assert data is not None
+    results = audit.validate_decisions(data, budget_cny=budget_cny)
+    for row in results:
+        text = f"{row['item']}：{row['message']}"
+        if row["level"] == "ERROR":
+            report.fail("决策审计", text)
+        else:
+            report.warn("决策审计", text)
+    if not any(row["level"] == "ERROR" for row in results):
+        summary = audit.audit_summary(data)
+        report.ok(
+            "决策审计",
+            "%d 条决策 / 累计 ¥%.2f / 预算 ¥%.2f（%s）"
+            % (summary["count"], summary["total_cost_cny"],
+               summary["budget_cny"], summary["budget_source"]),
+        )
 
 
 # ===========================================================================
@@ -1563,12 +1666,16 @@ def main(argv=None) -> int:
                         help=f"响度上限 LUFS（默认 {DEFAULT_LUFS_MAX:g}）")
     parser.add_argument("--silence", type=float, default=DEFAULT_SILENCE_S,
                         help=f"空档判定阈值秒数（默认 {DEFAULT_SILENCE_S:g}）")
+    parser.add_argument("--decisions", default=None,
+                        help="决策/成本账本路径，默认项目根的 decisions.json")
+    parser.add_argument("--budget-cny", type=float, default=None,
+                        help="临时覆盖预算上限（元）；默认 PROMO_BUDGET_CNY → "
+                             "decisions.json budget_limit_cny → 0 元（零付费路线）")
     args = parser.parse_args(raw_argv)
     if not args.video:
         parser.error("需要一个成片路径（例如 out/final-1080p.mp4）；只跑自测请用 --selftest")
 
     report = Report(strict=args.strict)
-    _ensure_tools()
 
     video_path = _resolve_project_path(args.video)
     log(f"成片检查：{_rel(video_path)}")
@@ -1584,6 +1691,12 @@ def main(argv=None) -> int:
         error(f"--lufs-min ({args.lufs_min:g}) 必须小于 --lufs-max ({args.lufs_max:g})。")
 
     timing = load_timing()
+    # 融合项 B（成本与决策审计）：成片交付前先查账本。零付费默认通过；
+    # 账本问题不依赖 ffmpeg，所以放在 _ensure_tools() 之前（P10）：机器没装
+    # ffmpeg 时也能先看到「需求确认没落账 / 超预算」这类可修的 ERROR。
+    check_audit(report, decisions_path=args.decisions, budget_cny=args.budget_cny)
+
+    _ensure_tools()
     probe = _ffprobe(video_path)
     log("")
 
