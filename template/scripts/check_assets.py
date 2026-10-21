@@ -274,6 +274,24 @@ def _finite_number(value):
     return number
 
 
+def _strict_number(value):
+    """把「必须是 JSON 数字」的字段转成 float；字符串 / 布尔 / 非数字一律 None。
+
+    R8-CA-01：为什么不能像 `_finite_number` 那样收数字字符串 —— timing.json 是唯一事实
+    来源，而 TS 侧对这几个字段有**字符串拼接**而不是算术：
+      * `src/components/Scene.tsx` 的 `useAbsTime()`：`framesToSec(frame, fps) + (offset ?? 0)`，
+        offset 是 `scenes[].start`；
+      * `src/components/Caption.tsx` 的 `captionUntil()`：`line.at + Math.max(...)`；
+      * `src/lib/beats.ts` 的 `musicToVideo()`：`musicTime + timing.music.offset`。
+    字符串一旦混进去就是 `"4.5" + 0.15 === "4.50.15"` → 后续 Number/比较得 NaN，
+    画面卡点与画面内字幕整段静默消失，而闸门 0 ERROR。类型口径与 fps /
+    captions.bottom（R6-TPL-03）保持一致：数字写错就是错，不靠渲染侧强转掩盖。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _finite_number(value)
+
+
 def _seconds_value(value):
     """把「秒」字段转成 float；返回 (number, None) 或 (None, 中文原因)。
 
@@ -285,6 +303,10 @@ def _seconds_value(value):
         return None, "缺失（单位：秒，例如 12.0）"
     if isinstance(value, bool):
         return None, f"是布尔值 {value!r}，不是数字"
+    if isinstance(value, str):
+        # R8-CA-01：字符串秒数一律拒绝。mix.py 的 segments 计算（at + from/to 与
+        # 时间轴相加）会静默变成字符串拼接或 NaN，剪接片段整段错位且不报错。
+        return None, f"是字符串 {value!r}（秒数不要加引号）"
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -639,9 +661,9 @@ def check_timing_structure(report: Report, timing: dict) -> None:
     # 前面那 2 秒既没有画面也没有字幕（Promo 的 <Sequence> 从 0 开始，场景组件在自己窗口外
     # return null，屏幕上就是黑的），但下面的 OK 文案会写「0 ~ N 秒」，看起来一切正常
     # —— 声明的 [0, duration] 覆盖不到开头那段，成片还比 duration 短。
-    first_start = _finite_number(scenes[0].get("start"))
+    first_start = _strict_number(scenes[0].get("start"))
     if first_start is None:
-        problems.append("第一个场景的 start 不是有限数字（NaN/Infinity 也不行；必须从 0 开始）")
+        problems.append("第一个场景的 start 不是数字（NaN/Infinity/字符串都不行；必须是不带引号的 0）")
     if first_start is not None and abs(first_start) > 1e-4:
         problems.append(
             f"第一个场景「{scenes[0].get('name', '#0')}」start={first_start:g}，不是 0："
@@ -652,10 +674,13 @@ def check_timing_structure(report: Report, timing: dict) -> None:
     previous = None
     for index, scene in enumerate(scenes):
         name = scene.get("name", f"#{index}")
-        start = _finite_number(scene.get("start"))
-        end = _finite_number(scene.get("end"))
+        start = _strict_number(scene.get("start"))
+        end = _strict_number(scene.get("end"))
         if start is None or end is None:
-            problems.append(f"场景「{name}」的 start/end 不是有限数字（NaN/Infinity 也不行）")
+            problems.append(
+                f"场景「{name}」的 start/end 不是数字（NaN/Infinity 也不行；"
+                "字符串要写成不带引号的数字，否则 useAbsTime/sequence 换算会得 NaN）"
+            )
             continue
         if end <= start:
             problems.append(f"场景「{name}」end({end:g}) ≤ start({start:g})")
@@ -679,10 +704,14 @@ def check_timing_structure(report: Report, timing: dict) -> None:
         )
 
     # duration == 最后一个场景的 end
-    last_end = _finite_number(scenes[-1].get("end"))
-    duration = _finite_number(timing.get("duration"))
+    last_end = _strict_number(scenes[-1].get("end"))
+    duration = _strict_number(timing.get("duration"))
     if duration is None:
-        report.fail(item, "duration 缺失或不是有限数字（单位：秒；JSON 里不允许写 NaN/Infinity）")
+        report.fail(
+            item,
+            "duration 缺失或不是数字（单位：秒；字符串/NaN/Infinity 都不行，"
+            "Root.tsx 的 durationInFrames 直接乘它）",
+        )
     elif last_end is not None and abs(duration - last_end) > TIME_EPS:
         report.fail(
             item,
@@ -704,14 +733,15 @@ def check_timing_structure(report: Report, timing: dict) -> None:
             "竖屏成片用 9:16，横版用 16:9；自定义比例不在契约里",
         )
     else:
-        width = _finite_number(timing.get("width"))
-        height = _finite_number(timing.get("height"))
+        width = _strict_number(timing.get("width"))
+        height = _strict_number(timing.get("height"))
         want_w, want_h = allowed_aspects[aspect]
         if width is None or height is None or width <= 0 or height <= 0:
             report.fail(
                 item,
-                f"aspect={aspect} 但 width/height 缺失或不是正数（现在是 "
-                f"{timing.get('width')!r}×{timing.get('height')!r}）：契约要求两者一致",
+                f"aspect={aspect} 但 width/height 缺失或不是数字（现在是 "
+                f"{timing.get('width')!r}×{timing.get('height')!r}）：字符串/布尔都不行，"
+                "契约要求两者一致",
             )
         elif abs(height - width * want_h / want_w) > 1.0:
             report.fail(
@@ -747,20 +777,24 @@ def check_timing_structure(report: Report, timing: dict) -> None:
 
     # 字幕安全区：单行 ≤13 字、最多 2 行（AGENTS.md 阶段 7）
     captions = _sub_dict(timing, "captions", report, item, "{enabled, maxChars, maxLines, bottom}")
-    max_chars = _positive_number(captions.get("maxChars", 13))
-    max_lines = _positive_number(captions.get("maxLines", 2))
+    # 与 fps / bottom 同口径：必须是 JSON 数字（字符串 "13" 会先被 _strict_number 拦下）。
+    # maxChars 在 TS 侧走 normalizeMaxChars()（非数字回退模板默认 13），Python 侧
+    # subtitles.py 的 _int() 也回退 13 —— 若这里放行字符串 "20"，容量按 20 算、
+    # 实际渲染按 13 折行，检查结论和画面就不是同一件事。
+    max_chars = _positive_number(_strict_number(captions.get("maxChars", 13)))
+    max_lines = _positive_number(_strict_number(captions.get("maxLines", 2)))
     if max_chars is None:
         report.fail(
             item,
-            f"captions.maxChars 必须是正数，现在是 {captions.get('maxChars')!r}："
-            "它是「一行放多少字」的判据，不是数字就没法算容量（默认 13）",
+            f"captions.maxChars 必须是数字，现在是 {captions.get('maxChars')!r}："
+            "它是「一行放多少字」的判据，字符串/非正数就没法算容量（默认 13）",
         )
         max_chars = 13.0
     if max_lines is None:
         report.fail(
             item,
-            f"captions.maxLines 必须是正数，现在是 {captions.get('maxLines')!r}："
-            "它是「最多几行」的判据，不是数字就没法算容量（默认 2）",
+            f"captions.maxLines 必须是数字，现在是 {captions.get('maxLines')!r}："
+            "它是「最多几行」的判据，字符串/非正数就没法算容量（默认 2）",
         )
         max_lines = 2.0
     # 字幕位置（R6-TPL-03）：captions.bottom / captions.top 是画布高度的比例，必须 0~1 的有限数。
@@ -824,9 +858,13 @@ def check_music_fields(report: Report, timing: dict) -> None:
     problems = []
     beat = bar = None
     for key in ("beat", "bar"):
-        value = _finite_number(music.get(key))
+        # R8-CA-01：严格数字。beats.ts 的 beatAt/barAt 用 beat/bar 做 Math.round 吸附，
+        # 字符串会让比较与乘法得 NaN，卡点整段失效而渲染不报错。
+        value = _strict_number(music.get(key))
         if value is None:
-            problems.append(f"music.{key} 缺失或不是有限数字（NaN/Infinity 也不行；单位：秒）")
+            problems.append(
+                f"music.{key} 缺失或不是数字（NaN/Infinity/字符串都不行；单位：秒）"
+            )
             continue
         if key == "beat":
             beat = value
@@ -837,9 +875,18 @@ def check_music_fields(report: Report, timing: dict) -> None:
     if beat is not None and bar is not None and beat > 0 and bar > 0 and bar < beat - 1e-9:
         problems.append(f"music.bar={bar:g} 比 music.beat={beat:g} 还短，一个小节不可能少于 1 拍")
 
+    # R8-CA-05：music.drop 是必填字段（`src/lib/timing.ts` 的 `Music` 类型标为必填），
+    # 渲染侧 `src/scenes/Hook.tsx` 直接 `TIMING.music.drop - beat.start` 算钩子爆发时刻：
+    # 缺失时 `undefined - number = NaN`，钩子/爆发整段静默失效而渲染不报错。
+    # 旧实现是「存在时才查」，漏写 drop 能 0 ERROR 过闸门 —— 与 R8-CA-01 同类，这里收口。
     drop = music.get("drop")
-    if drop not in (None, ""):
-        drop_value = _finite_number(drop)
+    if drop is None or drop == "":
+        problems.append(
+            "music.drop 缺失（必填：第一次爆发的视频时间，单位秒）："
+            "src/scenes/Hook.tsx 直接拿它做算术，缺失/空串会让钩子爆发变成 NaN 且渲染不报错"
+        )
+    else:
+        drop_value = _strict_number(drop)
         if drop_value is None:
             problems.append(f"music.drop={drop!r} 不是有限数字（NaN/Infinity 也不行）")
         elif drop_value < 0:
@@ -849,18 +896,28 @@ def check_music_fields(report: Report, timing: dict) -> None:
                 f"music.drop={drop_value:g}s 晚于第 4 秒——AGENTS.md 阶段 5 要求最晚第 4 秒完成第一次爆发"
             )
 
+    # R8-CA-05：music.gain 保持「存在时校验」的宽松口径 —— mix.py 对缺失 gain 用
+    # DEFAULT_MUSIC_GAIN=0.6，TS 侧不消费这个字段，省略是有意支持的；别改成必填。
     gain = music.get("gain")
     if gain not in (None, ""):
-        if _finite_number(gain) is None:
+        if _strict_number(gain) is None:
             problems.append(f"music.gain={gain!r} 不是有限数字（NaN/Infinity 也不行）")
 
     # R7-PY-07：music.offset 是「视频时间 = 音乐时间 + offset」的网格平移量（秒），
     # 之前一个字段都没查。NaN/Infinity 会被 mix.py / music.py 的算术一路带进时间轴，
     # 而这里是渲染前的闸门，必须比消费端更早拦住。负数合法（配乐可以先于画面起），
     # 所以只校验有限性、不限制符号。
+    # R8-CA-05：offset 同时也是**必填**字段（`src/lib/timing.ts` 的 `Music` 必填），
+    # `src/lib/beats.ts` 的 `musicToVideo()` 直接 `musicTime + timing.music.offset`：
+    # 缺失时 `number + undefined = NaN`，全片卡点/网格整段失效而渲染不报错，故缺失/空串 ERROR。
     offset = music.get("offset")
-    if offset not in (None, ""):
-        if _finite_number(offset) is None:
+    if offset is None or offset == "":
+        problems.append(
+            "music.offset 缺失（必填：视频时间 = 音乐时间 + offset，单位秒）："
+            "src/lib/beats.ts 的 musicToVideo() 直接拿它相加，缺失/空串会让卡点网格变成 NaN 且渲染不报错"
+        )
+    else:
+        if _strict_number(offset) is None:
             problems.append(
                 f"music.offset={offset!r} 不是有限数字（NaN/Infinity 也不行；单位：秒，"
                 "含义是视频时间 = 音乐时间 + offset）"
@@ -1061,8 +1118,15 @@ def check_voice_lines(report: Report, timing: dict) -> None:
             report.fail(item, f"第 {line_id} 句的 scene 是空的")
             continue
         at_raw = line.get("at")
-        if isinstance(at_raw, bool) or not isinstance(at_raw, (int, float, str)):
-            report.fail(item, f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头）")
+        # R8-CA-01：不再接受数字字符串。"at" 是 Caption.tsx 里 `line.at + Math.max(...)`
+        # 的直接输入，字符串 "5.0" 会拼成 "5.02.5" → captionUntil 变 NaN，画面内字幕
+        # 整段不出现且渲染不报错。类型口径与 fps / captions.bottom 一致。
+        if isinstance(at_raw, bool) or not isinstance(at_raw, (int, float)):
+            report.fail(
+                item,
+                f"第 {line_id} 句的 at={at_raw!r} 不是数字（单位：秒，相对片头；"
+                "字符串要写成不带引号的数字，否则字幕会静默消失）",
+            )
             continue
         at_value = _finite_number(at_raw)
         if at_value is None:
@@ -1073,6 +1137,31 @@ def check_voice_lines(report: Report, timing: dict) -> None:
             )
             continue
         lines.append(line)
+
+    # R8-CA-02：id 唯一性。id 是 audio-src/vo/<id>.mp3 的文件名、tts.py 的缓存键与
+    # report.json 的索引；重复时后一句的配音会覆盖前一句，而字幕/混音仍按各句 text 摆位，
+    # 成片里画面字幕与听到的话对不上，所有闸门却 0 ERROR（R8 已复现）。
+    seen_ids = {}
+    duplicate_ids = []
+    for index, line in enumerate(declared):
+        if not isinstance(line, dict):
+            continue
+        line_id = str(line.get("id", "")).strip()
+        if not line_id:
+            continue
+        first = seen_ids.get(line_id)
+        if first is None:
+            seen_ids[line_id] = index
+        else:
+            duplicate_ids.append((line_id, first, index))
+    for line_id, first, again in duplicate_ids:
+        report.fail(
+            item,
+            f"voice.lines 的 id「{line_id}」重复（voice.lines[{first}] 与 voice.lines[{again}]）："
+            "每句 id 必须唯一 —— 它是 audio-src/vo/<id>.mp3 的文件名与 report.json 的索引，"
+            "重复会让后一句的配音覆盖前一句（字幕和听到的话对不上）且不报错",
+        )
+
     if not lines:
         return
 
@@ -1134,9 +1223,15 @@ def check_voice_length(report: Report, timing: dict) -> None:
             bad_window.append((line_id, start, end))
             continue
         budget = CHARS_PER_SEC * window
-        if len(text) > budget:
-            cut = int(round(len(text) - budget + 0.49))
-            over.append((line_id, len(text), window, max(1, cut)))
+        # R8-CA-03：字数按「视觉字宽」算（全角 1、半角 0.5，同 _caption_capacity_width()、
+        # subtitles.py::_vis_len 与画面内 Caption 的折行口径）。旧代码用 len() 数码点：
+        # 32 字符的英文句会被判成 32「字」，在本窗口里 WARN「超过 6.5 字/秒预算，建议删 8 个字」，
+        # 而同一次检查的「字幕容量」却判「放得下」—— 同份报告自相矛盾，且英文 TTS
+        # (~15 字符/秒) 实际塞得进。中文全角字符的字宽仍是 1，判定不变。
+        width = _caption_capacity_width(text)
+        if width > budget:
+            cut = int(round(width - budget + 0.49))
+            over.append((line_id, width, window, max(1, cut)))
     for line_id, start, end in bad_window:
         report.warn(
             item,
@@ -1148,8 +1243,9 @@ def check_voice_length(report: Report, timing: dict) -> None:
         for line_id, count, window, cut in over:
             report.warn(
                 item,
-                f"第 {line_id} 句 {count} 字 / 窗口 {window:.2f}s 只能放 {CHARS_PER_SEC * window:.1f} 字"
-                f"（按 {CHARS_PER_SEC} 字/秒）——建议删掉 {cut} 个字。"
+                f"第 {line_id} 句 {count} 字宽（全角 1 / 半角 0.5）/ 窗口 {window:.2f}s "
+                f"只能放 {CHARS_PER_SEC * window:.1f} 字（按 {CHARS_PER_SEC} 字/秒）"
+                f"——建议删掉 {cut} 个字。"
                 "AGENTS.md 阶段 7：字数超窗口必须改稿，不许靠加速硬压",
             )
     else:
@@ -1751,7 +1847,9 @@ def _selftest() -> int:
         return report.errors
 
     # --- music.segments 结构校验（R5-CA-03）：坏段必须 ERROR ---
-    base_music = {"beat": 0.5769, "bar": 2.3076, "drop": 1.5}
+    # R8-CA-05：offset 是必填字段，基准夹具也要带上，否则下面「合法 → 0 ERROR」类用例会
+    # 因为「缺 offset」而误报，掩盖真正要测的那一项。
+    base_music = {"beat": 0.5769, "bar": 2.3076, "drop": 1.5, "offset": 0.0}
 
     def _segments_errors(segments) -> int:
         timing_fixture = {"music": dict(base_music, segments=segments)}
@@ -1780,6 +1878,10 @@ def _selftest() -> int:
           _voice_errors([{"id": "01", "scene": "s1", "text": "文案"}]) > 0, True)
     check("voice.lines 非对象行 → ERROR", _voice_errors([1, 2]) > 0, True)
     check("voice.lines 非数组 → ERROR", _voice_errors("oops") > 0, True)
+    # R8-CA-02：id 同时是配音文件名 / tts.py 缓存键 / report.json 索引，重复必须 ERROR
+    check("voice.lines 重复 id → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": 2.0, "text": "文案"},
+         {"id": "01", "scene": "s1", "at": 4.0, "text": "另一句"}]) > 0, True)
 
     # --- 数值有限性（R6-CA-01）：NaN / Infinity 是坏配置，不许静默放行 ---
     for value, want in (("1.5", 1.5), (2, 2.0), (None, None), (True, None),
@@ -1861,6 +1963,29 @@ def _selftest() -> int:
     check("_caption_capacity_width('ab')", _caption_capacity_width("ab"), 1)
     check("_caption_capacity_width('中文')", _caption_capacity_width("中文"), 2)
 
+    # --- R8-CA-03：旁白字数也按视觉字宽算（全角 1 / 半角 0.5），不再数字符个数 ---
+    # 旧实现用 len()：32 个半角字符在 3.75s 窗口里会被判成「超过 6.5 字/秒预算」，
+    # 而同一次检查的字幕容量却判「放得下」；实际 16 字宽 / 英文 TTS ~2.1s 都放得下。
+    def _voice_length_output(text_value: str) -> str:
+        timing_fixture = {
+            "duration": 3.9,
+            "scenes": [{"name": "s1", "start": 0.0, "end": 3.9}],
+            "voice": {"lines": [{"id": "01", "scene": "s1", "at": 0.0,
+                                 "text": text_value}]},
+        }
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_voice_length(report, timing_fixture)
+        return buffer.getvalue()
+
+    check("旁白字数不误报拉丁短句",
+          "WARN: 旁白字数" in _voice_length_output(
+              "Snap a photo and we do the rest."), False)
+    check("旁白字数真超长中文仍 WARN",
+          "WARN: 旁白字数" in _voice_length_output(
+              "一二三四五六七八九十一二三四五六七八九十一二三四五六"), True)
+
     check("music.beat=NaN → ERROR", _collect_report_errors(
         lambda report: check_music_fields(
             report, {"music": dict(base_music, beat=float("nan"))})) > 0, True)
@@ -1883,8 +2008,84 @@ def _selftest() -> int:
     check("music.offset='oops' → ERROR", _collect_report_errors(
         lambda report: check_music_fields(
             report, {"music": dict(base_music, offset="oops")})) > 0, True)
+
+    # --- R8-CA-05：music.offset / drop 是必填字段，缺失/None/空串都必须 ERROR ---
+    # 渲染侧 beats.ts:19 `musicTime + timing.music.offset`、Hook.tsx
+    # `TIMING.music.drop - beat.start` 直接运算，undefined 参与算术得 NaN，画面卡点/钩子
+    # 静默失效而 check_assets 却 0 ERROR（与 R8-CA-01 同类）。旧实现只在字段存在时校验。
+    def _music_errors(music) -> int:
+        return _collect_report_errors(
+            lambda report: check_music_fields(report, {"music": music}))
+
+    def _music_output(music) -> str:
+        report = Report(strict=False)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            check_music_fields(report, {"music": music})
+        return buffer.getvalue()
+
+    music_without_offset = {k: v for k, v in base_music.items() if k != "offset"}
+    music_without_drop = {k: v for k, v in base_music.items() if k != "drop"}
+    check("music 合法（beat/bar/drop/offset 都有）→ 0 ERROR", _music_errors(base_music), 0)
+    check("music.offset 缺失 → ERROR", _music_errors(music_without_offset) > 0, True)
+    check("music.drop 缺失 → ERROR", _music_errors(music_without_drop) > 0, True)
+    check("music.offset=None → ERROR",
+          _music_errors(dict(base_music, offset=None)) > 0, True)
+    check("music.drop=None → ERROR",
+          _music_errors(dict(base_music, drop=None)) > 0, True)
+    check("music.offset 空串 → ERROR",
+          _music_errors(dict(base_music, offset="")) > 0, True)
+    check("music.drop 空串 → ERROR",
+          _music_errors(dict(base_music, drop="")) > 0, True)
+    # 报错信息必须点名字段（验收要求）：不能只说「配乐字段有问题」让人猜。
+    check("music.offset 缺失的报错点名 music.offset",
+          "music.offset 缺失" in _music_output(music_without_offset), True)
+    check("music.drop 缺失的报错点名 music.drop",
+          "music.drop 缺失" in _music_output(music_without_drop), True)
+
     check("voice at=NaN → ERROR", _voice_errors(
         [{"id": "01", "scene": "s1", "at": float("nan"), "text": "文案"}]) > 0, True)
+
+    # --- R8-CA-01：时间/尺寸字段必须是 JSON 数字，数字字符串一律 ERROR ---
+    # TS 侧对 scenes[].start（Scene.tsx 的 useAbsTime）、voice.lines[].at
+    # （Caption.tsx 的 captionUntil）、music.offset（beats.ts 的 musicToVideo）用 `+` 拼接，
+    # 字符串会拼成 "4.50.15" → 后续 Number 得 NaN，画面卡点与画面内字幕整段静默消失；
+    # check_assets 以前走 _finite_number 的 float() 把 "4.5" 收下，闸门 0 ERROR 假绿。
+    for value, want in ((5, 5.0), (5.5, 5.5), (0, 0.0), (1e3, 1000.0), (-0.5, -0.5),
+                        ("5.5", None), ("5", None), ("0", None), ("0.0", None),
+                        ("1e3", None), ("-0.5", None), (" 0.5 ", None), ("", None),
+                        (True, None), (False, None),
+                        (float("nan"), None), (float("inf"), None), (None, None), ({}, None)):
+        check(f"_strict_number({value!r})", _strict_number(value), want)
+    # 负例：真正以字符串为契约的字段（voice id、music.file 等）不能被严格数字校验误伤。
+    check("字符串字段不被严格数字校验误伤（voice id='01'）",
+          _voice_errors([{"id": "01", "scene": "s1", "at": 2.0, "text": "文案"}]), 0)
+    check("字符串字段不被严格数字校验误伤（music.file / gain / offset）",
+          _collect_report_errors(
+              lambda report: check_music_fields(
+                  report, {"music": dict(base_music, file="audio/music.wav",
+                                         gain=1.0, offset=0.5)})), 0)
+    check("timing duration 字符串 → ERROR",
+          _timing_structure_errors(lambda t: t.__setitem__("duration", "10.0")) > 0, True)
+    check("timing 场景 start 字符串 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["scenes"][0].__setitem__("start", "0.0")) > 0, True)
+    check("timing 场景 end 字符串 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["scenes"][0].__setitem__("end", "10.0")) > 0, True)
+    check("timing width 字符串 → ERROR",
+          _timing_structure_errors(lambda t: t.__setitem__("width", "1080")) > 0, True)
+    check("timing captions.maxChars 字符串 → ERROR",
+          _timing_structure_errors(
+              lambda t: t["captions"].__setitem__("maxChars", "20")) > 0, True)
+    check("voice at 字符串 → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": "2.0", "text": "文案"}]) > 0, True)
+    for key in ("beat", "bar", "drop", "gain", "offset"):
+        check(f"music.{key} 字符串 → ERROR", _collect_report_errors(
+            lambda report, k=key: check_music_fields(
+                report, {"music": dict(base_music, **{k: "1.0"})})) > 0, True)
+    check("music.segments at 字符串 → ERROR", _segments_errors(
+        [{"at": "1.0", "from": 0.0, "to": 2.0}]) > 0, True)
 
     # --- 截断图片（R6-CA-02）：头部有效、数据截断，必须 ERROR ---
     try:
@@ -1918,8 +2119,9 @@ def _selftest() -> int:
         sys.stderr.write(f"ERROR: selftest — {len(failures)} 项失败\n")
         return 1
     print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
-          "music.segments / music.offset / voice.lines / 数值有限性 / 截断图片 / fps / "
-          "字幕位置 / 字幕容量字宽 全部通过")
+          "music.segments / music.offset / music.drop 必填 / voice.lines / id 唯一性 / "
+          "数值有限性 / 数字类型口径 / "
+          "截断图片 / fps / 字幕位置 / 字幕容量字宽 / 旁白字数 全部通过")
     return 0
 
 

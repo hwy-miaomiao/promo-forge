@@ -688,9 +688,40 @@ def _make_engine(timing: dict, cli_engine):
 # 句子处理
 # ===========================================================================
 
+def _check_unique_ids(lines) -> None:
+    """R8-CA-02：voice.lines 的 id 必须唯一，否则后一句的配音会覆盖前一句。
+
+    id 同时是 ``audio-src/vo/<id>.mp3`` 的文件名、缓存键 ``cache[line_id]`` 与
+    report.json 的索引；重复时两句写同一个 mp3（后写的覆盖先写的），而字幕/混音
+    仍按各自的 text 摆位 —— 成片里画面字幕与听到的话对不上，且全程不报错。
+    """
+    seen = {}
+    duplicates = []
+    for order, line in enumerate(lines, start=1):
+        line_id = str(line.get("id", "")).strip()
+        if not line_id:
+            continue
+        if line_id in seen:
+            duplicates.append((line_id, seen[line_id], order))
+        else:
+            seen[line_id] = order
+    if duplicates:
+        detail = "、".join(
+            "「%s」（第 %d 句与第 %d 句）" % (line_id, first, again)
+            for line_id, first, again in duplicates
+        )
+        error(
+            "timing.json 的 voice.lines 里 id 重复：%s。id 是 audio-src/vo/<id>.mp3 的"
+            "文件名、缓存键与 report.json 的索引；重复会让后一句的配音覆盖前一句，"
+            "字幕与听到的话对不上。请给每句一个唯一 id 后重跑" % detail
+        )
+
+
 def _voice_lines(timing: dict):
     lines = (timing.get("voice", {}) or {}).get("lines", []) or []
-    return [line for line in lines if isinstance(line, dict)]
+    picked = [line for line in lines if isinstance(line, dict)]
+    _check_unique_ids(picked)
+    return picked
 
 
 def _select_lines(lines, only: str):

@@ -1192,6 +1192,33 @@ def build_cues(timing: Dict[str, Any]) -> List[Cue]:
             "请先写旁白稿：每句带 id/scene/at/text（AGENTS.md 阶段 7）"
         )
 
+    # R8-CA-02：id 必须唯一。_load_vo_report() 把 report.json 按 id 收成 {id: entry}、
+    # 下面按 id 找 audio-src/vo/<id>.mp3；重复 id 会让两句共用同一段配音时长、字幕文本
+    # 与听到的话错位，而 rc 仍是 0（与 check_assets.py / tts.py 同一条契约）。
+    seen_ids = {}
+    duplicate_ids = []
+    for order, item in enumerate(raw_lines, start=1):
+        if not isinstance(item, dict):
+            continue
+        line_id = str(item.get("id", "")).strip()
+        if not line_id:
+            continue
+        first = seen_ids.get(line_id)
+        if first is None:
+            seen_ids[line_id] = order
+        else:
+            duplicate_ids.append((line_id, first, order))
+    if duplicate_ids:
+        detail = "、".join(
+            "「%s」（第 %d 句与第 %d 句）" % (line_id, first, again)
+            for line_id, first, again in duplicate_ids
+        )
+        error(
+            f"timing.json 的 voice.lines 里 id 重复：{detail}。每句 id 必须唯一 ——"
+            "它是 audio-src/vo/<id>.mp3 的文件名与 report.json 的索引；重复会让两句共用"
+            "同一段配音，字幕文本与听到的话对不上且不报错。请改成不同 id 后重跑 tts.py all"
+        )
+
     entries, report_path = _load_vo_report()
     vo_dir = PROJECT_ROOT / VO_DIRNAME
     if not entries:
@@ -1782,8 +1809,34 @@ def _frame_time(cues: Sequence["Cue"], cover: float) -> float:
     return max(cover * FRAME_AT_RATIO, 0.3)
 
 
+def _invalid_preview_note(value):
+    """R8-CA-04：``--preview`` 必须是有限正数秒；返回错误说明或 None。
+
+    为什么不能只判 ``<= 0``：``--preview nan`` 是 float() 能解析的「真值」，
+    ``nan <= 0`` 为 False 会被放行；后面的 ``cover = min(total, nan)`` 在 Python 里
+    返回 total（``nan < total`` 为 False），于是**静默按全片处理**，还把输出名改成
+    ``-preview`` 却打印「--preview 只处理前 45.00s / 全片 45.00s」——正是这个后缀
+    本来要防的「把预览当成品」。``inf`` 同理。和 R7-PY-05 的 ``--fontsize nan`` 是同一类。
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"--preview 必须是正数秒数，收到 {value!r}"
+    if not math.isfinite(number) or number <= 0:
+        return (
+            f"--preview 必须是**有限正数**秒数（nan / inf / 0 / 负数都不行），收到 {value!r}；"
+            "不加 --preview 就是全片"
+        )
+    return None
+
+
 def cmd_burn(args) -> int:
     _ensure_ffmpeg()
+    preview_note = _invalid_preview_note(args.preview)
+    if preview_note:
+        error(preview_note)
     timing = load_timing()
 
     src = _resolve_user_path(args.video)
@@ -1811,9 +1864,6 @@ def cmd_burn(args) -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         error(f"输出目录建不出来 {dst.parent}：{exc}（把 -o 指到可写目录，或先手工建好它）")
-
-    if args.preview is not None and args.preview <= 0:
-        error(f"--preview 必须是正数秒数，收到 {args.preview}")
 
     # ASS 不存在、或者比 timing.json 旧，就先自动生成（burn 的语义是「一条命令拿到带字幕的成片」）。
     #
@@ -2127,6 +2177,12 @@ def _selftest() -> int:
             expect_error("缺 text 字段报错",
                          lambda: build_cues(make_timing([{"id": "W2", "scene": "main", "at": 1.0}])),
                          "没有 text 字段")
+            # R8-CA-02：重复 id 会让两句共用同一段配音，必须挡在入口
+            expect_error("voice.lines 重复 id 报错",
+                         lambda: build_cues(make_timing([
+                             one_line(at=1.0, text="第一句", line_id="D1"),
+                             one_line(at=2.0, text="第二句", line_id="D1")])),
+                         "id 重复")
 
             # --- 6) SRT 乱序排序（R6-subs-03：时间轴必须单调） ---
             cues, _ = capture_cues(make_timing([
@@ -2179,6 +2235,16 @@ def _selftest() -> int:
                          lambda: _build_ass([], make_timing([one_line()]),
                                             root / "out" / "f.ass", float("nan")),
                          "有限正数")
+
+            # --- 10) --preview 非法值必须挡死（R8-CA-04：nan/inf 会被 min() 静默吃成全片） ---
+            check("--preview 正常 8s 通过", _invalid_preview_note(8.0), None)
+            check("--preview 0.5s 通过", _invalid_preview_note(0.5), None)
+            check("--preview 缺省通过", _invalid_preview_note(None), None)
+            check("--preview NaN 被拒", _invalid_preview_note(float("nan")) is not None, True)
+            check("--preview Infinity 被拒", _invalid_preview_note(float("inf")) is not None, True)
+            check("--preview 0 被拒", _invalid_preview_note(0.0) is not None, True)
+            check("--preview -3 被拒", _invalid_preview_note(-3.0) is not None, True)
+            check("--preview 非数字被拒", _invalid_preview_note("oops") is not None, True)
     finally:
         for name, value in originals.items():
             globals()[name] = value
@@ -2189,7 +2255,8 @@ def _selftest() -> int:
         sys.stderr.write("ERROR: selftest — %d 项失败\n" % len(failures))
         return 1
     print("OK: selftest — %d 项断言通过（ASS 转义 / 字号补偿 / 控制字符 / at 合法性 / "
-          "空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门 / 字号有限性）" % passed)
+          "空白 text / SRT 排序 / 收边跨场景 / maxLines 硬闸门 / 字号有限性 / "
+          "--preview 有限性）" % passed)
     return 0
 
 
