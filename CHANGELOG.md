@@ -19,6 +19,14 @@
   按默认值检查却报告成功）；`audit_validate` 的 `budget_cny` 必须是数字（不再接受 `"--help"` 之类开关字符串）。
 - 自测：`frame_check.py` 71 项、`transcript_check.py` 44 项；文档（AGENTS.md / README.md / references/校验清单.md）同步。
 
+### Fixed（CI 跨平台，2026-10-22 晚）
+
+- `service/test_mcp_integration.py`：深嵌套 JSON 用例写死 `"[" * 4000 + "]" * 4000` 并假设服务端
+  `json.loads` 必抛 `RecursionError`；但触发深度随解释器补丁版本/平台变化（Windows 3.12.8 抛，
+  Linux 3.12.3 能解析 4000 层 → 服务端正确回 -32600「消息必须是 JSON 对象」，测试却在 Linux CI
+  假红）。现在新增 `_find_recursion_payload()`：倍增深度（512→20 万）在**当前**解释器实测出最小
+  会抛 `RecursionError` 的载荷再发送，找不到则 WARN 跳过；服务端 `-32700` 与「之后仍存活」回归保留。
+
 ## [2026-10-22] 第 9 轮：证据闸门（真的看过画面 / 配音字幕对得上）+ 闸门漏洞修复
 
 本轮先把「代理看过画面」和「配音与字幕对得上」从口头承诺变成可跑的机器证据，再回头修独立审计发现的

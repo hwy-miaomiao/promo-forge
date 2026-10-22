@@ -28,6 +28,28 @@ SCRIPTS_DIR = REPO_ROOT / "template" / "scripts"
 SERVER = SERVICE_DIR / "mcp_server.py"
 
 
+def _find_recursion_payload(limit: int = 200_000) -> Optional[str]:
+    """返回一段「本解释器 json.loads 会抛 RecursionError」的深嵌套 JSON。
+
+    R9-MCP-04 的回归用例需要「真的会触发 RecursionError」的载荷，但触发深度随
+    解释器补丁版本/平台变化：同样的 4000 层在 Windows 3.12.8 抛 RecursionError，
+    在 Linux 3.12.3 上却能被解析成 list（服务端按非法请求回 -32600，测试假红）。
+    因此这里用倍增法在**当前**解释器里实测出最小会抛 RecursionError 的深度，
+    而不是写死层数；极端环境若到 limit 仍不抛，返回 None 由调用方跳过用例。
+    """
+    depth = 512
+    while depth <= limit:
+        payload = "[" * depth + "]" * depth
+        try:
+            json.loads(payload)
+        except RecursionError:
+            return payload
+        except Exception:  # noqa: BLE001 - 其他异常说明该深度不可用，继续加深
+            pass
+        depth *= 2
+    return None
+
+
 # ===========================================================================
 # 测试脚手架
 # ===========================================================================
@@ -368,12 +390,19 @@ def main() -> int:
             ping_after_notif = client.request("ping", {})
             check("通知坏 params 不响应", ping_after_notif.get("result"), {})
 
-            # 10c) R9-MCP-04 回归：深嵌套 JSON 抛 RecursionError 不能打死服务
-            client.send_raw("[" * 4000 + "]" * 4000)
-            deep_error = client.recv()
-            check("深嵌套 JSON -32700", deep_error["error"]["code"], -32700)
-            ping_after_deep = client.request("ping", {})
-            check("深嵌套 JSON 后服务仍存活", ping_after_deep.get("result"), {})
+            # 10c) R9-MCP-04 回归：深嵌套 JSON 抛 RecursionError 不能打死服务。
+            # 触发深度按当前解释器实测（见 _find_recursion_payload），不写死 4000：
+            # 写死会在能解析该深度的解释器上把「-32600 非法请求」误判成回归。
+            deep_payload = _find_recursion_payload()
+            if deep_payload is None:
+                print("WARN  [MCP] 当前解释器解析 20 万层嵌套仍不抛 RecursionError，"
+                      "跳过深嵌套用例")
+            else:
+                client.send_raw(deep_payload)
+                deep_error = client.recv()
+                check("深嵌套 JSON -32700", deep_error["error"]["code"], -32700)
+                ping_after_deep = client.request("ping", {})
+                check("深嵌套 JSON 后服务仍存活", ping_after_deep.get("result"), {})
         finally:
             try:
                 proc.terminate()
