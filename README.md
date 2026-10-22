@@ -157,7 +157,7 @@ python template/scripts/selftest.py    # 12 个脚本的 --selftest + 3 项 Pyth
 
 CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
 
-- Python 3.9 / 3.12 矩阵：`compileall`（`template/scripts` + `service/`）+ `selftest.py` + 两个证据闸门单独 `--selftest`（`frame_check.py` 用自造 PNG 判「正常/空白/截断/CRC 坏」四类夹具，58 项断言；`transcript_check.py` 用构造转写判「一致/漏行/错序/品牌错字」，41 项断言，都不渲染、不联网）+ MCP 服务集成测试（44 项）+ 行尾必须 LF；
+- Python 3.9 / 3.12 矩阵：`compileall`（`template/scripts` + `service/`）+ `selftest.py` + 两个证据闸门单独 `--selftest`（`frame_check.py` 用自造 PNG 变体判「正常/空白/截断/CRC 坏/未知 critical chunk/tRNS 全透明/`--scale` 舍入」等，71 项断言；`transcript_check.py` 用构造转写判「一致/漏行/错序/品牌错字/`--ref srt` 品牌校验」，44 项断言，都不渲染、不联网）+ MCP 服务集成测试（44 项）+ 行尾必须 LF；
 - Node 22：`npm install` + `tsc --noEmit`（只做类型检查）。
 
 渲染、成片规格、响度、抽帧审图这些重活仍在本地按 AGENTS.md 第 7 节的闸门跑。
@@ -220,7 +220,7 @@ python service/test_mcp_integration.py   # 零依赖集成测试（起子进程�
 `--strict` 把 WARN 也当 ERROR（manifest 与退出码用同一份结果）。`deliver.py check` 0 ERROR 时也会自动生成这份检查单。
 它**只检查、不登录、不自动发布**。被外部编排器调用时用 `service/mcp_server.py`（见上文「服务化入口」）。
 
-**AI 说「我看过画面了」，怎么证明？** 让它跑 `python scripts/frame_check.py --project .`（默认读 `out/stills`）：它逐帧解码 PNG（纯 stdlib `zlib`，不依赖 Pillow）、量亮度方差判空白、核对像素尺寸==timing、再按文件名时间戳核对每个场景是否都有帧；`--json` 输出 `{ok, frames, problems}` 给编排器，有 ERROR 非零退出。本机实测：ffmpeg 7.1 合成的 3 帧 540×960 测试图，正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 被判 ERROR；`--selftest` 58 项断言在 Python 3.12 与 3.9 下都过。`deliver.py check` 默认接这项（没有 `out/stills` 只 WARN），`publish_check.py --frames out/stills` 可把证据并入发布检查单。
+**AI 说「我看过画面了」，怎么证明？** 让它跑 `python scripts/frame_check.py --project .`（默认读 `out/stills`）：它逐帧解码 PNG（纯 stdlib `zlib`，不依赖 Pillow）、量亮度方差判空白（全透明帧也算空白，含 `tRNS` 透明像素）、核对像素尺寸==timing、再按文件名时间戳核对每个场景是否都有帧；`--json` 输出 `{ok, frames, problems}` 给编排器，有 ERROR 非零退出。本机实测：ffmpeg 7.1 合成的 3 帧 540×960 测试图，正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 被判 ERROR；`--selftest` 71 项断言在 Python 3.12 与 3.9 下都过。`deliver.py check` 默认接这项（没有 `out/stills` 只 WARN），`publish_check.py --frames out/stills` 可把证据并入发布检查单。
 
 **配音真的和字幕对得上吗？** 把逐句转写（txt 每行一句，或 SRT）交给 `python scripts/transcript_check.py transcript.txt --project .`：它把转写与 `timing.json` 的 `voice.lines` 逐行对齐，默认**任一语音行没对上就是 ERROR**，覆盖率阈值 `--min-coverage`、相似度阈值 `--threshold` 可调；品牌名/网址要求逐字一致（错一个字就失败，对标 STT 反查的做法）。本机实测：模板 5 句旁白逐字转写 → 5 行相似度全 1.00、字符覆盖率 100%、0 ERROR；只念其中一句的转写 → 6 ERROR、覆盖率 2.94%。它不下载模型、不调付费 ASR，零依赖、可离线，所以 CI 里就能跑。
 

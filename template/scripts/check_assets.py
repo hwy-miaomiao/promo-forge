@@ -351,6 +351,13 @@ def _public_relative_problem(value: str, label: str) -> str:
     if ".." in value.replace("\\", "/").split("/"):
         return (f"{label}=\"{value}\" 含 .. 段，会解析到 public/ 之外"
                 "（mix.py 会按这个路径写盘，Remotion 侧也拿不到文件）")
+    if ":" in value:
+        # R9-V-ASSET：冒号在 Windows 上是盘符 / NTFS 数据流（ADS）语法，在 URL 里也会
+        # 截断；file:///c:/x.png 这种值不是 public/ 下的合法相对路径。
+        return (f"{label}=\"{value}\" 含冒号：Windows 上会被当成盘符或 NTFS 数据流"
+                "（ADS），不是 public/ 下的相对路径")
+    if any(ord(ch) < 32 for ch in value):
+        return f"{label} 含控制字符，不是合法的 public/ 相对路径：{value!r}"
     return ""
 
 
@@ -570,27 +577,35 @@ def check_asset_refs(report: Report) -> None:
     )
 
 
-def _flush_brand_problems(report: Report, item: str, problems) -> None:
-    """把已经算出来的 brand.logo 问题先打出来（V25：提前 return 别把它们吞掉）。"""
-    for text in problems:
+def _flush_brand_problems(report: Report, item: str, errors, warnings) -> None:
+    """把已经算出来的 brand.logo / fonts 问题先打出来（V25：提前 return 别把它们吞掉）。
+
+    R9-CA-04：路径结构违规（绝对路径 / 盘符 / .. 越界）是 ERROR —— 这些值不可能
+    指向 public/ 下的素材，属于 timing.json / fonts.json 写错，必须拦发布；仅仅
+    「文件不存在」保持 WARN（新克隆还没跑 fonts.py subset 是常态）。
+    """
+    for text in errors:
+        report.fail(item, text)
+    for text in warnings:
         report.warn(item, text)
 
 
 def check_brand_and_font_files(report: Report, timing: dict) -> None:
     """timing.json 的 brand.logo 与 fonts.json 的 roles.*.file 也是 public/ 下的素材。"""
     item = "品牌与字体文件"
-    problems = []
+    errors = []
+    warnings = []
 
     brand = _sub_dict(timing, "brand", report, item, "{name, url, logo, colors}")
     logo = str(brand.get("logo") or "").strip()
     if logo:
         logo_unsafe = _public_relative_problem(logo, "brand.logo")
         if logo_unsafe:
-            problems.append(logo_unsafe)
+            errors.append(logo_unsafe)
         else:
             candidate = PROJECT_ROOT / "public" / logo.lstrip("/")
             if not candidate.is_file():
-                problems.append(
+                warnings.append(
                     f"timing.json 的 brand.logo=\"{logo}\" 指向 {_rel(candidate)}，但文件不存在"
                     "（场景里 staticFile(空文件) 会 404；不确定就先在 timing.json 里留空字符串）"
                 )
@@ -600,7 +615,7 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     roles_checked = 0
     if fonts_cfg is None:
         # V25：brand.logo 的问题已经算出来了，不能因为 fonts.json 读不到就一起吞掉。
-        _flush_brand_problems(report, item, problems)
+        _flush_brand_problems(report, item, errors, warnings)
         if err == JSON_MISSING:
             report.warn(item, f"读不到 fonts.json（{err}），跳过字体文件检查")
         else:
@@ -613,7 +628,7 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     # V28：结构异常（顶层不是对象 / roles 不是对象 / 某个角色不是对象）必须是干净的
     # ERROR: 行，而不是在下面 `.get()` 上抛 AttributeError traceback。
     if not isinstance(fonts_cfg, dict):
-        _flush_brand_problems(report, item, problems)
+        _flush_brand_problems(report, item, errors, warnings)
         report.fail(
             item,
             f"fonts.json 的顶层必须是 JSON 对象，现在是 {type(fonts_cfg).__name__}："
@@ -624,7 +639,7 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     if roles is None:
         roles = {}
     elif not isinstance(roles, dict):
-        _flush_brand_problems(report, item, problems)
+        _flush_brand_problems(report, item, errors, warnings)
         report.fail(
             item,
             f"fonts.json 的 roles 必须是对象（display/body/mono），现在是 "
@@ -634,31 +649,38 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     for role in FONT_ROLES:
         role_cfg = roles.get(role) or {}
         if not isinstance(role_cfg, dict):
-            _flush_brand_problems(report, item, problems)
+            _flush_brand_problems(report, item, errors, warnings)
             report.fail(
                 item,
                 f"fonts.json 的 roles.{role} 必须是对象（{{stack, weight, file}}），现在是 "
                 f"{type(role_cfg).__name__}：{role_cfg!r}",
             )
             return
-        file_value = str(role_cfg.get("file") or "").strip()
+        raw_file = role_cfg.get("file")
+        if raw_file is not None and not isinstance(raw_file, str):
+            errors.append(
+                f"fonts.json 的 roles.{role}.file 必须是字符串路径，现在是 "
+                f"{type(raw_file).__name__}：{raw_file!r}"
+            )
+            continue
+        file_value = str(raw_file or "").strip()
         if not file_value:
             continue
         roles_checked += 1
         file_unsafe = _public_relative_problem(file_value, f"fonts.json 的 roles.{role}.file")
         if file_unsafe:
-            problems.append(file_unsafe)
+            errors.append(file_unsafe)
             continue
         candidate = PROJECT_ROOT / "public" / file_value.lstrip("/")
         if not candidate.is_file():
-            problems.append(
+            warnings.append(
                 f"fonts.json 的 roles.{role}.file=\"{file_value}\" 指向 {_rel(candidate)}，但文件不存在"
                 "（@remotion/fonts 会加载失败并回退系统字体，同一行里可能混出两种字形；"
                 "新克隆没有子集字体是正常的，跑 `python scripts/fonts.py subset` 生成）"
             )
 
-    if problems:
-        _flush_brand_problems(report, item, problems)
+    if errors or warnings:
+        _flush_brand_problems(report, item, errors, warnings)
         return
     if logo or roles_checked:
         report.ok(
@@ -2095,6 +2117,53 @@ def _selftest() -> int:
                      "audio/../evil.wav", 123):
         check(f"music.file={bad_file!r} 越界/坏类型 → ERROR",
               _music_file_errors(bad_file) > 0, True)
+
+    # --- R9-CA-04（brand.logo / fonts.json 部分）：路径结构违规也必须是 ERROR。
+    # 以前 _flush_brand_problems 把所有问题统一 report.warn，文档却宣称 ERROR。
+    base_brand = {
+        "name": "小账本", "url": "x.app", "logo": "",
+        "colors": {"bg": "#000000", "fg": "#ffffff", "accent": "#33e1a1"},
+    }
+
+    def _brand_files_errors(mutate_timing, fonts=None) -> int:
+        global PROJECT_ROOT  # noqa: PLW0603 - 自测里临时替换项目根，用完恢复
+        original_root = PROJECT_ROOT
+        with tempfile.TemporaryDirectory(prefix="assets-brand-selftest-") as tmp:
+            root = Path(tmp)
+            (root / "public").mkdir()
+            if fonts is not None:
+                (root / "fonts.json").write_text(
+                    json.dumps(fonts, ensure_ascii=False), encoding="utf-8")
+            timing_fixture = copy.deepcopy(base_timing)
+            timing_fixture["brand"] = copy.deepcopy(base_brand)
+            mutate_timing(timing_fixture)
+            PROJECT_ROOT = root
+            try:
+                return _collect_report_errors(
+                    lambda report: check_brand_and_font_files(report, timing_fixture))
+            finally:
+                PROJECT_ROOT = original_root
+
+    for bad_logo in ("C:/evil.png", "C:\\evil.png", "\\\\server\\share\\x.png",
+                     "../logo.png", "/etc/passwd", "public/../../x.png",
+                     "file:///c:/x.png", "logo.png:stream"):
+        check(f"brand.logo={bad_logo!r} 绝对/越界/冒号 → ERROR（不是 WARN）",
+              _brand_files_errors(lambda t, v=bad_logo: t["brand"].__setitem__("logo", v)) > 0,
+              True)
+    check("brand.logo 合法相对路径但文件不存在 → 0 ERROR（只是 WARN）",
+          _brand_files_errors(lambda t: t["brand"].__setitem__("logo", "logo.png")), 0)
+    for bad_font in ("C:/evil.ttf", "/abs/font.ttf", "../font.ttf",
+                     "file:///c:/x.ttf", "fonts/f.ttf:stream"):
+        check(f"fonts.json roles.*.file={bad_font!r} 绝对/越界/冒号 → ERROR（不是 WARN）",
+              _brand_files_errors(
+                  lambda t: None,
+                  fonts={"roles": {"display": {"file": bad_font}}}) > 0, True)
+    check("fonts.json roles.*.file 数字 → ERROR（坏类型不是「文件不存在」）",
+          _brand_files_errors(
+              lambda t: None, fonts={"roles": {"display": {"file": 123}}}) > 0, True)
+    check("fonts.json roles.*.file 合法相对路径但不存在 → 0 ERROR（只是 WARN）",
+          _brand_files_errors(
+              lambda t: None, fonts={"roles": {"display": {"file": "fonts/x.ttf"}}}), 0)
 
     def _timing_structure_errors(mutate) -> int:
         # deepcopy：下面的夹具会改嵌套的 scenes/captions，浅拷贝会让改动串到下一个用例。

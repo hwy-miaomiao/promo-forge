@@ -271,17 +271,33 @@ def _tool_publish_check(arguments: Dict[str, Any]) -> Dict[str, Any]:
     for key, flag in (("video", "--video"), ("covers", "--covers"),
                       ("subtitles", "--subtitles"), ("copy", "--copy")):
         value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            argv += [flag, _safe_positional(value, key)]
+        if value is None or value == "":
+            continue
+        # R9-V-MCP：非字符串以前被静默忽略（例如 covers 传数组就退回默认封面目录），
+        # 客户端以为按自己的参数检查了，实际查的是别的东西 —— 必须显式报参数错误。
+        if not isinstance(value, str):
+            raise RpcError(-32602, "%s 必须是字符串路径，现在是 %s"
+                           % (key, type(value).__name__))
+        argv += [flag, _safe_positional(value, key)]
     for key, flag in (("title", "--title"), ("body", "--body")):
         value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            argv += [flag, value]
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise RpcError(-32602, "%s 必须是字符串，现在是 %s"
+                           % (key, type(value).__name__))
+        argv += [flag, value]
     hashtags = arguments.get("hashtags")
-    if isinstance(hashtags, list) and hashtags:
-        argv += ["--hashtags", ",".join(str(tag) for tag in hashtags)]
+    if hashtags is not None:
+        if not isinstance(hashtags, list) or not all(
+                isinstance(tag, str) for tag in hashtags):
+            raise RpcError(-32602, "hashtags 必须是字符串数组")
+        if hashtags:
+            argv += ["--hashtags", ",".join(hashtags)]
     platform = arguments.get("platform")
-    if isinstance(platform, str) and platform.strip():
+    if platform is not None and platform != "":
+        if not isinstance(platform, str):
+            raise RpcError(-32602, "platform 必须是字符串")
         argv += ["--platform", platform]
     if arguments.get("strict"):
         argv.append("--strict")
@@ -296,6 +312,9 @@ def _tool_audit_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     argv = ["validate", "--root", str(root), "--format", "json"]
     budget = arguments.get("budget_cny")
     if budget is not None:
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            raise RpcError(-32602, "budget_cny 必须是数字，现在是 %s"
+                           % (type(budget).__name__,))
         argv += ["--budget", str(budget)]
     result = _run_script("audit.py", argv, project_root=root)
     structured = _last_json_line(result["stdout"]) or {}
@@ -360,7 +379,7 @@ TOOL_SPECS: List[Dict[str, Any]] = [
                 "project_root": {"type": "string", "description": "宣传片项目根目录"},
                 "platform": {"type": "string", "description": "douyin/kuaishou/xiaohongshu/shipinhao/all"},
                 "video": {"type": "string", "description": "成片路径，默认 out/final-1080p.mp4"},
-                "covers": {"type": "string", "description": "封面目录，默认 out/covers"},
+                "covers": {"type": "string", "description": "封面 PNG 路径（默认自动发现 out/covers/cover-*.png）"},
                 "subtitles": {"type": "string", "description": "字幕路径，默认 out/subtitles/zh.srt"},
                 "copy": {"type": "string", "description": "发布文案 JSON，默认 publish/copy.json"},
                 "title": {"type": "string", "description": "标题（覆盖 copy.json / timing.title）"},
@@ -636,6 +655,19 @@ def _selftest() -> int:
         check("audio='--help' 错误码", exc.code, -32602)
     check("_safe_positional 正常路径", _safe_positional("out/x.mp4", "video"),
           "out/x.mp4")
+
+    # R9-V-MCP：坏类型参数不许静默忽略（covers 传数组会退回默认封面目录）
+    for label, func, arguments in (
+        ("publish_check covers 数组", _tool_publish_check, {"covers": ["x.png"]}),
+        ("publish_check hashtags 字符串", _tool_publish_check, {"hashtags": "#x"}),
+        ("publish_check platform 数字", _tool_publish_check, {"platform": 1}),
+        ("audit budget 传开关", _tool_audit_validate, {"budget_cny": "--help"}),
+    ):
+        try:
+            func(dict(arguments, project_root=tempfile.gettempdir()))
+            check(label + " 抛 RpcError", False, True)
+        except RpcError as exc:
+            check(label + " 错误码", exc.code, -32602)
 
     # R9-MCP-03：通知（无 id）携带非对象 params 时不得回响应
     bad_params_notif = handle_message(

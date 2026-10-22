@@ -176,14 +176,24 @@ def _png_chunks(data: bytes) -> Tuple[List[Tuple[bytes, bytes]], Optional[str]]:
         if ctype not in (b"IHDR", b"PLTE", b"IDAT", b"IEND") and not (
                 len(ctype) == 4 and ctype[0:1].isalpha()):
             return chunks, "chunk 类型不是 4 个 ASCII 字母：%r" % (ctype,)
+        if ctype not in (b"IHDR", b"PLTE", b"IDAT", b"IEND") and ctype[0:1].isupper():
+            # PNG 规范：chunk 类型首字母大写 = critical，解码器遇到不认识的 critical
+            # chunk 必须报错（以前只要求首字节是字母，未知 critical chunk 会被静默放行）。
+            return chunks, ("未知的 critical chunk %r（首字母大写，规范要求解码器拒绝）："
+                            "文件可能不是 PNG 或被工具写坏" % (ctype,))
+        if ctype == b"IHDR" and chunks:
+            return chunks, "PNG 里出现了第二个 IHDR（chunk 链重复/损坏）"
+        if ctype == b"IEND" and payload:
+            return chunks, "IEND chunk 的长度应为 0，实际 %d 字节：文件结构损坏" % (len(payload),)
         chunks.append((ctype, payload))
         pos = end
         if ctype == b"IEND":
             break
     if pos != len(data):
-        # IEND 之后还有字节：多数编码器不会这么干，但不算致命损坏。
         if not chunks or chunks[-1][0] != b"IEND":
             return chunks, "chunk 链没有以 IEND 结束（文件被截断）"
+        # PNG 规范要求 IEND 是最后一个 chunk；IEND 之后还有字节说明文件被动过。
+        return chunks, "IEND 之后还有 %d 字节多余数据（不是合法的 PNG）" % (len(data) - pos,)
     if not chunks:
         return [], "没有任何 PNG chunk"
     return chunks, None
@@ -241,13 +251,22 @@ def _unfilter(raw: bytes, width: int, height: int, bpp: int) -> Tuple[Optional[L
 
 
 def _luma_for_pixel(row: bytes, offset: int, color_type: int, sample_bytes: int,
-                    palette: Optional[List[Tuple[int, int, int]]]) -> Tuple[int, int]:
-    """返回 (亮度 0~255, alpha)。只支持 8 / 16 bit（16 bit 取高字节）。"""
+                    palette: Optional[List[Tuple[int, int, int]]],
+                    transparency: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
+    """返回 (亮度 0~255, alpha)。只支持 8 / 16 bit（16 bit 取高字节）。
+
+    ``transparency`` 来自 tRNS chunk：调色板图是透明索引集合，灰度/RGB 图是
+    全透明的精确采样值。PNG 的 tRNS 只表示「这些像素完全透明」，没有半透明。
+    """
+    transparent = transparency or {}
     if color_type == 0:  # 灰度
-        return row[offset], 255
+        gray = _be16(row, offset) if sample_bytes == 2 else row[offset]
+        alpha = 0 if transparent.get("gray") == gray else 255
+        return gray >> 8 if sample_bytes == 2 else gray, alpha
     if color_type == 4:  # 灰度 + alpha
         gray = row[offset]
-        alpha = row[offset + sample_bytes]
+        alpha = (_be16(row, offset + sample_bytes) if sample_bytes == 2
+                 else row[offset + sample_bytes])
         return gray, alpha
     if color_type == 3:  # 调色板
         index = row[offset]
@@ -255,16 +274,31 @@ def _luma_for_pixel(row: bytes, offset: int, color_type: int, sample_bytes: int,
             r, g, b = palette[index]
         else:
             r = g = b = 0
-        return (r * 299 + g * 587 + b * 114) // 1000, 255
-    r = row[offset]
-    g = row[offset + sample_bytes]
-    b = row[offset + 2 * sample_bytes]
-    alpha = row[offset + 3 * sample_bytes] if color_type == 6 else 255
+        alpha = 0 if index in transparent.get("palette", ()) else 255
+        return (r * 299 + g * 587 + b * 114) // 1000, alpha
+    if sample_bytes == 2:
+        r16 = _be16(row, offset)
+        g16 = _be16(row, offset + 2)
+        b16 = _be16(row, offset + 4)
+        r, g, b = r16 >> 8, g16 >> 8, b16 >> 8
+        rgb_key = transparent.get("rgb")
+        if rgb_key is not None and (r16, g16, b16) == rgb_key:
+            return (r * 299 + g * 587 + b * 114) // 1000, 0
+    else:
+        r = row[offset]
+        g = row[offset + sample_bytes]
+        b = row[offset + 2 * sample_bytes]
+        rgb_key = transparent.get("rgb")
+        if rgb_key is not None and (r, g, b) == rgb_key:
+            return (r * 299 + g * 587 + b * 114) // 1000, 0
+    alpha = ((_be16(row, offset + 3 * sample_bytes) if sample_bytes == 2
+              else row[offset + 3 * sample_bytes]) if color_type == 6 else 255)
     return (r * 299 + g * 587 + b * 114) // 1000, alpha
 
 
 def _png_luma_stats(rows: List[bytes], width: int, height: int, color_type: int,
-                    bit_depth: int, palette: Optional[List[Tuple[int, int, int]]]) -> Dict[str, Any]:
+                    bit_depth: int, palette: Optional[List[Tuple[int, int, int]]],
+                    transparency: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """对解码后的像素做抽样统计：亮度方差、颜色数、是否全透明。"""
     channels = _PNG_CHANNELS[color_type]
     sample_bytes = bit_depth // 8
@@ -280,7 +314,8 @@ def _png_luma_stats(rows: List[bytes], width: int, height: int, color_type: int,
         row = rows[y]
         for x in range(0, width, stride):
             offset = x * pixel_bytes
-            luma, alpha = _luma_for_pixel(row, offset, color_type, sample_bytes, palette)
+            luma, alpha = _luma_for_pixel(row, offset, color_type, sample_bytes, palette,
+                                          transparency)
             total += luma
             total_sq += luma * luma
             count += 1
@@ -351,6 +386,7 @@ def read_png(path: Path, data: Optional[bytes] = None) -> Dict[str, Any]:
                                  % (compression, filter_method)))
         return info
     palette: Optional[List[Tuple[int, int, int]]] = None
+    trns_payload: Optional[bytes] = None
     idats = []
     for ctype, payload in chunks[1:]:
         if ctype == b"PLTE":
@@ -359,11 +395,42 @@ def read_png(path: Path, data: Optional[bytes] = None) -> Dict[str, Any]:
                 return info
             palette = [(payload[i], payload[i + 1], payload[i + 2])
                        for i in range(0, len(payload), 3)]
+        elif ctype == b"tRNS":
+            trns_payload = payload
         elif ctype == b"IDAT":
             idats.append(payload)
     if color_type == 3 and palette is None:
         problems.append(_problem("ERROR", "调色板 PNG（color_type=3）缺少 PLTE"))
         return info
+    # tRNS：全透明像素。以前完全不处理，导致「调色板 + tRNS 把所有索引设成 alpha=0」
+    # 这种整帧隐形图能通过空白判定（AGENTS.md 承诺「全透明也算空白」）。
+    transparency: Optional[Dict[str, Any]] = None
+    if trns_payload is not None:
+        if color_type == 3:
+            if len(trns_payload) > len(palette or []):
+                problems.append(_problem(
+                    "ERROR", "tRNS 有 %d 个 alpha 值，比 PLTE 的 %d 个颜色还多"
+                    % (len(trns_payload), len(palette or []))))
+                return info
+            transparency = {"palette": {i for i, a in enumerate(trns_payload) if a == 0}}
+        elif color_type == 0:
+            if len(trns_payload) != 2:
+                problems.append(_problem("ERROR", "灰度 PNG 的 tRNS 长度应为 2，实际 %d"
+                                         % (len(trns_payload),)))
+                return info
+            transparency = {"gray": _be16(trns_payload, 0)}
+        elif color_type == 2:
+            if len(trns_payload) != 6:
+                problems.append(_problem("ERROR", "RGB PNG 的 tRNS 长度应为 6，实际 %d"
+                                         % (len(trns_payload),)))
+                return info
+            transparency = {"rgb": (_be16(trns_payload, 0), _be16(trns_payload, 2),
+                                    _be16(trns_payload, 4))}
+        else:  # color_type 4 / 6 自带 alpha，规范不允许 tRNS
+            problems.append(_problem(
+                "ERROR", "color_type=%d 的 PNG 自带 alpha 通道，不应再有 tRNS chunk"
+                % (color_type,)))
+            return info
     if not idats:
         problems.append(_problem("ERROR", "PNG 没有 IDAT（没有像素数据）：文件被截断或只有文件头"))
         return info
@@ -381,17 +448,35 @@ def read_png(path: Path, data: Optional[bytes] = None) -> Dict[str, Any]:
             "（抽帧产物一般不是交错 PNG）"))
         info["ok"] = True
         return info
+    bpp = max(1, (_PNG_CHANNELS[color_type] * bit_depth + 7) // 8)
+    expected_raw = height * (1 + width * bpp)
     try:
-        raw = zlib.decompress(b"".join(idats))
+        engine = zlib.decompressobj()
+        raw = engine.decompress(b"".join(idats), expected_raw + 1)
+        if engine.unconsumed_tail:
+            problems.append(_problem(
+                "ERROR", "PNG 解压后的像素数据比 IHDR 声明的 %d 字节还多（IDAT 被追加了别的内容）"
+                % (expected_raw,)))
+            return info
+        if not engine.eof:
+            problems.append(_problem(
+                "ERROR", "PNG 像素数据流不完整（zlib 流没有结束标记）：文件被截断"))
+            return info
+        raw += engine.flush()
+        if engine.unused_data:
+            problems.append(_problem(
+                "ERROR", "PNG 像素数据流之后还有 %d 字节多余数据：文件被动过"
+                % (len(engine.unused_data),)))
+            return info
     except zlib.error as exc:
         problems.append(_problem("ERROR", "IDAT 解压失败（%s）：文件截断或损坏" % (exc,)))
         return info
-    bpp = max(1, (_PNG_CHANNELS[color_type] * bit_depth + 7) // 8)
     rows, unfilter_error = _unfilter(raw, width, height, bpp)
     if unfilter_error:
         problems.append(_problem("ERROR", unfilter_error))
         return info
-    stats = _png_luma_stats(rows or [], width, height, color_type, bit_depth, palette)
+    stats = _png_luma_stats(rows or [], width, height, color_type, bit_depth, palette,
+                            transparency)
     if not stats.get("decoded"):
         problems.append(_problem("ERROR", "PNG 像素统计失败：%s" % (stats.get("error"),)))
         return info
@@ -617,6 +702,22 @@ def _scene_of(scenes: Sequence[Dict[str, Any]], time_s: float,
 # ---------------------------------------------------------------------------
 # 目录级检查
 # ---------------------------------------------------------------------------
+def _finalize(result: Dict[str, Any]) -> Dict[str, Any]:
+    """补齐 stats 统计口径（早退分支也要有 errors/warnings，CLI 才不会打「0 ERROR」）。"""
+    problems = result.get("problems") or []
+    stats = result.setdefault("stats", {})
+    for key in ("frame_count", "png", "jpeg", "timestamped", "decoded", "blank_frames"):
+        stats.setdefault(key, 0)
+    stats.setdefault("coverage", None)
+    stats.setdefault("covered_scenes", None)
+    stats.setdefault("scene_count", None)
+    stats.setdefault("min_frame_variance", None)
+    stats["errors"] = sum(1 for item in problems if item.get("level") == "ERROR")
+    stats["warnings"] = sum(1 for item in problems if item.get("level") == "WARN")
+    result["ok"] = stats["errors"] == 0
+    return result
+
+
 def check_frames(
     stills_dir: Path,
     timing: Optional[Dict[str, Any]] = None,
@@ -653,7 +754,7 @@ def check_frames(
         problems.append(_problem(
             "ERROR", "找不到静帧目录 %s：先跑 `npm run stills -- --scenes` 抽帧，再复跑本闸门"
             % (stills_dir,)))
-        return result
+        return _finalize(result)
 
     entries = sorted(stills_dir.iterdir(), key=lambda p: p.name)
     frames_paths: List[Path] = []
@@ -671,14 +772,24 @@ def check_frames(
         problems.append(_problem(
             "ERROR", "静帧目录 %s 里没有 PNG/JPEG 文件（只有 %d 个其它文件）"
             % (stills_dir, len(result["ignored"]))))
-        return result
+        return _finalize(result)
 
     # 期望尺寸：显式 --expect 优先；否则从 timing 的 width/height 与 --scale 推。
+    # 舍入用「四舍五入一半向上」而不是 Python 的 round()（银行家舍入）：stills.mjs 走
+    # JS Math.round，奇数宽度 × 0.5 时 Python round(500.5)=500 会与 JS 的 501 差 1 像素，
+    # 真实抽帧反而被误判错尺寸。
     if expect is None and timing is not None:
         width, height = timing.get("width"), timing.get("height")
         if _finite(width) and _finite(height) and float(width) > 0 and float(height) > 0:
-            expect = (int(round(float(width) * scale)), int(round(float(height) * scale)))
+            expect = (int(math.floor(float(width) * scale + 0.5)),
+                      int(math.floor(float(height) * scale + 0.5)))
             result["expect"] = "%dx%d" % expect
+        elif width is not None or height is not None:
+            # R9-V-TIMING：width/height 写错类型（"1080"、NaN）时以前静默跳过尺寸核对，
+            # 等于让「静帧尺寸对不对」这条检查消失；闸门应报 ERROR 而不是装没看见。
+            problems.append(_problem(
+                "ERROR", "timing.json 的 width/height 必须是正的有限数字，现在是 %r / %r："
+                "无法推算静帧期望尺寸（可用 --expect 显式指定）" % (width, height)))
 
     scenes: Optional[List[Dict[str, Any]]] = None
     duration: Optional[float] = None
@@ -770,11 +881,7 @@ def check_frames(
     result["stats"].setdefault("coverage", None)
     result["stats"].setdefault("covered_scenes", None)
     result["stats"].setdefault("scene_count", None)
-    errors = sum(1 for item in problems if item["level"] == "ERROR")
-    result["ok"] = errors == 0
-    result["stats"]["errors"] = errors
-    result["stats"]["warnings"] = sum(1 for item in problems if item["level"] == "WARN")
-    return result
+    return _finalize(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1204,68 @@ def _selftest() -> int:
             transparent_info = read_png(transparent_png)
             ok(transparent_info["all_transparent"], "全透明 PNG 应标记 all_transparent")
 
+            # R9-V-tRNS：调色板 PNG 用 tRNS 把索引设成 alpha=0，整帧不可见。以前完全不
+            # 处理 tRNS，这种隐形帧的亮度方差不为 0，能骗过空白闸门。
+            def _chunk(ctype: bytes, payload: bytes) -> bytes:
+                return (struct.pack(">I", len(payload)) + ctype + payload
+                        + struct.pack(">I", zlib.crc32(ctype + payload) & 0xFFFFFFFF))
+
+            def _palette_png(trns: bytes, index: int = 0, checker: bool = False) -> bytes:
+                ihdr3 = struct.pack(">IIBBBBB", 20, 10, 8, 3, 0, 0, 0)
+                rows = []
+                for _y in range(10):
+                    if checker:
+                        rows.append(b"\x00" + bytes(x % 2 for x in range(20)))
+                    else:
+                        rows.append(b"\x00" + bytes([index] * 20))
+                return (PNG_SIGNATURE + _chunk(b"IHDR", ihdr3)
+                        + _chunk(b"PLTE", bytes([255, 0, 0, 0, 255, 0]))
+                        + _chunk(b"tRNS", trns)
+                        + _chunk(b"IDAT", zlib.compress(b"".join(rows)))
+                        + _chunk(b"IEND", b""))
+
+            palette_trns_path = _write(tmp_path / "palette_trns.png",
+                                      _palette_png(bytes([0, 0])))
+            palette_trns_info = read_png(palette_trns_path)
+            ok(palette_trns_info["ok"] and palette_trns_info["decoded"], "调色板 + tRNS PNG 应能解码")
+            ok(palette_trns_info["all_transparent"],
+               "调色板 + tRNS 把所有索引设成 alpha=0：整帧应标记 all_transparent")
+            palette_trns_frame = analyze_frame(palette_trns_path, expect=(20, 10))
+            ok(palette_trns_frame["blank"], "调色板 + tRNS 隐形帧应被判为空白帧")
+            palette_opaque_path = _write(tmp_path / "palette_opaque.png",
+                                         _palette_png(bytes([255, 255]), checker=True))
+            palette_opaque_info = read_png(palette_opaque_path)
+            palette_opaque_frame = analyze_frame(palette_opaque_path, expect=(20, 10))
+            ok(not palette_opaque_info["all_transparent"],
+               "调色板 + tRNS 全不透明（alpha=255）不应标记 all_transparent")
+            ok(not palette_opaque_frame["blank"],
+               "调色板 + tRNS 全不透明且画面有对比时不应被误判空白")
+
+            # R9-V-chunk：未知 critical chunk / IEND 后多余数据 / 重复 IHDR /
+            # IDAT 里 zlib 流后追加垃圾，都应报 ERROR（与 publish_check 口径一致）。
+            ihdr_normal = struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 0)
+            idat_normal = zlib.compress(b"".join(_solid_rgba(4, 4, (10, 20, 30, 255))))
+
+            def _raw_png(middle: bytes, idat_payload: bytes = idat_normal,
+                         trailing: bytes = b"") -> bytes:
+                return (PNG_SIGNATURE + _chunk(b"IHDR", ihdr_normal) + middle
+                        + _chunk(b"IDAT", idat_payload) + _chunk(b"IEND", b"")
+                        + trailing)
+
+            cases = [
+                ("未知 critical chunk", _raw_png(_chunk(b"ABCD", b"x")), "critical"),
+                ("IEND 后多余字节", _raw_png(b"", trailing=b"junk"), "多余数据"),
+                ("重复 IHDR", _raw_png(_chunk(b"IHDR", ihdr_normal)), "IHDR"),
+                ("IDAT 里 zlib 流后垃圾", _raw_png(b"", idat_normal + b"trailing"), "多余数据"),
+            ]
+            for label, data, keyword in cases:
+                bad_info = read_png(_write(tmp_path / ("bad_" + str(len(label)) + ".png"), data))
+                ok(not bad_info["ok"] and any(
+                    keyword in msg for msg in _levels({"problems": bad_info["problems"]}, "ERROR")),
+                   "%s 应被判坏 PNG（含「%s」）" % (label, keyword))
+            ok(read_png(_write(tmp_path / "raw_ok.png", _raw_png(b"")))["ok"],
+               "同样构造但结构合法的 PNG 应通过（证明上面几条不是误伤）")
+
             raw_good = _png_bytes(40, 60, _gradient_rgba(40, 60))
             truncated = _write(tmp_path / "truncated.png", raw_good[:40])
             truncated_info = read_png(truncated)
@@ -1261,10 +1430,40 @@ def _selftest() -> int:
             ok(any("有限数字" in msg for msg in _levels(bad, "ERROR")),
                "坏 scenes 应报「有限数字」")
 
+            # 13b) width/height 类型坏：不许静默跳过尺寸核对
+            bad_size_timing = dict(timing)
+            bad_size_timing["width"] = "1080"
+            bad_size = check_frames(stills, timing=bad_size_timing, project_root=project)
+            ok(not bad_size["ok"] and any(
+                "width/height" in msg for msg in _levels(bad_size, "ERROR")),
+               "timing.json width 是字符串时应报 ERROR（而不是静默跳过尺寸核对），实际：%r"
+               % (_levels(bad_size, "ERROR"),))
+
             # 14) scale：期望尺寸跟着缩放
             scaled = check_frames(stills, timing=timing, project_root=project, scale=0.5)
             ok(not scaled["ok"] and scaled["expect"] == "20x30",
                "scale=0.5 时期望尺寸应为 20x30（实际 %r）" % (scaled["expect"],))
+
+            # 15) 奇数尺寸 × 0.5：舍入必须和 stills.mjs 的 JS Math.round 一致
+            # （1001*0.5=500.5 / 601*0.5=300.5，JS 得 501x301；Python round() 会得
+            # 500x300 —— 之前真实抽帧会被这条尺寸断言误判成 ERROR）。
+            odd_project = tmp_path / "odd_proj"
+            (odd_project / "src").mkdir(parents=True)
+            (odd_project / "src" / "timing.json").write_text(json.dumps({
+                "width": 1001, "height": 601, "duration": 1.0,
+                "scenes": [{"name": "only", "start": 0.0, "end": 1.0}],
+            }), encoding="utf-8")
+            odd_stills = odd_project / "out" / "stills"
+            odd_stills.mkdir(parents=True)
+            _write(odd_stills / "0000.00.png",
+                   _png_bytes(501, 301, _gradient_rgba(501, 301)))
+            odd = check_frames(odd_stills, timing=json.loads(
+                (odd_project / "src" / "timing.json").read_text(encoding="utf-8")),
+                project_root=odd_project, scale=0.5)
+            ok(odd["expect"] == "501x301",
+               "奇数尺寸 × 0.5 的期望尺寸应四舍五入为 501x301（实际 %r）" % (odd["expect"],))
+            ok(odd["ok"], "501x301 的真实抽帧不应因舍入口径被误判：%r"
+               % (odd["problems"][:3],))
 
     except AssertionError as exc:
         print("FAILED: frame_check.py --selftest：%s" % (exc,))

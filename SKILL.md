@@ -27,6 +27,6 @@ description: 一句话做出一支能发出去的竖屏产品宣传片（1080×1
 2. 真实产品才是主角：功能展示必须用脚本截的 2 倍图真实界面，AI 生成的图只做包装。
 3. `check_assets.py`、`check_video.py` 必须 **0 ERROR**；交付前 `audit.py validate`（决策/成本账本）与
    `publish_check.py`（四平台发布合规检查单，只检查不发布）同样要 0 ERROR；静帧证据 `frame_check.py`
-   （帧数覆盖每个场景、PNG 完整解码、非空白、像素尺寸==timing）与转写反查 `transcript_check.py`
+   （帧数覆盖每个场景、PNG 完整解码（Adam7 交错 / 超 4000 万像素降级结构校验 + WARN）、非空白、像素尺寸==timing）与转写反查 `transcript_check.py`
    （用户提供转写，漏念/错序/品牌名错字 = ERROR）也要 0 ERROR；抽帧联系表必须逐张看过，才允许交付。
    「看过画面」和「配音与字幕对得上」不是口头承诺——以两个脚本的输出为机器证据。

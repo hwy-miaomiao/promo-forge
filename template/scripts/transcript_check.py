@@ -370,6 +370,19 @@ def align_lines(refs: Sequence[Dict[str, Any]], transcripts: Sequence[Dict[str, 
 # ---------------------------------------------------------------------------
 # 主检查
 # ---------------------------------------------------------------------------
+def _finalize(result: Dict[str, Any]) -> Dict[str, Any]:
+    """补齐 stats 计数（早退分支也要有 errors/warnings，CLI 才不会打「0 ERROR」）。"""
+    problems = result.get("problems") or []
+    stats = result.setdefault("stats", {})
+    for key in ("ref_lines", "transcript_lines", "matched_lines", "missing_lines",
+                "low_lines", "extra_lines", "ref_chars", "matched_chars"):
+        stats.setdefault(key, 0)
+    stats["errors"] = sum(1 for item in problems if item.get("level") == "ERROR")
+    stats["warnings"] = sum(1 for item in problems if item.get("level") == "WARN")
+    result["ok"] = stats["errors"] == 0
+    return result
+
+
 def check_transcript(
     transcript_path: Path,
     ref_kind: str = "timing",
@@ -404,21 +417,34 @@ def check_transcript(
 
     if not (0.0 < threshold <= 1.0):
         problems.append(_problem("ERROR", "--threshold 必须在 (0, 1] 之间，现在是 %r" % (threshold,)))
-        return result
+        return _finalize(result)
     if not (0.0 <= min_coverage <= 1.0):
         problems.append(_problem("ERROR", "--min-coverage 必须在 0~1 之间，现在是 %r"
                                  % (min_coverage,)))
-        return result
+        return _finalize(result)
     if not transcript_path.is_file():
         problems.append(_problem("ERROR", "找不到 transcript 文件：%s" % (transcript_path,)))
-        return result
+        return _finalize(result)
 
     try:
         transcripts, actual_fmt = read_transcript(transcript_path, transcript_format)
     except ValueError as exc:
         problems.append(_problem("ERROR", str(exc)))
-        return result
+        return _finalize(result)
     result["stats"]["transcript_format"] = actual_fmt
+
+    if ref_kind == "srt" and timing is None:
+        # --ref srt 只换「参考行」的来源，品牌词仍应来自 timing.brand.name/url；
+        # 以前这里直接跳过，导致 --ref srt 时品牌错字能静默通过（文档承诺逐字校验）。
+        brand_timing_path = (Path(timing_path) if timing_path is not None
+                             else project_root / DEFAULT_TIMING)
+        if brand_timing_path.is_file():
+            try:
+                timing = _read_timing(brand_timing_path)
+                timing_path = brand_timing_path
+            except ValueError as exc:
+                problems.append(_problem(
+                    "WARN", "读了 timing.json 想核验品牌词，但解析失败，跳过品牌词校验：%s" % (exc,)))
 
     try:
         if ref_kind == "timing":
@@ -437,7 +463,7 @@ def check_transcript(
             raise ValueError("--ref 只能是 timing / srt，现在是 %r" % (ref_kind,))
     except ValueError as exc:
         problems.append(_problem("ERROR", str(exc)))
-        return result
+        return _finalize(result)
     result["ref"]["lines"] = len(refs)
 
     ref_norms = [normalize_text(ref["text"]) for ref in refs]
@@ -549,7 +575,7 @@ def check_transcript(
         "errors": errors,
         "warnings": sum(1 for item in problems if item["level"] == "WARN"),
     })
-    return result
+    return _finalize(result)
 
 
 def _who_uses(rows: Sequence[Dict[str, Any]], trans_index: Optional[int]) -> Optional[int]:
@@ -922,6 +948,16 @@ def _selftest() -> int:
             ok(by_srt["ref"]["kind"] == "srt" and by_srt["ref"]["lines"] == 4,
                "--ref srt 应有 4 条参考 cue")
 
+            # 11b) --ref srt 时品牌词仍来自 timing.brand：以前不读 timing，品牌错字会静默通过
+            srt_brand_wrong = check_transcript(
+                _write_text(tmp_path / "brand_srt.txt", "\n".join([
+                    good_lines[0], "打开青柚记帐就有答案", good_lines[2], good_lines[3]])),
+                ref_kind="srt", project_root=root, srt_path=srt_ref_path)
+            ok(not srt_brand_wrong["ok"] and any(
+                "品牌" in msg for msg in _levels(srt_brand_wrong, "ERROR")),
+               "--ref srt 时品牌错字应报「品牌」（不能静默跳过），实际：%r"
+               % (_levels(srt_brand_wrong, "ERROR"),))
+
             # 12) 输入错误：坏 SRT / 空文件 / 找不到文件 / 坏 timing
             bad_srt = _write_text(tmp_path / "bad.srt", "1\n00:00:xx,000 --> 00:00:02,000\n嗨\n")
             try:
@@ -939,6 +975,14 @@ def _selftest() -> int:
             absent = check_transcript(tmp_path / "nope.txt", project_root=root, timing=timing)
             ok(not absent["ok"] and any("找不到" in msg for msg in _levels(absent, "ERROR")),
                "找不到 transcript 应报找不到")
+            ok(absent["stats"].get("errors", 0) >= 1,
+               "早退分支的 stats.errors 必须与 problems 同源（否则 CLI 会打「0 ERROR」），"
+               "实际：%r" % (absent["stats"],))
+            bad_threshold = check_transcript(
+                tmp_path / "nope.txt", project_root=root, timing=timing, threshold=0.0)
+            ok(bad_threshold["stats"].get("errors", 0) >= 1,
+               "坏 --threshold 的早退分支也要有 stats.errors，实际：%r"
+               % (bad_threshold["stats"],))
 
             bad_timing = check_transcript(
                 _write_text(tmp_path / "t.txt", "x"), project_root=root,

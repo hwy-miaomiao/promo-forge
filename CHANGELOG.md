@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Fixed（第 9 轮独立验证 V9-P）
+
+- `frame_check.py`：PNG chunk 链收紧——未知 critical chunk / `IEND` 后尾随数据 / `IEND` payload 非空 / 重复 `IHDR` /
+  `IDAT` 解压后 zlib 流尾随垃圾 = ERROR（以前全部放行，与 `publish_check.py` 口径不一致）；`tRNS` 透明像素参与空白判定
+  （调色板/灰度/RGB 全透明隐形帧以前被判成「有画面」）；`--scale` 舍入改成 JS `Math.round` 口径（奇数边不再误判尺寸）；
+  `timing.width/height` 是字符串/NaN 时 = ERROR（以前静默跳过尺寸核对）；提前返回路径补 `stats`（CLI 不再打「0 ERROR」）。
+- `transcript_check.py`：`--ref srt` 时也从 `timing.json` 读品牌词做逐字校验（以前静默关闭，品牌错字可过闸）；
+  提前返回路径补 `stats`。
+- `check_assets.py`：`brand.logo` / `fonts.json` 的 `roles.*.file` 路径结构违规（绝对路径 / 盘符 / UNC / `..` 越界 /
+  冒号数据流 / 控制字符）从 WARN 升为 ERROR（文档承诺 R9-CA-04 的 ERROR，以前只 WARN）；「文件不存在」仍 WARN。
+- `publish_check.py`：封面 PNG 补 `IHDR` 长度/尺寸/`color_type`/`bit_depth` 合法组合、重复 `IHDR`、zlib `unused_data` 校验。
+- `mcp_server.py`：`publish_check` 的 `covers`/`video`/`subtitles`/`copy`/`title`/`body` 传非字符串时返回 -32602（以前静默忽略、
+  按默认值检查却报告成功）；`audit_validate` 的 `budget_cny` 必须是数字（不再接受 `"--help"` 之类开关字符串）。
+- 自测：`frame_check.py` 71 项、`transcript_check.py` 44 项；文档（AGENTS.md / README.md / references/校验清单.md）同步。
+
 ## [2026-10-22] 第 9 轮：证据闸门（真的看过画面 / 配音字幕对得上）+ 闸门漏洞修复
 
 本轮先把「代理看过画面」和「配音与字幕对得上」从口头承诺变成可跑的机器证据，再回头修独立审计发现的
@@ -14,12 +29,13 @@
 - **静帧证据闸门 `template/scripts/frame_check.py`**：逐帧完整解码 PNG（自实现 zlib 解压 + filter 0–4 反滤波，不依赖
   Pillow）、量化亮度方差判空白帧、像素尺寸==timing 分辨率（`--scale` 可缩放）、按文件名时间戳（`stills.mjs` 的
   `%06.2f` 命名）与 `timing.scenes` 核对每场景帧覆盖；JPEG 只解析头与段结构（明示不做像素解码，空白判定降级 WARN）。
-  人读表 + `--json {ok, frames, problems}`，有 ERROR 退出码 1；`--selftest` 58 项断言（正常/空白/截断/CRC 坏/错尺寸/
-  缺场景覆盖/坏 timing/`--no-timing`/`--scale`）。实测 ffmpeg 7.1 合成 3 帧：正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 判 ERROR。
+  人读表 + `--json {ok, frames, problems}`，有 ERROR 退出码 1；`--selftest` 71 项断言（正常/空白/截断/CRC 坏/未知
+  critical chunk/`tRNS` 全透明/错尺寸/缺场景覆盖/坏 timing/`--no-timing`/`--scale` 舍入）。实测 ffmpeg 7.1 合成 3 帧：
+  正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 判 ERROR。
 - **转写反查闸门 `template/scripts/transcript_check.py`**：零依赖 STT 替代（对标 MoneyPrinterTurbo 的 STT 反查思路，
   差异化是用户提供转写 + 纯 stdlib difflib + 可离线 + CI 可跑）。txt 逐行 / SRT 自动识别，与 `voice.lines`
   （或 `--ref srt`）保序对齐；漏念 / 低相似度 / 覆盖率不足 / 顺序错位 / 品牌名与网址错字 = ERROR，多余转写行 = WARN；
-  `--threshold`（默认 0.85）、`--min-coverage`（默认 1.0）可配。`--selftest` 41 项断言。
+  `--threshold`（默认 0.85）、`--min-coverage`（默认 1.0）可配。`--selftest` 44 项断言。
   实测：模板 5 句逐字转写 100% / 相似度全 1.00 / 0 ERROR；只念一句的转写 6 ERROR、字符覆盖率 2.94%。
 - **闸门接入**：`deliver.py check` 默认验证 `out/stills`（没有目录只 WARN；`--no-frames` 可跳过），
   `publish_check.py --frames <dir>` / `--transcript <file>` 显式传入才并入发布检查单（不破坏既有产物）；

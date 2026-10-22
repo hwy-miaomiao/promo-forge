@@ -214,14 +214,31 @@ def _png_problems(data: bytes) -> Optional[str]:
         if crc != actual:
             return "PNG 的 %s chunk CRC 校验失败（像素数据损坏或文件被动过）" % (
                 chunk_type.decode("ascii", "replace"),)
+        if chunk_type not in (b"IHDR", b"PLTE", b"IDAT", b"IEND") and chunk_type[0:1].isupper():
+            return ("PNG 含未知 critical chunk %r（首字母大写，规范要求解码器拒绝）"
+                    % (chunk_type.decode("ascii", "replace"),))
         if first:
             if chunk_type != b"IHDR":
                 return "PNG 第一个 chunk 不是 IHDR"
-            expected = _png_expected_raw_size(
-                data[offset + 8:offset + 8 + length],
-                int.from_bytes(data[16:20], "big"),
-                int.from_bytes(data[20:24], "big"))
+            if length != 13:
+                return "PNG 的 IHDR 长度应为 13（实际 %d）" % (length,)
+            ihdr_payload = data[offset + 8:offset + 8 + length]
+            bit_depth, color_type = ihdr_payload[8], ihdr_payload[9]
+            width = int.from_bytes(data[16:20], "big")
+            height = int.from_bytes(data[20:24], "big")
+            if width <= 0 or height <= 0:
+                return "PNG 尺寸不合法：%dx%d" % (width, height)
+            if color_type not in _PNG_CHANNELS:
+                return "PNG 的 color_type=%d 不认识（合法值 0/2/3/4/6）" % (color_type,)
+            if bit_depth not in (1, 2, 4, 8, 16):
+                return "PNG 的 bit_depth=%d 不合法" % (bit_depth,)
+            if color_type not in (0, 3) and bit_depth < 8:
+                return ("PNG 的 bit_depth=%d 与 color_type=%d 组合不合法"
+                        % (bit_depth, color_type))
+            expected = _png_expected_raw_size(ihdr_payload, width, height)
             first = False
+        elif chunk_type == b"IHDR":
+            return "PNG 里出现了重复的 IHDR chunk"
         elif chunk_type == b"IDAT":
             idat.extend(data[offset + 8:offset + 8 + length])
         elif chunk_type == b"IEND":
@@ -245,6 +262,9 @@ def _png_problems(data: bytes) -> Optional[str]:
         if not engine.eof:
             return "PNG 像素数据流不完整（zlib 流没有结束标记，文件被截断）"
         raw += engine.flush()
+        if engine.unused_data:
+            return ("PNG 像素数据流之后还有 %d 字节多余数据（IDAT 被追加了别的内容）"
+                    % (len(engine.unused_data),))
     except zlib.error as exc:
         return "PNG 的像素数据解压失败（%s）——文件不完整或已损坏" % (exc,)
     if expected is not None and len(raw) != expected:
@@ -1222,6 +1242,38 @@ def _selftest() -> int:
         corrupt_png.write_bytes(bytes(corrupt_bytes))
         size, err = png_size(corrupt_png)
         check("PNG CRC 坏 → 报错", (size is None, err is not None), (True, True))
+
+        # --- R9-V-PNG：publish_check 与 frame_check 的 PNG 结构口径要对齐 ---
+        def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+            return (len(payload).to_bytes(4, "big") + kind + payload
+                    + (zlib.crc32(kind + payload) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+        small_ihdr = ((8).to_bytes(4, "big") + (8).to_bytes(4, "big")
+                      + bytes([8, 2, 0, 0, 0]))
+        small_raw = b"".join(b"\x00" + bytes((1, 2, 3)) * 8 for _ in range(8))
+        small_z = zlib.compress(small_raw)
+        small_base = _PNG_SIGNATURE + _png_chunk(b"IHDR", small_ihdr)
+        valid_small = root / "small-ok.png"
+        valid_small.write_bytes(small_base + _png_chunk(b"IDAT", small_z)
+                                + _png_chunk(b"IEND", b""))
+        check("小尺寸合法 PNG → 通过", png_size(valid_small), ((8, 8), None))
+        bad_ct5 = (_PNG_SIGNATURE
+                   + _png_chunk(b"IHDR", (8).to_bytes(4, "big") + (8).to_bytes(4, "big")
+                                + bytes([8, 5, 0, 0, 0]))
+                   + _png_chunk(b"IDAT", small_z) + _png_chunk(b"IEND", b""))
+        png_variants = {
+            "未知 critical chunk": small_base + _png_chunk(b"ABCD", b"x")
+                                    + _png_chunk(b"IDAT", small_z) + _png_chunk(b"IEND", b""),
+            "IDAT 里 zlib 流后尾随垃圾": small_base + _png_chunk(b"IDAT", small_z + b"junk")
+                                         + _png_chunk(b"IEND", b""),
+            "非法 color_type=5": bad_ct5,
+            "重复 IHDR": small_base + _png_chunk(b"IHDR", small_ihdr)
+                          + _png_chunk(b"IDAT", small_z) + _png_chunk(b"IEND", b""),
+        }
+        for index, (label, payload) in enumerate(png_variants.items()):
+            variant_path = root / ("variant-%d.png" % index)
+            variant_path.write_bytes(payload)
+            check("%s → 报错" % (label,), png_size(variant_path)[0] is None, True)
 
         # --- 组装一个完整假项目 ---
         project = root / "proj"
