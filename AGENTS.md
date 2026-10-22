@@ -209,6 +209,8 @@ python scripts/subtitles.py burn out/final-1080p-nosubs.mp4 -o out/final-1080p-h
   硬字幕用**系统字体**渲染（`fonts.json` 的 `stack`），不用子集字体：字幕改一个字就可能超出子集范围，
   那会静默变成方块；要改字幕就改 `voice.lines[].text` 并重跑 `tts.py`。
 
+**配音与字幕对得上要机器验证**：`python scripts/transcript_check.py transcript.txt` 用用户提供的逐句转写（txt 每行一句，或 SRT 自动识别）反查 `timing.json` 的 `voice.lines`：默认**任一语音行没对上就 ERROR**，相似度阈值 `--threshold`（默认 0.85）、字符覆盖率 `--min-coverage`（默认 1.0）可调；顺序错位、品牌名与网址错字（对标 STT 反查的「品牌名错一个字就失败」）也是 ERROR，多余转写行只 WARN。它不下载模型、不调付费 ASR，零依赖可离线。注意它是**反查口播与字幕文案是否一致**，不替代「人耳试听音色」那一步。
+
 ### 阶段 8 · 混音
 
 ```bash
@@ -240,9 +242,11 @@ python scripts/check_assets.py                      # 渲染前：缺文件/图�
 python scripts/audit.py validate                    # 决策/成本账本：结构、人拍板三类事、付费记账、预算上限
 npm run stills -- --scenes                          # 每场景抽 40% 与 80% 两帧
 python scripts/media.py sheet out/stills --cols 4   # 拼成联系表
+python scripts/frame_check.py                       # 静帧证据：帧数/尺寸/空白/场景覆盖（机器可验证「看过」）
+python scripts/transcript_check.py transcript.txt   # 转写反查：漏念/错序/品牌错字（用户提供转写，替代 STT）
 python scripts/check_video.py out/final-1080p.mp4   # 渲染后：规格/响度/空档/渲染日志报错 + 联系表 + 决策账本
 python scripts/fonts.py check                       # 缺字（内嵌子集 / 系统字体都算）
-python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预检 + 生成发布合规清单
+python scripts/deliver.py check out/final-1080p.mp4 --platform all   # 平台预检 + 静帧证据 + 生成发布合规清单
 python scripts/publish_check.py                     # 四平台发布前检查单（标题/话题/正文/时长/封面/安全区）
 ```
 
@@ -257,6 +261,15 @@ python scripts/publish_check.py                     # 四平台发布前检查�
   `deliver.py check` 通过后会自动生成 `publish/manifest.json`。它只出检查单，**绝不自动发布**
   （账号风控与平台合规由人负责）。
 - 抽帧联系表**必须逐张看过**，对照 `references/校验清单.md` 的审图项打勾（构图、字幕安全区、截图清晰度、品牌名拼写）。
+- **「看过画面」「配音与字幕对得上」要有机器证据**：`frame_check.py` 逐帧**完整解码** PNG（纯标准库，
+  不依赖 Pillow）、按亮度方差判空白帧（默认阈值 6.0）、核对像素尺寸等于 `timing` 的 `width×height`、
+  再用文件名时间戳（`stills.mjs` 的 `%06.2f` 命名）核对每个场景都有帧；`--json` 输出 `{ok, frames, problems}`
+  给外部编排器，有 ERROR 非零退出。`transcript_check.py <用户提供的转写.txt|.srt>` 把「实际念出来的话」与
+  `voice.lines`（或 `--ref srt` 用已生成字幕）逐行保序对齐：任一语音行漏配 / 相似度低于 `--threshold`（默认 0.85）/
+  字符覆盖率低于 `--min-coverage`（默认 1.0）/ 顺序错位 / 品牌名与网址错字 = ERROR，多余转写行 = WARN。
+  它不下载模型、不调付费 ASR（对标 STT 反查的零依赖替代）。`deliver.py check` 默认跑静帧证据闸门
+  （没有 `out/stills` 只 WARN，`--no-frames` 可跳过）；`publish_check.py --frames <dir> --transcript <file>`
+  可把两项证据并入发布检查单（显式传入才启用）。
 - 渲染日志里出现 `cannot be decoded` / `Error:` / `failed to load` 一律按失败处理，即使渲染"成功结束"。
   另有 9 条**强失败信号**同享此判据，而且**优先于**「`0 errors` 自称零错误」的豁免（汇总行会跟真错误写在同一行）：
   `Unhandled exception` / `Command failed with exit code N`、`exited with code N`、`exit status N` /
@@ -300,6 +313,7 @@ npm run web:build && npm run web:serve    # 网页播放版
 python scripts/deliver.py check out/final-1080p.mp4 --platform all
 python scripts/deliver.py cover out/final-1080p.mp4 --title "每天记账要花十几分钟？"
 python scripts/publish_check.py --strict    # 发布前最后一关：0 ERROR 才投；生成 publish/manifest.json
+python scripts/publish_check.py --strict --frames out/stills --transcript transcript.txt   # 可选：把两项证据并入检查单
 ```
 
 - `publish_check.py` 是**发布前检查单**，不是发布器：逐平台给标题/话题/正文/时长/封面/安全区的
@@ -308,6 +322,7 @@ python scripts/publish_check.py --strict    # 发布前最后一关：0 ERROR �
   `summary.errors/publishable` 与每个平台的 `publishable` 上，不会出现「summary 说不可发、平台说可发」。
   `--strict` 把 WARN 也当 ERROR；文案用 `publish/copy.json` 覆盖（标题/话题/正文），
   也可以用 `--title/--hashtags/--body` 直接传。**它不会登录任何平台、不会自动发布**。
+- `--frames <静帧目录>` / `--transcript <转写文件>` 是**显式传入才启用**的可选证据闸门（不传时行为与以前完全一致，既有产物不会因为新增检查突然红）：`--frames` 把 `frame_check.py` 的帧覆盖/尺寸/空白结论并入检查单，`--transcript` 把转写反查结论并入（漏念/错序/品牌错字 = ERROR）；两者都写进 `publish/manifest.json` 的明细。
 
 - `check` 按平台给硬限制与推荐值；**抖音、小红书的官方口径脚本抓不到**，那部分标「需人工确认」
   （只提示、不参与判定，不会因此刷 WARN）；第三方汇总口径才按 WARN 处理，交付时必须说清"需人工确认"；
@@ -384,7 +399,7 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
   "aspect": "9:16",       // "9:16" | "16:9"
   "duration": 45,         // 秒，必须等于最后一个场景的 end
   "music": {
-    "file": "audio/music.wav",  // 相对 public/；混音脚本会写出这个文件
+    "file": "audio/music.wav",  // 相对 public/；混音脚本会写出这个文件。必须是 public/ 下的相对路径（绝对路径 / 盘符 / `..` 越界 = ERROR，R9-CA-04：mix.py 照这个路径写盘并自动建父目录）
     "source": "audio-src/music/track.mp3",
     "offset": 0.0,        // 视频时间 = 音乐时间 + offset
     "beat": 0.4615,       // 每拍秒数
@@ -420,10 +435,12 @@ TS 侧（Root / Promo / 场景 / 动画库）与 Python 侧（tts / mix / music 
 约定：`at`、`start`、`end`、`drop` 一律是**秒**（浮点）；`beat/bar` 是**秒**；帧数由脚本或组件用 `Math.round(秒 × fps)` 换算。
 `voice.lines` 每句必须有 `id/scene/at/text`（缺字段、非对象行、`voice.lines` 不是数组都是 **ERROR**，由 `check_assets.py` 校验，不再默认 `at = 0`）。
 `voice.lines` 的 `id` **必须唯一**（`tts.py` / `subtitles.py` / `check_assets.py` 三处都拦，R8-CA-02）：`id` 同时是 `audio-src/vo/<id>.mp3` 的文件名、`tts.py` 缓存键与 `audio-src/vo/report.json` 的索引；重复时后一句的配音会覆盖前一句，而字幕/混音仍按各自的 `text` 摆位 —— 成片里画面字幕与听到的话对不上，却全程不报错。
+`voice.lines[].text` 必须是**非空字符串**（空串 / 纯空白 / 数字 = ERROR，R9-CA-01：text 是 tts.py 合成、subtitles.py 上屏、mix.py 算人声窗口的唯一来源）；`id` 还必须能当**安全文件名**（不含 `/ \ :` 等分隔符、不是 `.`/`..`、不是 Windows 保留名 CON/PRN/AUX/NUL/COM1-9/LPT1-9、不以点或空格结尾，R9-CA-03：它会拼成 `audio-src/vo/<id>.mp3` 并当 tts 缓存键）。
 时间/尺寸字段必须写成 **JSON 数字**，写成字符串（如 `"4.5"`）一律 **ERROR**（R8-CA-01）：覆盖 `duration`、`width`/`height`、`scenes[].start/end`、`voice.lines[].at`、`music.beat/bar/drop/gain/offset`、`music.segments[].at/from/to`、`captions.maxChars/maxLines`。原因是 TS 侧对它们做 `+` 运算（`Scene.tsx` 的 `useAbsTime`、`Caption.tsx` 的 `captionUntil`、`beats.ts` 的 `musicToVideo`），字符串会拼成 `"4.50.15"` → 后续 `Number`/比较得 NaN，画面卡点与画面内字幕整段静默消失；`fps` / `captions.bottom` 早已按同一口径拦（R6-TPL-03），R8 把其余数值字段补齐。
 `fps` 必须有限正数且 `0 < fps ≤ 240`：字符串（如 `"60"`）、布尔、0、负数、NaN、Inf 都是 **ERROR**。它是帧号换算（秒 × fps）和渲染命令 `--fps` 的直接输入，写错会一路带到渲染阶段才炸（`check_assets.py` 的 `check_timing_structure`，R6-TPL-03）。
 `music.offset` 与 `music.drop` 是**必填**字段：缺失 / `null` / 空串都是 **ERROR**（R8-CA-05，`check_assets.py` 的 `check_music_fields`）。`src/lib/timing.ts` 的 `Music` 类型把它们标为必填，而 `beats.ts` 的 `musicToVideo()` 直接 `musicTime + timing.music.offset`、`scenes/Hook.tsx` 直接 `TIMING.music.drop - beat.start` —— 字段缺失时 `undefined` 参与算术得 NaN，全片卡点与钩子爆发整段静默失效而渲染不报错。`music.gain` 是例外：mix.py 对缺失值用 `DEFAULT_MUSIC_GAIN=0.6`、TS 侧不消费它，所以只要求「存在时必须是有限数字」（有意宽松）。
 `captions.bottom` / `captions.top` 若存在，必须是 `0~1` 的有限数（画布高度比例；模板默认 `bottom=0.18`）：越界（如 `1.5`）是 **ERROR** —— 画面内 `<Caption>` 与硬字幕都按它定位，越界会把字幕推出画面或压到平台互动按钮区却不报错（同一函数校验）。
+`brand` 是**必填结构**：`brand` 对象、`name`/`url`/`logo` 字符串（name/url 非空，logo 允许空串）、`colors` 对象且 `bg`/`fg`/`accent` 非空字符串（R9-CA-02）。TS 侧 `src/lib/timing.ts` 把 `brand` 标为必填，`Promo.tsx` / `Cta.tsx` / `theme.ts` / `Scene.tsx` 直接读 `brand.colors` / `brand.logo` / `name` / `url`，缺字段是渲染期 `Cannot read properties of undefined`，以前闸门 0 ERROR 放行。
 
 ## 6. 技术栈与脚本速查
 
@@ -458,8 +475,10 @@ Remotion 自带的 compositor 精简构建只能渲、不能烧字幕。装完�
 | `scripts/check_assets.py` | 渲染前闸门 | `[--strict]` / `--selftest`（纯函数自测，不读素材） |
 | `scripts/check_video.py` | 成片闸门 | `<mp4> [--expect 1080x1920] [--log out/render.log] [--no-log] [--fps] [--lufs-min] [--lufs-max] [--silence] [--decisions] [--budget-cny]` / `--selftest` |
 | `scripts/audit.py` | 决策与成本账本：人拍板三类事、付费记账、预算上限（零付费默认通过） | `init [--root] [--budget] [--force]` / `append --kind … --decision … [--cost] [--paid-service]` / `validate [--root] [--budget] [--format text\|json]` / `--selftest` |
-| `scripts/publish_check.py` | 四平台发布合规检查单（标题/话题/正文/时长/封面/安全区；只检查不发布） | `[--project] [--video] [--covers] [--subtitles] [--copy] [--title] [--hashtags] [--body] [--platform all\|douyin\|kuaishou\|xiaohongshu\|shipinhao] [--strict] [--no-write] [--format text\|json]` / `--selftest` |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；10 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查，共 13 项） | 无 |
+| `scripts/publish_check.py` | 四平台发布合规检查单（标题/话题/正文/时长/封面/安全区；只检查不发布） | `[--project] [--video] [--covers] [--subtitles] [--copy] [--title] [--hashtags] [--body] [--platform all\|douyin\|kuaishou\|xiaohongshu\|shipinhao] [--frames <静帧目录>] [--transcript <转写文件>] [--strict] [--no-write] [--format text\|json]` / `--selftest` |
+| `scripts/frame_check.py` | 静帧证据闸门（「真的看过画面」的机器可验证版）：PNG 完整解码 / 空白帧方差 / 像素尺寸 / 场景帧覆盖 | `[<stills>] [--project] [--timing] [--no-timing] [--expect WxH] [--scale] [--per-scene] [--coverage] [--min-variance] [--json]` / `--selftest` |
+| `scripts/transcript_check.py` | 转写反查闸门（零依赖 STT 替代）：用户转写 vs `voice.lines`/SRT 的漏念/错序/相似度/品牌错字 | `<transcript> [--project] [--ref timing\|srt] [--timing] [--srt] [--format auto\|txt\|srt] [--threshold] [--min-coverage] [--brand WORD] [--no-brand-strict] [--json]` / `--selftest` |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款；12 个脚本 `--selftest` + 3 项 3.9/BOM 兼容检查，共 15 项） | 无 |
 | `scripts/stills.mjs` | 抽帧 | `<秒...>` 或 `--scenes` `[--scale 0.5] [--keep]` |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（同步范围与「未纳入比对」清单见 `--help`） | `[--diff] [--apply] [--force]` / `--selftest` |
 
@@ -468,17 +487,19 @@ Remotion 自带的 compositor 精简构建只能渲、不能烧字幕。装完�
 | 闸门 | 通过条件 |
 | --- | --- |
 | `doctor.py` | 无 MISSING（WARN 可接受） |
-| `scripts/selftest.py` | 10 个脚本的 `--selftest`（`check_assets` / `check_video` / `audit` / `publish_check` / `mix` / `subtitles` / `doctor` / `deliver` / `sync_template` / `media`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描（scripts + service）/ 源码 AST 扫描容忍 UTF-8 BOM，共 13 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
+| `scripts/selftest.py` | 12 个脚本的 `--selftest`（`check_assets` / `check_video` / `audit` / `publish_check` / `frame_check` / `transcript_check` / `mix` / `subtitles` / `doctor` / `deliver` / `sync_template` / `media`）+ Python 3.9 写盘 smoke（真写 SRT）/ API 扫描（scripts + service）/ 源码 AST 扫描容忍 UTF-8 BOM，共 15 项全过（纯函数自测，不读素材、不需要 ffmpeg / node / 网络；CI 同款） |
 | `audit.py` | 0 ERROR：`decisions.json` 存在且结构合法、需求确认（`user_requirement`）有记录、付费服务逐项记账且写清服务名、累计金额不超预算（默认 0 元 = 零付费）；试听/事实核实按项目条件校验。存量项目缺文件 → WARN 提示 `audit.py init`；文件坏/缺需求确认/付费未记账 = ERROR |
-| `publish_check.py` | 目标平台 0 ERROR：成片存在、竖屏且 MP4 容器结构合法（`ftyp`+`moov`，文本假视频 ERROR；无 ffprobe 时深检降级 WARN）、封面 1~3 张且 1080×1920、字幕落安全区（`captions.bottom ≥ 0.18`）、标题/话题/正文/时长符合平台口径（话题数越界 = ERROR）；`--strict` 下 manifest 与退出码同源；输出 `publish/manifest.json` 逐平台 `publishable`（只检查不发布） |
-| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`timing.json` 数值口径合法**（`fps` 必须是有限正数且 `0 < fps ≤ 240`，字符串/布尔/0/负/NaN/Inf = ERROR；`captions.bottom` / `captions.top` 若存在必须是 `0~1` 的有限数，越界 = ERROR，R6-TPL-03；其余时间/尺寸字段（`duration`、`width/height`、`scenes[].start/end`、`voice.lines[].at`、`music.beat/bar/drop/gain/offset`、`music.segments[].at/from/to`、`captions.maxChars/maxLines`）写成字符串也是 ERROR，R8-CA-01）；`music.offset` / `music.drop` 是**必填字段**，缺失 / `null` / 空串 = ERROR（R8-CA-05，TS 侧 `beats.ts` / `Hook.tsx` 直接参与算术，缺字段得 NaN）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空且 `id` 全片唯一、`at` 是数字——不再默认 `at = 0`；R8-CA-02）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；旁白字数按视觉字宽（全角 1 / 半角 0.5）对照 6.5 字/秒预算（WARN，R8-CA-03）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈 |
+| `publish_check.py` | 目标平台 0 ERROR：成片存在、竖屏且 MP4 容器结构合法（`ftyp`+`moov`，文本假视频 ERROR；无 ffprobe 时深检降级 WARN）、封面 1~3 张且 1080×1920、字幕落安全区（`captions.bottom ≥ 0.18`）、标题/话题/正文/时长符合平台口径（话题数越界 = ERROR）；**`timing` 的 `duration`/`width`/`height`/`captions.bottom` 若声明了但不是有限数字（字符串 / `NaN` / `Infinity`）= ERROR**（R9-P1：`NaN` 与任何数比较都为假，以前两项范围判断都走 OK、`width>=height` 也走 OK）；封面 PNG 必须**完整解码**（chunk 链走到 IEND、逐 chunk CRC、IDAT 解压长度==IHDR 推导值，截断/坏 CRC = ERROR，R9-P2）；`--frames <目录>` / `--transcript <文件>`**显式传入时才启用**，把 `frame_check.py` 的静帧证据与 `transcript_check.py` 的转写反查结论并入检查单与 manifest；`--strict` 下 manifest 与退出码同源；输出 `publish/manifest.json` 逐平台 `publishable`（只检查不发布） |
+| `check_assets.py` | 0 ERROR；`timing.json` 的 `aspect` 与 `width×height` 一致（只允许 `9:16` / `16:9`，允许 ±1px）；**`timing.json` 数值口径合法**（`fps` 必须是有限正数且 `0 < fps ≤ 240`，字符串/布尔/0/负/NaN/Inf = ERROR；`captions.bottom` / `captions.top` 若存在必须是 `0~1` 的有限数，越界 = ERROR，R6-TPL-03；其余时间/尺寸字段（`duration`、`width/height`、`scenes[].start/end`、`voice.lines[].at`、`music.beat/bar/drop/gain/offset`、`music.segments[].at/from/to`、`captions.maxChars/maxLines`）写成字符串也是 ERROR，R8-CA-01）；`music.offset` / `music.drop` 是**必填字段**，缺失 / `null` / 空串 = ERROR（R8-CA-05，TS 侧 `beats.ts` / `Hook.tsx` 直接参与算术，缺字段得 NaN）；**`voice.lines` 结构合法**（必须是数组；每句必须是对象且 `id/scene/at/text` 齐全、`id`/`scene` 非空且 `id` 全片唯一、`at` 是数字——不再默认 `at = 0`；R8-CA-02）；**`music.segments` 结构合法**（必须是数组；每段必须是对象、`at`/`from` 是非负数字、给了 `to` 必须 `from < to`）；旁白字数按视觉字宽（全角 1 / 半角 0.5）对照 6.5 字/秒预算（WARN，R8-CA-03）；图片宽度在护栏内（<1000px 或 >3000px 会 WARN；「≥ 显示宽度 ×2」要人工按画面占比核对）；无缺字 —— 缺字口径覆盖 `timing.json` 文案 **+ `src/web` 里写在组件里的屏上文字**（剥注释），内嵌子集存在就查子集、不存在才退回系统字体栈；**`voice.lines[].text` 必须是非空字符串**（空串 / 纯空白 / 数字 = ERROR，R9-CA-01：text 是 tts.py 合成、subtitles.py 上屏、mix.py 算人声窗口的唯一来源）；**`voice.lines[].id` 必须能当安全文件名**（不含 `/ \ :` 等分隔符与 `..` 路径段、不是 Windows 保留名、不以点/空格结尾，R9-CA-03）；**`brand` 结构齐全**（name/url/logo 字符串、colors 的 bg/fg/accent 非空字符串，R9-CA-02，TS 侧必填、缺了渲染期 TypeError）；**`music.file` / `brand.logo` / `fonts.json` 的 `roles.*.file` 必须是 `public/` 下的相对路径**（绝对路径 / 盘符 / `..` 越界 = ERROR，R9-CA-04，mix.py 会照 `music.file` 写盘） |
+| `frame_check.py` | 0 ERROR：静帧目录（默认 `out/stills`）每张 PNG **完整解码**（chunk 链到 IEND、逐 chunk CRC、IDAT 解压长度==IHDR 推导值）、非空白帧（亮度方差 ≥ `--min-variance`，默认 6.0；全透明也算空白）、像素尺寸 == `timing` 的 `width×height`（可用 `--scale` 整组缩放）、文件名时间戳（`stills.mjs` 的 `%06.2f`）覆盖 `timing.scenes` 每个场景（`--per-scene` 默认 1，场景外帧只 WARN）；JPEG 只做头/段结构校验（纯 stdlib 不做像素解码，空白判定降级 WARN）；`--json` 输出 `{ok, frames, problems}`，有 ERROR 退出码 1；58 项自测覆盖正常/空白/截断/CRC/错尺寸/缺场景/坏 timing |
+| `transcript_check.py` | 0 ERROR（用户提供转写时才启用）：txt/SRT 转写与 `voice.lines`（`--ref timing`，默认）或已生成字幕（`--ref srt`）逐行保序对齐；漏念 / 相似度 < `--threshold`（默认 0.85）/ 字符覆盖率 < `--min-coverage`（默认 1.0）/ 顺序错位 / `brand.name`/`brand.url` 错字 = ERROR，多余转写行 = WARN，纯标点/空白差异只 WARN；不下载模型、不调付费 ASR |
 | `check_video.py` | 规格与 `timing.json` 一致（±0.2 秒）；有音轨（没有音轨只报「没有音轨」，不再误归因为 ffmpeg 缺滤镜）；**音轨时长覆盖全片**（音轨比视频短 >0.3 秒 = ERROR，片尾静音 silencedetect 查不到）；响度 -16~-12 LUFS；无 ≥1.0 秒空档（片尾静音豁免不叠加）；渲染日志无报错，**日志缺失默认 ERROR**（确实不需要检查才显式加 `--no-log`），日志会按字节识别 UTF-8/UTF-16 编码（UTF-16 打 WARN 留痕），超时只认失败语义（`_RX_LOG_TIMEOUT`）不认配置回显；逐场景抽帧与联系表帧数必须达到期望值（少了算 ERROR） |
 | `mix.py` | 母带后响度复测成功（-14 LUFS ±2 dB）；**测不到成品响度 = ERROR**（闸门失效不等于通过；需要完整版 ffmpeg 的 ebur128，compositor 精简构建跑不通）；每句人声比音乐高 ≥6 dB |
 | `tts.py audit` | 无 `TOO_LONG` / `MISSING`（`ECHO`：脚本已自动截掉低能量拖音，重跑仍报说明尾巴能量不低，需人工试听确认） |
 | `fonts.py check` | 0 ERROR：片子用到的每个字符都有字形（内嵌子集或系统字体都算） |
-| `deliver.py check` | 目标平台 0 ERROR；「需人工确认」项（抖音/小红书的官方码率、体积口径）只提示、不参与判定；「推荐值（第三方汇总，非官方）」WARN 由人逐条判断；「官方建议值（非硬限制）」（视频号的码率 / 画幅：官方原文用词是「建议」，不是拒收门槛）只判 WARN；「本项目规范（AGENTS.md）」是硬规矩（如必须有音轨/视频流、视频号分辨率按 AGENTS 的 1080×1920）；音轨/视频流不是平台限制；0 ERROR 时自动生成 `publish/manifest.json` 发布合规检查单 |
+| `deliver.py check` | 目标平台 0 ERROR；「需人工确认」项（抖音/小红书的官方码率、体积口径）只提示、不参与判定；「推荐值（第三方汇总，非官方）」WARN 由人逐条判断；「官方建议值（非硬限制）」（视频号的码率 / 画幅：官方原文用词是「建议」，不是拒收门槛）只判 WARN；「本项目规范（AGENTS.md）」是硬规矩（如必须有音轨/视频流、视频号分辨率按 AGENTS 的 1080×1920）；音轨/视频流不是平台限制；默认跑静帧证据闸门（`out/stills` 存在则把 `frame_check.py` 的结论并入发布检查单，目录缺失只 WARN，`--no-frames` 跳过）；0 ERROR 时自动生成 `publish/manifest.json` 发布合规检查单 |
 | `subtitles.py srt/ass/burn` | 折行超过 `captions.maxLines` 直接 ERROR（最多 2 行是硬要求，不是 WARN）；字号自动压进左右安全区；burn 完的片子仍要过 `check_video.py`（音轨用 `-c:a copy` 保留）；烧之前画面里必须没有自带字幕 |
-| 人工审图 | 联系表逐张看过，`references/校验清单.md` 全部打勾 |
+| 人工审图 | 联系表逐张看过，`references/校验清单.md` 全部打勾；`frame_check.py` 0 ERROR 是「看过画面」的机器证据，「我看了」这类口头声明不算 |
 
 脚本一律：**发现问题就非零退出并打印 `ERROR: ...` 行**，不要静默通过。
 

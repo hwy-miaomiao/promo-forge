@@ -17,10 +17,17 @@
 2. 本机有 ``ffprobe`` 时再深检容器/视频流/时长/分辨率（失败 = ERROR）；没有
    ffprobe 时只做第 1 层并显式 WARN 说明降级（不静默放过）。
 
+两个可选证据闸门（只在显式传参时启用，避免旧项目产物被新口径拦死）：
+- ``--frames out/stills``：调 ``frame_check.py`` 机器验证「代理真的看过画面」
+  （帧数覆盖 timing 每个场景、PNG 可解码、像素尺寸 == timing、非空白）；
+- ``--transcript 转写.txt|.srt``：调 ``transcript_check.py`` 做零依赖 STT 反查
+  （配音逐句对上字幕源；漏行 / 错序 / 品牌名错一个字 = ERROR）。
+
 用法：
     python scripts/publish_check.py                     # 默认四平台全查
     python scripts/publish_check.py --platform douyin   # 只查一个平台
     python scripts/publish_check.py --strict            # WARN 也当 ERROR（更严）
+    python scripts/publish_check.py --frames out/stills --transcript 转写.txt
     python scripts/publish_check.py --format json       # 单行 JSON（MCP 用）
     python scripts/publish_check.py --selftest          # 纯函数自测，不读真实项目
 
@@ -30,11 +37,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import importlib.util
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -156,21 +166,110 @@ def load_json_file(path: Path) -> Tuple[Optional[Any], Optional[str]]:
         return None, "%s 不是合法 JSON：%s" % (target, exc)
 
 
-def png_size(path: Path) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
-    """只读 PNG 头 24 字节取宽高（不依赖 Pillow）。返回 ((w,h), 错误说明)。"""
+#: PNG 解压后允许的最大扫描线字节数：超过就拒绝继续校验（防 zip 炸弹）。
+_PNG_MAX_RAW = 400 * 1024 * 1024
+#: PNG color_type → 每像素通道数（0 灰度 2 RGB 3 调色板 4 灰度+alpha 6 RGBA）。
+_PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+
+def _png_expected_raw_size(ihdr: bytes, width: int, height: int) -> Optional[int]:
+    """按 IHDR 估算解压后的字节数（每行 1 个 filter 字节）；不支持组合返回 None。"""
+    if len(ihdr) != 13:
+        return None
+    bit_depth, color_type, interlace = ihdr[8], ihdr[9], ihdr[12]
+    channels = _PNG_CHANNELS.get(color_type)
+    if channels is None or interlace != 0 or bit_depth not in (1, 2, 4, 8, 16):
+        return None
+    if color_type not in (0, 3) and bit_depth < 8:
+        return None
+    row_bytes = (width * channels * bit_depth + 7) // 8
+    expected = height * (1 + row_bytes)
+    return expected if expected <= _PNG_MAX_RAW else None
+
+
+def _png_problems(data: bytes) -> Optional[str]:
+    """校验 PNG 结构完整性（纯 stdlib）：chunk 链 / CRC / IDAT / 解压后长度自洽。
+
+    只读 24 字节头只能判断「是不是 PNG」：截断、CRC 坏、像素数据被破坏的图照样能
+    骗过尺寸检查，投平台时才发现封面打不开。这里把 chunk 链走完、逐个校验 CRC，
+    再把 IDAT 拼起来解压一次、按 IHDR 核对扫描线字节数。
+    """
+    total = len(data)
+    offset = 8
+    first = True
+    seen_iend = False
+    idat = bytearray()
+    expected: Optional[int] = None
+    while offset + 12 <= total:
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_type = data[offset + 4:offset + 8]
+        if not all(32 <= byte <= 126 for byte in chunk_type):
+            return "PNG 第 %d 字节处的 chunk 类型不合法" % (offset,)
+        end = offset + 12 + length
+        if end > total:
+            return ("PNG 的 %s chunk 被截断（声明 %d 字节，文件只剩 %d 字节）"
+                    % (chunk_type.decode("ascii", "replace"), length, total - offset - 12))
+        crc = int.from_bytes(data[offset + 8 + length:end], "big")
+        actual = zlib.crc32(bytes(chunk_type) + data[offset + 8:offset + 8 + length]) & 0xFFFFFFFF
+        if crc != actual:
+            return "PNG 的 %s chunk CRC 校验失败（像素数据损坏或文件被动过）" % (
+                chunk_type.decode("ascii", "replace"),)
+        if first:
+            if chunk_type != b"IHDR":
+                return "PNG 第一个 chunk 不是 IHDR"
+            expected = _png_expected_raw_size(
+                data[offset + 8:offset + 8 + length],
+                int.from_bytes(data[16:20], "big"),
+                int.from_bytes(data[20:24], "big"))
+            first = False
+        elif chunk_type == b"IDAT":
+            idat.extend(data[offset + 8:offset + 8 + length])
+        elif chunk_type == b"IEND":
+            seen_iend = True
+            if length != 0:
+                return "PNG 的 IEND chunk 长度不是 0"
+            offset = end
+            break
+        offset = end
+    if not first and not seen_iend:
+        return "PNG 缺少 IEND（文件被截断，不是完整 PNG）"
+    if not idat:
+        return "PNG 没有 IDAT（没有像素数据，不是可显示的图）"
+    if offset != total:
+        return "PNG 的 IEND 之后还有 %d 字节多余数据" % (total - offset,)
     try:
-        with open(str(path), "rb") as handle:
-            head = handle.read(24)
+        engine = zlib.decompressobj()
+        raw = engine.decompress(bytes(idat), _PNG_MAX_RAW + 1)
+        if engine.unconsumed_tail:
+            return "PNG 像素数据超过 %d MB，拒绝继续校验" % (_PNG_MAX_RAW // 1024 // 1024,)
+        if not engine.eof:
+            return "PNG 像素数据流不完整（zlib 流没有结束标记，文件被截断）"
+        raw += engine.flush()
+    except zlib.error as exc:
+        return "PNG 的像素数据解压失败（%s）——文件不完整或已损坏" % (exc,)
+    if expected is not None and len(raw) != expected:
+        return "PNG 像素数据长度 %d 与 IHDR 声明不符（应为 %d）" % (len(raw), expected)
+    return None
+
+
+def png_size(path: Path) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
+    """读 PNG 取宽高，并校验结构完整性（不依赖 Pillow）。返回 ((w,h), 错误说明)。"""
+    target = Path(path)
+    try:
+        data = target.read_bytes()
     except OSError as exc:
-        return None, "读不了 %s：%s" % (path, exc)
-    if len(head) < 24 or head[:8] != _PNG_SIGNATURE:
+        return None, "读不了 %s：%s" % (target, exc)
+    if len(data) < 33 or data[:8] != _PNG_SIGNATURE:
         return None, "不是 PNG 文件"
-    if head[12:16] != b"IHDR":
+    if data[12:16] != b"IHDR":
         return None, "PNG 头缺少 IHDR"
-    width = int.from_bytes(head[16:20], "big")
-    height = int.from_bytes(head[20:24], "big")
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
     if width <= 0 or height <= 0:
         return None, "PNG 宽高不合法"
+    problem = _png_problems(data)
+    if problem:
+        return None, problem
     return (width, height), None
 
 
@@ -427,8 +526,15 @@ def build_package(
     captions = timing.get("captions") if isinstance(timing, dict) else None
     captions_bottom = captions.get("bottom") if isinstance(captions, dict) else None
 
-    def numeric(value: Any) -> Optional[float]:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+    invalid_numeric: List[str] = []
+
+    def numeric(value: Any, field: str) -> Optional[float]:
+        """只接受有限 JSON 数字；字符串 / bool / NaN / Infinity 记进 invalid_numeric。"""
+        if value is None:
+            return None
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))):
+            invalid_numeric.append(field)
             return None
         return float(value)
 
@@ -461,9 +567,9 @@ def build_package(
         "generated_at": now_iso(),
         "timing_error": timing_err,
         "video": video_info,
-        "duration_s": numeric(duration),
-        "width": numeric(width),
-        "height": numeric(height),
+        "duration_s": numeric(duration, "duration"),
+        "width": numeric(width, "width"),
+        "height": numeric(height, "height"),
         "aspect": (timing.get("aspect") if isinstance(timing, dict) else None),
         "covers": cover_rows,
         "cover_max_candidates": COVER_MAX_CANDIDATES,
@@ -481,7 +587,8 @@ def build_package(
         "hashtags": resolved_hashtags,
         "body": resolved_body,
         "platforms_copy": platform_copy,
-        "captions": {"bottom": numeric(captions_bottom)},
+        "captions": {"bottom": numeric(captions_bottom, "captions.bottom")},
+        "invalid_numeric_fields": invalid_numeric,
     }
     return package
 
@@ -551,6 +658,15 @@ def _common_results(package: Dict[str, Any]) -> List[Dict[str, str]]:
     if package.get("timing_error"):
         results.append(_res("ERROR", "项目", "读不到 src/timing.json（%s）"
                             % (package.get("timing_error"),)))
+
+    invalid_numeric = package.get("invalid_numeric_fields") or []
+    if invalid_numeric:
+        # NaN / Infinity 的比较全是 False：不显式拦下就会静默通过所有「≥ / ≤」口径。
+        results.append(_res(
+            "ERROR", "timing 字段",
+            "timing.json 这些字段必须是有限的 JSON 数字（字符串 / null / NaN / Infinity 都不行）：%s"
+            "——NaN/Infinity 会让大小比较全部为假，等于把坏数据静默放行"
+            % ("、".join(sorted(set(invalid_numeric))),)))
 
     video = package.get("video") or {}
     if not video.get("exists"):
@@ -736,6 +852,108 @@ def validate_package(
     return results
 
 
+#: 可选闸门脚本（frame_check / transcript_check）的模块缓存。
+_SIBLING_MODULES: Dict[str, Any] = {}
+
+
+def _load_sibling(filename: str, module_name: str) -> Optional[Any]:
+    """按文件路径加载同级脚本；失败返回 None（可选闸门显式报 ERROR，不静默跳过）。"""
+    if module_name in _SIBLING_MODULES:
+        return _SIBLING_MODULES[module_name]
+    path = Path(__file__).resolve().parent / filename
+    module: Optional[Any] = None
+    if path.is_file():
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, str(path))
+            loaded = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(loaded)  # type: ignore[union-attr]
+            module = loaded
+        except Exception:  # noqa: BLE001 - 加载失败由调用方转成显式 ERROR
+            module = None
+    _SIBLING_MODULES[module_name] = module
+    return module
+
+
+def _problem_rows(item: str, problems: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for problem in problems or ():
+        level = "ERROR" if str(problem.get("level", "")).upper() == "ERROR" else "WARN"
+        rows.append(_res(level, item, str(problem.get("message") or problem)))
+    return rows
+
+
+def _frames_gate_rows(root: Path, frames: Optional[str]) -> List[Dict[str, str]]:
+    """可选闸门：机器验证「代理真的看过画面」（frame_check.py）。
+
+    只有显式传 ``--frames`` 时才启用，默认不跑 —— 旧项目没跑过 ``npm run stills``
+    时不应被这条新闸门拦死（deliver.py check 有自己的自动降级口径）。
+    """
+    frame_check = _load_sibling("frame_check.py", "pf_frame_check")
+    if frame_check is None:
+        return [_res("ERROR", "静帧校验",
+                     "找不到同级 scripts/frame_check.py，无法校验静帧（scripts 目录不完整？）")]
+    target = _resolve(root, frames, "out/stills")
+    if not target.is_dir():
+        return [_res("ERROR", "静帧校验",
+                     "找不到静帧目录 %s（先跑 npm run stills -- --scenes，再逐张看过联系表）"
+                     % (_rel(root, target),))]
+    try:
+        timing_data, _timing_error = read_timing(Path(root))
+        result = frame_check.check_frames(
+            target, timing=timing_data,
+            timing_path=Path(root) / "src" / "timing.json",
+            project_root=Path(root))
+    except Exception as exc:  # noqa: BLE001 - 可选闸门失败要显式 ERROR，不能静默
+        return [_res("ERROR", "静帧校验", "frame_check 执行失败：%s" % (exc,))]
+    rows = _problem_rows("静帧校验", result.get("problems") or [])
+    stats = result.get("stats") or {}
+    if not rows:
+        rows.append(_res(
+            "OK", "静帧校验",
+            "%d 帧 / %d 场景 · 覆盖率 %.0f%% · 最小帧方差 %s（尺寸与 timing 一致）"
+            % (stats.get("frame_count") or 0, stats.get("scene_count") or 0,
+               (stats.get("coverage") or 0.0) * 100.0,
+               ("%.1f" % float(stats["min_frame_variance"]))
+               if stats.get("min_frame_variance") is not None
+               else "n/a（JPEG 未解码像素）")))
+    elif result.get("ok"):
+        rows.append(_res("OK", "静帧校验", "%d 帧通过（有 WARN，见上）"
+                         % (stats.get("frame_count", 0),)))
+    return rows
+
+
+def _transcript_gate_rows(root: Path, transcript: Optional[str]) -> List[Dict[str, str]]:
+    """可选闸门：转写反查（transcript_check.py），只在显式传 ``--transcript`` 时启用。
+
+    这是「零依赖 STT 替代」：用户提供 txt/srt 转写，与 timing.json 的 voice.lines
+    逐句比对；漏行 / 顺序错位 / 字符覆盖率不足 / 品牌名错一个字都 ERROR。
+    """
+    if not transcript:
+        return []
+    transcript_check = _load_sibling("transcript_check.py", "pf_transcript_check")
+    if transcript_check is None:
+        return [_res("ERROR", "转写校验",
+                     "找不到同级 scripts/transcript_check.py，无法做转写反查（scripts 目录不完整？）")]
+    path = _resolve(root, transcript, transcript)
+    try:
+        result = transcript_check.check_transcript(path, project_root=Path(root))
+    except Exception as exc:  # noqa: BLE001 - 可选闸门失败要显式 ERROR
+        return [_res("ERROR", "转写校验", "transcript_check 执行失败：%s" % (exc,))]
+    rows = _problem_rows("转写校验", result.get("problems") or [])
+    stats = result.get("stats") or {}
+    if not rows:
+        rows.append(_res(
+            "OK", "转写校验",
+            "%d 行字幕 / %d 行转写 · 字符覆盖率 %.1f%% · 行覆盖率 %.1f%% · 平均相似度 %.2f"
+            % (stats.get("ref_lines", 0), stats.get("transcript_lines", 0),
+               (result.get("coverage") or 0.0) * 100.0,
+               (result.get("line_coverage") or 0.0) * 100.0,
+               result.get("mean_similarity") or 0.0)))
+    elif result.get("ok"):
+        rows.append(_res("OK", "转写校验", "转写与字幕源一致（有 WARN，见上）"))
+    return rows
+
+
 def _platform_of_item(item: str) -> Optional[str]:
     """按检查项名前缀判断它属于哪个平台（``抖音：标题`` → ``douyin``）。"""
     for platform, rules in PLATFORM_RULES.items():
@@ -900,13 +1118,37 @@ def _write_text_lf(path: Path, text: str) -> None:
         handle.write(text)
 
 
-def _write_png(path: Path, width: int = COVER_WIDTH, height: int = COVER_HEIGHT) -> None:
-    """写一个只有 PNG 头合法的极小文件（够 png_size 读，不做完整图片）。"""
-    header = _PNG_SIGNATURE + (13).to_bytes(4, "big") + b"IHDR"
-    header += int(width).to_bytes(4, "big") + int(height).to_bytes(4, "big")
-    header += b"\x08\x06\x00\x00\x00"
+def _write_png(path: Path, width: int = COVER_WIDTH, height: int = COVER_HEIGHT,
+               color: Tuple[int, int, int] = (0, 0, 0), pattern: bool = False) -> None:
+    """写一张真实可解码的 RGB PNG（纯 stdlib，自测夹具用）。
+
+    以前这里只写 24 字节 PNG 头 + IHDR，够 ``png_size`` 读尺寸，但那正是
+    「截断封面也能过闸门」的 bug 成因。现在写完整 PNG：IHDR + IDAT + IEND，
+    每个 chunk 带 CRC，解压后扫描线字节数与 IHDR 自洽。
+    ``pattern=True`` 时像素有梯度（给静帧空白判定用；默认纯色）。
+    """
+    rows: List[bytes] = []
+    for y in range(int(height)):
+        if pattern:
+            row = bytearray()
+            for x in range(int(width)):
+                row += bytes(((x * 7 + y * 3) % 256, (x * 3 + y * 11) % 256,
+                              (x * 13 + y * 5) % 256))
+            rows.append(b"\x00" + bytes(row))
+        else:
+            rows.append(b"\x00" + bytes(color) * int(width))
+    raw = b"".join(rows)
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (len(payload).to_bytes(4, "big") + kind + payload
+                + (zlib.crc32(kind + payload) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+    ihdr = (int(width).to_bytes(4, "big") + int(height).to_bytes(4, "big")
+            + bytes([8, 2, 0, 0, 0]))
+    data = (_PNG_SIGNATURE + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
     ensure_dir(Path(path).parent)
-    Path(path).write_bytes(header)
+    Path(path).write_bytes(data)
 
 
 def _minimal_mp4() -> bytes:
@@ -963,6 +1205,23 @@ def _selftest() -> int:
         size, err = png_size(bad_png)
         check("png_size 非 PNG 报错", (size is None, err is not None), (True, True))
         check("png_size 缺文件报错", png_size(root / "none.png")[0] is None, True)
+
+        # --- 回归 BUG-P2：只有 PNG 头 / 缺 IEND / CRC 坏的封面必须报错（以前只读 24 字节头）---
+        header_only = root / "header-only.png"
+        header_only.write_bytes(_PNG_SIGNATURE + (13).to_bytes(4, "big") + b"IHDR"
+                                + (1080).to_bytes(4, "big") + (1920).to_bytes(4, "big")
+                                + b"\x08\x02\x00\x00\x00")
+        check("只有 PNG 头的截断封面 → 报错", png_size(header_only)[0] is None, True)
+        truncated_png = root / "truncated.png"
+        truncated_png.write_bytes(good_png.read_bytes()[:-12])
+        size, err = png_size(truncated_png)
+        check("PNG 缺 IEND → 报错", (size is None, err is not None), (True, True))
+        corrupt_bytes = bytearray(good_png.read_bytes())
+        corrupt_bytes[50] ^= 0xFF  # IDAT 数据区，改一个字节让 CRC / 解压失败
+        corrupt_png = root / "corrupt.png"
+        corrupt_png.write_bytes(bytes(corrupt_bytes))
+        size, err = png_size(corrupt_png)
+        check("PNG CRC 坏 → 报错", (size is None, err is not None), (True, True))
 
         # --- 组装一个完整假项目 ---
         project = root / "proj"
@@ -1117,6 +1376,70 @@ def _selftest() -> int:
               all(entry["publishable"] == (entry["errors"] == 0)
                   for entry in strict_manifest["platforms"].values()), True)
 
+        # --- 回归 BUG-P1：NaN / Infinity / 字符串冒充数字 → ERROR（以前会静默通过）---
+        nan_proj = root / "nan_proj"
+        (nan_proj / "src").mkdir(parents=True)
+        for case_name, payload in (
+            ("duration=NaN", {"duration": float("nan")}),
+            ("duration=Infinity", {"duration": float("inf")}),
+            ("width/height=NaN", {"width": float("nan"), "height": float("nan")}),
+            ("duration=字符串", {"duration": "45"}),
+        ):
+            timing_data = {"title": "t", "fps": 60, "width": 1080, "height": 1920,
+                           "duration": 45, "captions": {"bottom": 0.2}}
+            timing_data.update(payload)
+            _write_text_lf(nan_proj / "src" / "timing.json",
+                           json.dumps(timing_data, ensure_ascii=False))
+            nan_rows = validate_package(build_package(nan_proj))
+            check("NaN/Inf/字符串 timing 字段（%s）→ ERROR" % (case_name,),
+                  any(row["level"] == "ERROR" and row["item"] == "timing 字段"
+                      for row in nan_rows), True)
+
+        # --- Phase2 闸门：静帧校验（frame_check.py 接入，显式 --frames 才启用）---
+        frames_proj = root / "frames_proj"
+        (frames_proj / "src").mkdir(parents=True)
+        (frames_proj / "out" / "stills").mkdir(parents=True)
+        _write_text_lf(frames_proj / "src" / "timing.json", json.dumps({
+            "title": "f", "fps": 30, "width": 60, "height": 90, "duration": 6,
+            "scenes": [{"name": "hook", "start": 0, "end": 3},
+                       {"name": "cta", "start": 3, "end": 6}],
+        }, ensure_ascii=False))
+        _write_png(frames_proj / "out" / "stills" / "0001.00.png", 60, 90, pattern=True)
+        _write_png(frames_proj / "out" / "stills" / "0004.00.png", 60, 90, pattern=True)
+        frame_rows = _frames_gate_rows(frames_proj, "out/stills")
+        check("静帧闸门：正常 2 帧 → 0 ERROR",
+              [row for row in frame_rows if row["level"] == "ERROR"], [])
+        _write_png(frames_proj / "out" / "stills" / "0002.50.png", 60, 90)
+        check("静帧闸门：空白帧 → ERROR",
+              any(row["level"] == "ERROR" for row in _frames_gate_rows(frames_proj, "out/stills")),
+              True)
+        check("静帧闸门：目录缺失 → ERROR",
+              any(row["level"] == "ERROR"
+                  for row in _frames_gate_rows(frames_proj, "out/nope")), True)
+
+        # --- Phase2 闸门：转写反查（transcript_check.py 接入，只有 --transcript 才启用）---
+        transcript_proj = root / "transcript_proj"
+        (transcript_proj / "src").mkdir(parents=True)
+        _write_text_lf(transcript_proj / "src" / "timing.json", json.dumps({
+            "brand": {"name": "青柚记账", "url": "qingyou.app"},
+            "voice": {"lines": [
+                {"id": "01", "at": 0.5, "text": "每天记账要花十分钟"},
+                {"id": "02", "at": 4.0, "text": "打开青柚记账就有答案"},
+            ]},
+        }, ensure_ascii=False))
+        _write_text_lf(transcript_proj / "good.txt",
+                       "每天记账要花十分钟\n打开青柚记账就有答案\n")
+        _write_text_lf(transcript_proj / "brand-typo.txt",
+                       "每天记账要花十分钟\n打开青柚记帐就有答案\n")
+        check("转写闸门：未传 transcript 不启用",
+              _transcript_gate_rows(transcript_proj, None), [])
+        check("转写闸门：逐字一致 → 0 ERROR",
+              [row for row in _transcript_gate_rows(transcript_proj, "good.txt")
+               if row["level"] == "ERROR"], [])
+        check("转写闸门：品牌名错一个字 → ERROR",
+              any(row["level"] == "ERROR"
+                  for row in _transcript_gate_rows(transcript_proj, "brand-typo.txt")), True)
+
         # --- 未知平台 → ERROR ---
         check("未知平台 → ERROR",
               validate_package(package, platforms=["weibo"])[0]["level"], "ERROR")
@@ -1126,8 +1449,9 @@ def _selftest() -> int:
             sys.stderr.write("ERROR: selftest — %s\n" % (message,))
         sys.stderr.write("ERROR: selftest — %d 项失败\n" % (len(failures),))
         return 1
-    print("OK: selftest — 话题归一化 / PNG 头解析 / MP4 容器结构（含文本假成片拦截） / "
-          "导出包完整性 / 四平台标题·话题·正文·时长·封面 / 安全区 / "
+    print("OK: selftest — 话题归一化 / PNG 完整解码（截断·CRC·IHDR 拦截） / "
+          "MP4 容器结构（含文本假成片拦截） / 导出包完整性 / 四平台标题·话题·正文·时长·封面 / "
+          "安全区 / NaN·Infinity·字符串 timing 字段拦截 / 静帧闸门 / 转写反查闸门 / "
           "--strict manifest 自洽 / manifest 写盘 全部通过")
     return 0
 
@@ -1168,6 +1492,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title", default=None, help="覆盖标题（默认取 copy.json / timing.json）")
     parser.add_argument("--hashtags", default=None, help="话题，逗号或空格分隔（默认取 copy.json）")
     parser.add_argument("--body", default=None, help="正文（默认取 copy.json）")
+    parser.add_argument("--frames", default=None,
+                        help="静帧目录：显式传入才启用 frame_check.py 静帧闸门（默认不查），例如 out/stills")
+    parser.add_argument("--transcript", default=None,
+                        help="转写文件（txt / srt）：显式传入才启用 transcript_check.py 配音字幕反查（默认不查）")
     parser.add_argument("--platform", default="all",
                         choices=(*PLATFORM_ORDER, "all"),
                         help="只查一个平台，默认 all（四平台全查）")
@@ -1208,6 +1536,11 @@ def main(argv=None) -> int:
         package["video"]["probe"] = probe_video(video_path)
     platforms = list(PLATFORM_ORDER) if args.platform == "all" else [args.platform]
     results = validate_package(package, platforms=platforms)
+    # Phase2 可选闸门：默认不启用（旧项目没有静帧 / 转写也不该被拦），显式传参才跑。
+    if args.frames:
+        results.extend(_frames_gate_rows(root, args.frames))
+    if args.transcript:
+        results.extend(_transcript_gate_rows(root, args.transcript))
     if args.strict:
         # P2：先把 WARN 升级成 ERROR，再让 manifest 与退出码共用这份最终结果。
         results = _apply_strict(results)

@@ -4,6 +4,56 @@
 
 ## [Unreleased]
 
+## [2026-10-22] 第 9 轮：证据闸门（真的看过画面 / 配音字幕对得上）+ 闸门漏洞修复
+
+本轮先把「代理看过画面」和「配音与字幕对得上」从口头承诺变成可跑的机器证据，再回头修独立审计发现的
+「坏输入静默通过闸门」缺陷。两个新脚本都是纯标准库、确定性、Windows 安全，带自测并进 CI。
+
+### Added
+
+- **静帧证据闸门 `template/scripts/frame_check.py`**：逐帧完整解码 PNG（自实现 zlib 解压 + filter 0–4 反滤波，不依赖
+  Pillow）、量化亮度方差判空白帧、像素尺寸==timing 分辨率（`--scale` 可缩放）、按文件名时间戳（`stills.mjs` 的
+  `%06.2f` 命名）与 `timing.scenes` 核对每场景帧覆盖；JPEG 只解析头与段结构（明示不做像素解码，空白判定降级 WARN）。
+  人读表 + `--json {ok, frames, problems}`，有 ERROR 退出码 1；`--selftest` 58 项断言（正常/空白/截断/CRC 坏/错尺寸/
+  缺场景覆盖/坏 timing/`--no-timing`/`--scale`）。实测 ffmpeg 7.1 合成 3 帧：正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 判 ERROR。
+- **转写反查闸门 `template/scripts/transcript_check.py`**：零依赖 STT 替代（对标 MoneyPrinterTurbo 的 STT 反查思路，
+  差异化是用户提供转写 + 纯 stdlib difflib + 可离线 + CI 可跑）。txt 逐行 / SRT 自动识别，与 `voice.lines`
+  （或 `--ref srt`）保序对齐；漏念 / 低相似度 / 覆盖率不足 / 顺序错位 / 品牌名与网址错字 = ERROR，多余转写行 = WARN；
+  `--threshold`（默认 0.85）、`--min-coverage`（默认 1.0）可配。`--selftest` 41 项断言。
+  实测：模板 5 句逐字转写 100% / 相似度全 1.00 / 0 ERROR；只念一句的转写 6 ERROR、字符覆盖率 2.94%。
+- **闸门接入**：`deliver.py check` 默认验证 `out/stills`（没有目录只 WARN；`--no-frames` 可跳过），
+  `publish_check.py --frames <dir>` / `--transcript <file>` 显式传入才并入发布检查单（不破坏既有产物）；
+  CI 两个脚本单独跑 `--selftest`。
+- 文档：README 差异化表补「证据」行、脚本表与 FAQ 补两项闸门及实测数字；AGENTS.md 第 6/7 节；
+  `references/校验清单.md`；SKILL.md 铁律 3；`selftest.py` 覆盖 12 个脚本（15/15 项）；MCP 集成测试 44 项。
+
+### Fixed
+
+- **`publish_check.py` 的 NaN / Infinity / 字符串 timing 字段静默通过**：`numeric()` 加 `math.isfinite` 并把坏字段
+  报 ERROR——之前 `duration: NaN` 让 `3≤d≤900` 全为假、`width/height: NaN` 让 `width>=height` 为假、
+  `captions.bottom: NaN` 让 `≥0.18` 为假，三项都打印 OK 并判定可发布。
+- **`publish_check.py` 封面 PNG 只验 24 字节头**：截断/CRC 坏的封面能通过；现完整走 chunk 链、逐 chunk CRC、
+  IDAT 解压长度必须等于 IHDR 推导值。
+- **`check_assets.py` 放行空/非字符串旁白**：`voice.lines[].text=""` / `123` / 全空白以前 0 ERROR（该字段是 tts、
+  字幕、混音的唯一来源），现要求非空字符串。
+- **`check_assets.py` 不校验 `brand` 结构**：TS 侧无条件读 `TIMING.brand.colors` / `brand.logo` / `name` / `url`，
+  缺整块会在渲染期 `Cannot read properties of undefined`；现校验 brand、name/url/logo、colors(bg,fg,accent)（logo 允许空串）。
+- **路径穿越**：`voice.lines[].id`（文件名 / tts 缓存键）、`music.file`（mix.py 会写入 `public/<file>` 并自动建父目录）、
+  `brand.logo`、`fonts.json` 的 `roles.*.file` 现在拒绝绝对路径、盘符与 `..` 越界；id 还拒绝 Windows 保留名与首尾点/空格。
+- **MCP 工具参数注入**：`check_video` 的 `video="--selftest"`、`music_analyze` 的 `audio="--help"` 会被 argparse 当成开关，
+  「什么都没查」却返回 `isError=false`；现路径类位置参数拒绝以 `-` 开头并加 `--` 分隔。
+- **MCP `check_video.expect` schema 与实现不符**：schema 声明 number「期望时长秒数」，`--expect` 实际是 WxH 分辨率；
+  现 schema 改 string + pattern，传数字/非法值返回 -32602。
+- **MCP 协议**：通知（无 id）带非对象 params 时不再返回错误响应；深嵌套 JSON 的 `RecursionError` 不再打死服务（返回 -32700）。
+
+### 升级须知（已有项目）
+
+- 新脚本不是硬依赖：`deliver.py check` 没有 `out/stills` 只 WARN，`publish_check.py` 不传 `--frames`/`--transcript`
+  时行为和以前一致；想显式跳过静帧检查用 `deliver.py check --no-frames`。
+- 自建 `timing.json`（不是从模板复制的）若缺 `brand` 结构，`check_assets.py` 现在会报 ERROR——模板自带的 `brand` 完整
+  （`logo` 允许空字符串）。
+- `publish_check.py` 现在会拦 `NaN` / `Infinity` / 字符串形式的 `duration`、`width`、`height`、`captions.bottom`。
+
 ## [2026-10-22] 修复轮（task-9）：按独立验证报告修 6 major + 5 minor
 
 独立验证对融合改动做了复现核对（报告在工作区 `similar-projects/verification-report.md`），

@@ -200,6 +200,100 @@ def _load_publish_check() -> Any:
     return _PC or None
 
 
+# ---------------------------------------------------------------------------
+# 复用 scripts/frame_check.py（「代理真的看过画面」的机器可验证闸门）
+# ---------------------------------------------------------------------------
+_FC: Any = None
+
+
+def _load_frame_check() -> Any:
+    """按文件路径加载同级 frame_check.py；失败返回 None（只影响静帧这一项）。"""
+    global _FC
+    if _FC is None:
+        path = Path(__file__).resolve().parent / "frame_check.py"
+        if not path.is_file():
+            _FC = False
+        else:
+            try:
+                spec = importlib.util.spec_from_file_location("pf_frame_check", path)
+                module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                spec.loader.exec_module(module)  # type: ignore[union-attr]
+                _FC = module
+            except Exception:  # noqa: BLE001 - 静帧校验失败不该让交付预检挂掉
+                _FC = False
+    return _FC or None
+
+
+def _check_frames_qa() -> Check:
+    """静帧证据闸门：帧数覆盖每个场景 / 文件真能解码 / 尺寸==timing / 不是空白帧。
+
+    对应 AGENTS.md 阶段 9「联系表必须逐张看过」：人眼看图没法自动化，但
+    「看了几张、每张是不是真的、有没有覆盖每个场景」可以机器验证。没有
+    ``out/stills`` 只 WARN（老项目可能只渲成片）；有目录但帧坏了是 ERROR。
+    """
+    stills = PROJECT_ROOT / "out" / "stills"
+    name = "静帧校验（真的看过画面）"
+    rule = "每场景≥1帧 · 像素尺寸==timing · PNG 解码方差≥阈值 · 时间戳覆盖场景"
+    if not stills.is_dir():
+        return Check(
+            name=name,
+            value="没有 out/stills 目录",
+            rule=rule,
+            level="WARN",
+            conf="project",
+            advice="先渲静帧再拼联系表逐张看：npm run stills -- --scenes && "
+                   "python scripts/media.py sheet out/stills --cols 4",
+        )
+    module = _load_frame_check()
+    if module is None:
+        return Check(
+            name=name,
+            value="没找到 scripts/frame_check.py",
+            rule=rule,
+            level="WARN",
+            conf="project",
+            advice="从模板同步 frame_check.py（python scripts/sync_template.py compare）",
+        )
+    timing_path = PROJECT_ROOT / "src" / "timing.json"
+    try:
+        timing = load_timing() if timing_path.is_file() else None
+        result = module.check_frames(
+            stills, timing=timing, timing_path=timing_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as exc:  # noqa: BLE001 - 检查器自身报错也必须显式失败，不能静默
+        return Check(
+            name=name,
+            value="frame_check 运行失败：%s" % exc,
+            rule=rule,
+            level="ERROR",
+            conf="project",
+            advice="单独跑 `python scripts/frame_check.py --project .` 看完整报错",
+        )
+    stats = result.get("stats") or {}
+    errors = int(stats.get("errors") or 0)
+    warns = int(stats.get("warnings") or 0)
+    observed = stats.get("min_frame_variance")
+    value = ("%d 帧 / %d 场景 · 覆盖 %d%% · 最小帧方差 %s"
+             % (int(stats.get("frame_count") or 0),
+                int(stats.get("scene_count") or 0),
+                round(float(stats.get("coverage") or 0.0) * 100),
+                ("%.1f" % float(observed)) if observed is not None
+                else "n/a（JPEG 未解码像素，只按结构校验）"))
+    problems = result.get("problems") or []
+    if errors:
+        advice = "；".join(
+            "[%s] %s" % (p.get("level", "?"), p.get("message", "")) for p in problems[:3])
+        return Check(name=name, value=value, rule=rule, level="ERROR",
+                     conf="project", advice=advice)
+    if warns:
+        advice = "；".join(
+            "[%s] %s" % (p.get("level", "?"), p.get("message", "")) for p in problems[:3])
+        return Check(name=name, value=value, rule=rule, level="WARN",
+                     conf="project", advice=advice)
+    return Check(name=name, value=value, rule=rule, level="OK", conf="project")
+
+
 def _write_publish_manifest(video_path: Path) -> Optional[Path]:
     """交付预检 0 ERROR 后生成 publish/manifest.json：四平台发布前检查单。
 
@@ -213,7 +307,12 @@ def _write_publish_manifest(video_path: Path) -> Optional[Path]:
         return None
     try:
         package = publish_check.build_package(PROJECT_ROOT, video=rel(video_path))
-        results = publish_check.validate_package(package)
+        results = list(publish_check.validate_package(package))
+        # 融合项（第 2 批）：out/stills 存在时把「静帧证据」并入清单，让
+        # publish/manifest.json 与 `publish_check.py --frames out/stills` 同源。
+        stills_dir = PROJECT_ROOT / "out" / "stills"
+        if stills_dir.is_dir():
+            results.extend(publish_check._frames_gate_rows(PROJECT_ROOT, "out/stills"))
         manifest = publish_check.build_manifest(package, results)
         target = publish_check.write_manifest(PROJECT_ROOT, manifest)
     except Exception as exc:  # noqa: BLE001 - 辅助清单失败不阻断交付
@@ -1298,6 +1397,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     # 全局检查：与平台无关、只和「这支文件是不是一支能交付的成片」有关。
     # 平台检查各自计数，最后和全局一起汇总（0 ERROR 才算过）。
     global_checks = [_check_rotation(m, timing), _check_decodable(m, decode_detail)]
+    if not getattr(args, "no_frames", False):
+        # 第 2 批融合：静帧证据闸门（out/stills 存在则硬校验，缺失只 WARN）。
+        global_checks.append(_check_frames_qa())
     log("")
     log("-" * 78)
     log("全局检查（所有平台共用，先于平台口径）")
@@ -2582,6 +2684,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"响度下限 LUFS，默认 {DEFAULT_LUFS_MIN:g}（与 check_video.py 一致）")
     c.add_argument("--lufs-max", type=float, default=DEFAULT_LUFS_MAX,
                    help=f"响度上限 LUFS，默认 {DEFAULT_LUFS_MAX:g}")
+    c.add_argument("--no-frames", action="store_true",
+                   help="跳过静帧证据闸门（默认会校验 out/stills：帧数覆盖场景 / 解码 / "
+                        "尺寸==timing / 非空白；目录不存在只 WARN）")
     c.set_defaults(func=cmd_check)
 
     v = sub.add_parser(

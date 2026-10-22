@@ -11,8 +11,9 @@
 折行、版本解析、缓存键、平台表 & conf 档位、字幕字号补偿 / ASS 转义、同步分类与 --diff 只读……
 不读素材、不跑 ffmpeg、不联网、不需要 node，因此可以放心放进 CI 的 Python 矩阵里。
 
-每个脚本自己的 ``--selftest`` 是唯一事实来源（当前 10 个：check_assets / check_video /
-audit / publish_check / mix / subtitles / doctor / deliver / sync_template / media）；
+每个脚本自己的 ``--selftest`` 是唯一事实来源（当前 12 个：check_assets / check_video /
+audit / publish_check / frame_check / transcript_check / mix / subtitles / doctor /
+deliver / sync_template / media）；
 本文件只负责逐个跑、汇总、把失败原样带出来（有失败就非零退出）。另外三道静态兜底：
 Python 3.9 真写盘 smoke、脚本源码 AST 扫描（scripts/ 与 service/，拒绝 3.10+ 写盘参数）、
 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 ``-Encoding utf8`` 会写 BOM，
@@ -42,11 +43,17 @@ SERVICE_DIR = SCRIPTS_DIR.parent.parent / "service"
 #: media.py 的 --selftest 覆盖 CMYK 等「浏览器不认的色彩模式」转 sRGB（R7-PY-09：
 #: prepare 以前会把 CMYK JPEG 原样复制进 public/，页面端颜色错误）+ 正常 RGB 仍原样复制
 #: （11 条断言；prepare 用例需要 Pillow，缺了自动跳过）。
+#: frame_check.py（第 2 批融合）的 --selftest 覆盖 PNG 完整解码 / 截断·CRC 坏图 /
+#: 空白帧方差 / 帧时间戳覆盖率 / 场景覆盖 / JPEG 结构（58 条断言，纯 stdlib 自造 PNG）。
+#: transcript_check.py（第 2 批融合）的 --selftest 覆盖归一化 / difflib 对齐 /
+#: 漏行·错序·低相似度 / 品牌名逐字校验 / SRT 解析（41 条断言，零依赖）。
 TARGETS = (
     "check_assets.py",
     "check_video.py",
     "audit.py",
     "publish_check.py",
+    "frame_check.py",
+    "transcript_check.py",
     "mix.py",
     "subtitles.py",
     "doctor.py",

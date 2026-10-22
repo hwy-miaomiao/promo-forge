@@ -33,6 +33,14 @@ jobs:
       - name: 脚本纯函数自测（不渲染、不需要 ffmpeg）
         run: python template/scripts/selftest.py
 
+      # 第 2 批融合的两个「证据闸门」单独跑一遍：CI 日志里能直接看到它们自己的
+      # 自测结论（selftest.py 也会跑，这里不渲染、不联网、纯 stdlib）。
+      - name: 静帧证据闸门自测（frame_check：PNG 解码 / 空白帧 / 帧覆盖率）
+        run: python template/scripts/frame_check.py --selftest
+
+      - name: 转写反查闸门自测（transcript_check：零依赖，不调 STT）
+        run: python template/scripts/transcript_check.py --selftest
+
       - name: MCP 服务化入口集成测试（子进程走 JSON-RPC，不联网）
         run: python service/test_mcp_integration.py
 

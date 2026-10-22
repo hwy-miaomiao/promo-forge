@@ -31,6 +31,7 @@ promo-forge 把这件事拆成两半：
 | 配乐 | 靠感觉挑一首 | 本地分析 BPM / beat / bar / downbeat / 逐小节能量，**卡点靠算不靠猜** |
 | 画面 | AI 生成图凑 | **真实界面 2 倍图截图**（1080 宽画布需要 2160 像素），AI 图只做包装 |
 | 质量 | 渲完就交 | 渲染前后各有**自动闸门**（缺文件、规格、响度、空档、渲染日志报错）+ 逐场景抽帧审图 |
+| 证据 | 「渲染成功」就当看过 | **静帧证据闸门**：逐帧解码 PNG、量化空白（亮度方差）、像素尺寸==timing、帧时间戳覆盖每个场景；**转写反查闸门**：用户提供的转写逐行对齐字幕，漏念 / 错序 / 品牌名错字按阈值报 ERROR |
 | 判断 | "感觉节奏太快/太慢" | 全部量化：快切 ≥0.5 秒、网址 ≥2.5 秒、人声高于音乐 ≥6 dB、母带 -14 LUFS |
 | 交付 | 渲完就交 / 自动发布 | **发布合规检查单**（四平台标题/话题/正文/封面/安全区）+ 决策成本账本；只检查、**绝不自动发布** |
 
@@ -108,7 +109,7 @@ promo-forge/
 ├── references/      # 八份方法论：需求问询 / 风格方向 / 素材与截图 / 配乐与卡点 / 配音与字幕 / 校验清单 / 踩坑记录 / 案例复盘
 ├── template/        # 复制到项目里的 Remotion 工程模板
 │   ├── src/         #   timing.json（唯一事实来源）+ Root/Promo + 组件 + 场景
-│   ├── scripts/     #   doctor / capture / media / music / tts / mix / subtitles / fonts / deliver / audit / publish_check / check_assets / check_video / stills / sync_template
+│   ├── scripts/     #   doctor / capture / media / music / tts / mix / subtitles / fonts / deliver / audit / publish_check / frame_check / transcript_check / check_assets / check_video / stills / sync_template
 │   ├── web/         #   基于 @remotion/player 的网页播放版
 │   └── public/      #   素材与音频（截图、混音结果）
 ├── service/         # 可选的 MCP 服务化入口（零依赖 stdio server，把校验闸门暴露给外部编排器）
@@ -133,8 +134,10 @@ promo-forge/
 | `scripts/check_assets.py` | 渲染前闸门：引用文件、图片尺寸、字体缺字、旁白窗口、`voice.lines` / `music.segments` 结构 |
 | `scripts/check_video.py` | 成片闸门：规格、音轨（含是否覆盖全片）、响度、空档、渲染日志（编码 / 超时语义）+ 逐场景抽帧联系表 + 决策账本 |
 | `scripts/audit.py` | 决策与成本账本：需求确认必填、付费服务逐项记账（含服务名）、默认 0 元预算（零付费）；超预算 / 缺记录 / 花钱未写服务名由闸门报 ERROR，存量项目缺账本只 WARN |
-| `scripts/publish_check.py` | 四平台发布合规检查单：标题 / 话题 / 正文 / 时长 / 封面 / 字幕安全区 + 成片 MP4 容器校验（文本假视频直接 ERROR），输出 `publish/manifest.json`；只检查不发布 |
-| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：10 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查，共 13 项） |
+| `scripts/publish_check.py` | 四平台发布合规检查单：标题 / 话题 / 正文 / 时长 / 封面 / 字幕安全区 + 成片 MP4 容器校验（文本假视频直接 ERROR），输出 `publish/manifest.json`；只检查不发布。可选 `--frames <dir>` 把静帧证据并入检查单、`--transcript <file>` 把转写反查并入检查单 |
+| `scripts/frame_check.py` | 静帧证据闸门（「代理真的看过画面」的机器可验证版）：完整解码 PNG（纯 stdlib zlib，不需要 Pillow）、量化空白帧（亮度方差）、像素尺寸==timing、帧时间戳覆盖每个场景；`--json` 输出 `{ok, frames, problems}` 供编排器消费，有 ERROR 非零退出 |
+| `scripts/transcript_check.py` | 转写反查闸门（零依赖 STT 替代）：读用户提供的 txt 逐行或 SRT 转写，与 `timing.json` 的 `voice.lines`（或已生成 SRT）保序对齐，报漏念 / 多念 / 顺序错位 / 低相似度 / 品牌名或网址错字；`--min-coverage` / `--threshold` 可配，默认任一语音行漏配即 ERROR |
+| `scripts/selftest.py` | 脚本纯函数自测总入口（CI 同款：12 个脚本的 `--selftest` + Python 3.9 写盘/API/BOM 兼容检查，共 15 项） |
 | `scripts/stills.mjs` | 按秒或按场景抽帧（Remotion renderStill） |
 | `scripts/sync_template.py` | 用新版模板更新已有项目（`--diff` / `--apply`；`--force` 连「本地比模板新」的文件也覆盖；`--help` 会列出同步范围与「未纳入比对」清单） |
 
@@ -145,16 +148,16 @@ promo-forge/
 脚本里那些容易写错的纯函数逻辑（注释剥离、渲染日志强信号、时间/响度解析、字幕折行、版本解析等）有一组自测，不依赖素材、不需要 ffmpeg、不联网，一条命令全跑：
 
 ```bash
-python template/scripts/selftest.py    # 10 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 13 项）；全过退出码 0
+python template/scripts/selftest.py    # 12 个脚本的 --selftest + 3 项 Python 3.9 / 编码兼容检查（共 15 项）；全过退出码 0
 ```
 
-每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`audit.py`、`publish_check.py`、`mix.py`、`subtitles.py`、`doctor.py`、`deliver.py`、`sync_template.py`、`media.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
+每个脚本也能单独跑：`check_assets.py`、`check_video.py`、`audit.py`、`publish_check.py`、`frame_check.py`、`transcript_check.py`、`mix.py`、`subtitles.py`、`doctor.py`、`deliver.py`、`sync_template.py`、`media.py` 都支持 `--selftest`（例如 `python scripts/deliver.py --selftest`）。失败会打印 `ERROR: selftest — ...` 并以非零退出。
 
-除 10 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描 `template/scripts` 与 `service/`、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
+除 12 个脚本自测外，`selftest.py` 还会做三项 Python 3.9 / 编码兼容检查：① 真的导一次 `subtitles` 并写出一个 SRT（覆盖 `_write_srt` 写盘路径）；② 用 AST 扫描 `template/scripts` 与 `service/`、拒绝 `Path.write_text(..., newline=...)` 这类 3.10+ 参数（3.9 会抛 `TypeError`）；③ 源码 AST 扫描容忍 UTF-8 BOM（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM，合法脚本不能被误判红）。它们必须由 CI 的 3.9 格真正跑过才算数。
 
 CI（`.github/workflows/ci.yml`）只做确定性检查，**不渲染、不跑 ffmpeg、不下载素材**：
 
-- Python 3.9 / 3.12 矩阵：`compileall`（`template/scripts` + `service/`）+ `selftest.py` + MCP 服务集成测试 + 行尾必须 LF；
+- Python 3.9 / 3.12 矩阵：`compileall`（`template/scripts` + `service/`）+ `selftest.py` + 两个证据闸门单独 `--selftest`（`frame_check.py` 用自造 PNG 判「正常/空白/截断/CRC 坏」四类夹具，58 项断言；`transcript_check.py` 用构造转写判「一致/漏行/错序/品牌错字」，41 项断言，都不渲染、不联网）+ MCP 服务集成测试（44 项）+ 行尾必须 LF；
 - Node 22：`npm install` + `tsc --noEmit`（只做类型检查）。
 
 渲染、成片规格、响度、抽帧审图这些重活仍在本地按 AGENTS.md 第 7 节的闸门跑。
@@ -216,6 +219,10 @@ python service/test_mcp_integration.py   # 零依赖集成测试（起子进程�
 没有则显式 WARN），输出 `publish/manifest.json` 并给每平台 `publishable` 结论；0 ERROR 才投，
 `--strict` 把 WARN 也当 ERROR（manifest 与退出码用同一份结果）。`deliver.py check` 0 ERROR 时也会自动生成这份检查单。
 它**只检查、不登录、不自动发布**。被外部编排器调用时用 `service/mcp_server.py`（见上文「服务化入口」）。
+
+**AI 说「我看过画面了」，怎么证明？** 让它跑 `python scripts/frame_check.py --project .`（默认读 `out/stills`）：它逐帧解码 PNG（纯 stdlib `zlib`，不依赖 Pillow）、量亮度方差判空白、核对像素尺寸==timing、再按文件名时间戳核对每个场景是否都有帧；`--json` 输出 `{ok, frames, problems}` 给编排器，有 ERROR 非零退出。本机实测：ffmpeg 7.1 合成的 3 帧 540×960 测试图，正常帧亮度方差 4227.5 / 2107.1，纯白帧 0.0 被判 ERROR；`--selftest` 58 项断言在 Python 3.12 与 3.9 下都过。`deliver.py check` 默认接这项（没有 `out/stills` 只 WARN），`publish_check.py --frames out/stills` 可把证据并入发布检查单。
+
+**配音真的和字幕对得上吗？** 把逐句转写（txt 每行一句，或 SRT）交给 `python scripts/transcript_check.py transcript.txt --project .`：它把转写与 `timing.json` 的 `voice.lines` 逐行对齐，默认**任一语音行没对上就是 ERROR**，覆盖率阈值 `--min-coverage`、相似度阈值 `--threshold` 可调；品牌名/网址要求逐字一致（错一个字就失败，对标 STT 反查的做法）。本机实测：模板 5 句旁白逐字转写 → 5 行相似度全 1.00、字符覆盖率 100%、0 ERROR；只念其中一句的转写 → 6 ERROR、覆盖率 2.94%。它不下载模型、不调付费 ASR，零依赖、可离线，所以 CI 里就能跑。
 
 ## 参与贡献
 
