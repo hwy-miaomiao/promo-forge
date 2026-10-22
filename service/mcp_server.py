@@ -174,6 +174,30 @@ def _require_project_root(arguments: Dict[str, Any]) -> Path:
     return root
 
 
+#: check_video.py 的 ``--expect`` 是**分辨率**（WxH），不是时长；这里和脚本同口径。
+_RESOLUTION_RE = re.compile(r"^\d{3,5}[xX]\d{3,5}$")
+
+#: publish_check.py 的 --platform 合法取值（与脚本 argparse choices 同源）。
+_PLATFORMS = ("douyin", "kuaishou", "xiaohongshu", "shipinhao", "all")
+
+
+def _safe_positional(value: str, label: str) -> str:
+    """位置参数校验（R9-MCP-02）：以 ``-`` 开头会被 argparse 当成开关。
+
+    以前 ``check_video`` 的 video 是 argv[0]：调用方传 ``video="--selftest"``，
+    子进程直接跑自测并 exit 0 —— 什么都没查却返回 ``isError=false``，
+    等于让「坏输入」静默通过闸门。这里显式拒绝开关形态的值。
+    """
+    if "\x00" in value:
+        raise RpcError(-32602, "%s 含 NUL 字节，不是合法路径：%r" % (label, value))
+    if value.lstrip().startswith("-"):
+        raise RpcError(
+            -32602,
+            "%s 不能以 - 开头（会被命令行当成开关，让脚本跑别的东西）：%r" % (label, value),
+        )
+    return value
+
+
 def _tool_result(tool: str, result: Dict[str, Any], structured: Dict[str, Any],
                  is_error: bool) -> Dict[str, Any]:
     payload = {
@@ -202,19 +226,30 @@ def _tool_check_video(arguments: Dict[str, Any]) -> Dict[str, Any]:
     root = _require_project_root(arguments)
     video = arguments.get("video")
     if isinstance(video, str) and video.strip():
-        video_arg = video
+        video_arg = _safe_positional(video, "video")
     else:
         video_arg = "out/final-1080p.mp4"
-    argv = [video_arg]
-    # MCP 场景默认不读 out/render.log：调用方通常只想要规格/响度/抽帧结论，
-    # 传 no_log=false 才复用渲染日志那组强信号检查。
-    if arguments.get("no_log", True):
-        argv.append("--no-log")
-    for key, flag in (("expect", "--expect"), ("lufs_min", "--lufs-min"),
-                      ("lufs_max", "--lufs-max")):
+    # flag 全部放在位置参数之前；video 已做开关形态校验，双保险。
+    argv = ["--no-log"] if arguments.get("no_log", True) else []
+    expect = arguments.get("expect")
+    if expect is not None:
+        if not isinstance(expect, str) or not _RESOLUTION_RE.match(expect.strip()):
+            # R9-MCP-01：以前 schema 把它写成「期望时长秒数(number)」，与 check_video.py
+            # 的 --expect（分辨率 WxH，见 check_video.py 的 WxH 报错文案）完全不符，
+            # 按 schema 传数字必然让工具报错。这里按脚本真实口径做参数校验。
+            raise RpcError(
+                -32602,
+                "expect 必须是分辨率字符串 WxH，例如 1080x1920（check_video.py 的 "
+                "--expect 不接收时长）：%r" % (expect,),
+            )
+        argv += ["--expect", expect.strip()]
+    for key, flag in (("lufs_min", "--lufs-min"), ("lufs_max", "--lufs-max")):
         value = arguments.get(key)
         if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise RpcError(-32602, "%s 必须是数字（LUFS）：%r" % (key, value))
             argv += [flag, str(value)]
+    argv.append(video_arg)
     result = _run_script("check_video.py", argv, project_root=root)
     return _tool_result("check_video", result, {}, result["exitCode"] != 0)
 
@@ -224,7 +259,9 @@ def _tool_music_analyze(arguments: Dict[str, Any]) -> Dict[str, Any]:
     audio = arguments.get("audio")
     if not isinstance(audio, str) or not audio.strip():
         raise RpcError(-32602, "缺少参数 audio（音频文件路径，相对 project_root 或绝对路径）")
-    result = _run_script("music.py", ["analyze", audio], project_root=root)
+    # R9-MCP-02：audio 是 music.py 的位置参数，"--help"/"--selftest" 会被当成开关。
+    audio = _safe_positional(audio, "audio")
+    result = _run_script("music.py", ["analyze", "--", audio], project_root=root)
     return _tool_result("music_analyze", result, {}, result["exitCode"] != 0)
 
 
@@ -232,8 +269,11 @@ def _tool_publish_check(arguments: Dict[str, Any]) -> Dict[str, Any]:
     root = _require_project_root(arguments)
     argv = ["--project", str(root), "--format", "json", "--no-write"]
     for key, flag in (("video", "--video"), ("covers", "--covers"),
-                      ("subtitles", "--subtitles"), ("copy", "--copy"),
-                      ("title", "--title"), ("body", "--body")):
+                      ("subtitles", "--subtitles"), ("copy", "--copy")):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            argv += [flag, _safe_positional(value, key)]
+    for key, flag in (("title", "--title"), ("body", "--body")):
         value = arguments.get(key)
         if isinstance(value, str) and value.strip():
             argv += [flag, value]
@@ -286,7 +326,11 @@ TOOL_SPECS: List[Dict[str, Any]] = [
                 "project_root": {"type": "string", "description": "宣传片项目根目录"},
                 "video": {"type": "string", "description": "成片路径，默认 out/final-1080p.mp4"},
                 "no_log": {"type": "boolean", "description": "不读 out/render.log（默认 true）"},
-                "expect": {"type": "number", "description": "期望时长秒数（可选）"},
+                "expect": {
+                    "type": "string",
+                    "pattern": "^[0-9]{3,5}[xX][0-9]{3,5}$",
+                    "description": "期望分辨率 WxH（check_video.py 的 --expect 口径），例如 1080x1920；不接受时长",
+                },
                 "lufs_min": {"type": "number", "description": "响度下限，默认 -16"},
                 "lufs_max": {"type": "number", "description": "响度上限，默认 -12"},
             },
@@ -416,6 +460,10 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
     if params is None:
         params = {}
     if not isinstance(params, dict):
+        # JSON-RPC：通知（无 id）即使参数坏了也不能回响应，否则客户端会收到一条
+        # 无人认领的 id=null 错误（R9-MCP-03）。
+        if is_notification:
+            return None
         return {
             "jsonrpc": "2.0", "id": msg_id,
             "error": {"code": -32602, "message": "Invalid params：params 必须是对象"},
@@ -469,7 +517,9 @@ def serve(stdin, stdout) -> int:
             continue
         try:
             message = json.loads(line)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # R9-MCP-04：Python 的 json 解析是递归的，`[[[[…` 深嵌套会抛 RecursionError；
+            # 以前只捕获 ValueError，一条请求就能把服务进程打死（stdin 循环直接退出）。
             response: Optional[Dict[str, Any]] = {
                 "jsonrpc": "2.0", "id": None,
                 "error": {"code": -32700, "message": "Parse error: %s" % exc},
@@ -559,6 +609,49 @@ def _selftest() -> int:
     check("带 id initialized → -32601", notif_with_id2["error"]["code"], -32601)
     unknown_notif = handle_message({"jsonrpc": "2.0", "method": "notifications/wat"})
     check("无 id 未知通知仍不响应", unknown_notif, None)
+
+    # R9-MCP-01：check_video 的 expect 是分辨率 WxH，不是时长（schema 以前写反了）
+    expect_spec = TOOLS_BY_NAME["check_video"]["inputSchema"]["properties"]["expect"]
+    check("check_video.expect schema 是 string", expect_spec.get("type"), "string")
+    check("check_video.expect schema 有 WxH pattern",
+          bool(expect_spec.get("pattern")), True)
+    try:
+        _tool_check_video({"project_root": tempfile.gettempdir(), "expect": 45})
+        check("expect=45（时长）抛 RpcError", False, True)
+    except RpcError as exc:
+        check("expect=45 错误码", exc.code, -32602)
+
+    # R9-MCP-02：位置参数以 - 开头会被 argparse 当开关（--selftest 让脚本自测 exit 0）
+    try:
+        _tool_check_video({"project_root": tempfile.gettempdir(),
+                           "video": "--selftest"})
+        check("video='--selftest' 抛 RpcError", False, True)
+    except RpcError as exc:
+        check("video='--selftest' 错误码", exc.code, -32602)
+    try:
+        _tool_music_analyze({"project_root": tempfile.gettempdir(),
+                             "audio": "--help"})
+        check("audio='--help' 抛 RpcError", False, True)
+    except RpcError as exc:
+        check("audio='--help' 错误码", exc.code, -32602)
+    check("_safe_positional 正常路径", _safe_positional("out/x.mp4", "video"),
+          "out/x.mp4")
+
+    # R9-MCP-03：通知（无 id）携带非对象 params 时不得回响应
+    bad_params_notif = handle_message(
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": []})
+    check("通知 + 坏 params 不响应", bad_params_notif, None)
+
+    # R9-MCP-04：深嵌套 JSON 抛 RecursionError，不能打死服务
+    import io as _io
+    deep = "[" * 4000 + "]" * 4000
+    out = _io.StringIO()
+    code = serve(_io.StringIO(deep + "\n"
+                              + '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'), out)
+    replies = [json.loads(line) for line in out.getvalue().splitlines()]
+    check("深嵌套 JSON → -32700 且继续服务",
+          [replies[0]["error"]["code"], replies[1]["id"], code], [-32700, 1, 0])
+
     env = _child_env(Path(tempfile.gettempdir()))
     check("子进程 PROMO_ROOT", env.get("PROMO_ROOT"), str(Path(tempfile.gettempdir())))
     check("子进程 UTF-8", env.get("PYTHONIOENCODING"), "utf-8")
@@ -569,7 +662,9 @@ def _selftest() -> int:
         sys.stderr.write("ERROR: selftest — %d 项失败\n" % len(failures))
         return 1
     print("OK: selftest — 工具 schema / initialize / tools.list / 分发 / "
-          "错误码 / 摘要解析（含决策审计·发布合规）/ 带 id 通知 -32601 / 子进程环境 全部通过")
+          "错误码 / 摘要解析（含决策审计·发布合规）/ 带 id 通知 -32601 / "
+          "expect 为 WxH 分辨率 / 位置参数开关注入拦截 / 通知坏 params 不响应 / "
+          "深嵌套 JSON -32700 / 子进程环境 全部通过")
     return 0
 
 

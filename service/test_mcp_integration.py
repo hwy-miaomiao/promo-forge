@@ -86,14 +86,24 @@ def _write_lf(path: Path, text: str) -> None:
 
 
 def _png_header(path: Path, width: int, height: int) -> None:
-    """写一个只有合法头部的 PNG（publish_check 只读 IHDR，不需要完整像素）。"""
+    """写一张**完整可解码**的 PNG（纯色）。
+
+    publish_check 现在会完整走 PNG chunk 链、逐 chunk 校验 CRC、要求至少一个 IDAT
+    且解压长度与 IHDR 推导一致（R9-P2 修掉「只有 24 字节头也能当封面过闸门」），
+    所以夹具不能再只写 signature+IHDR+IEND，必须是真的能被解码的图。
+    """
     signature = b"\x89PNG\r\n\x1a\n"
-    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-    ihdr = struct.pack(">I", len(ihdr_data)) + b"IHDR" + ihdr_data + \
-        struct.pack(">I", zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF)
-    iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\x00" + bytes((16, 18, 24)) * width  # filter 0 + RGB 纯色
+    raw = row * height
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(signature + ihdr + iend)
+    path.write_bytes(signature + chunk(b"IHDR", ihdr_data)
+                     + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
 def _minimal_mp4() -> bytes:
@@ -295,6 +305,36 @@ def main() -> int:
             check("check_video isError", video["isError"], True)
             check("check_video 有退出码", isinstance(video_payload["exitCode"], int), True)
 
+            # 7b) R9-MCP-01 回归：expect 是分辨率 WxH（以前 schema 写成「时长 number」）
+            expect_schema = [tool for tool in listed
+                             if tool["name"] == "check_video"][0]["inputSchema"]
+            expect_prop = (expect_schema.get("properties") or {}).get("expect") or {}
+            check("check_video.expect schema 类型", expect_prop.get("type"), "string")
+            check("check_video.expect schema pattern", bool(expect_prop.get("pattern")), True)
+            bad_expect = client.request("tools/call", {
+                "name": "check_video",
+                "arguments": {"project_root": str(project), "expect": 45},
+            })
+            check("expect=45（时长）→ -32602",
+                  bad_expect["error"]["code"], -32602)
+            good_expect = client.call_tool("check_video", {
+                "project_root": str(project), "expect": "1080x1920",
+            })
+            check("expect=1080x1920 是合法参数",
+                  isinstance(_tool_payload(good_expect)["exitCode"], int), True)
+
+            # 7c) R9-MCP-02 回归：位置参数以 - 开头不能被当成开关（否则 --selftest
+            #     让脚本自测 exit 0，工具报 isError=false，等于坏输入静默通过闸门）
+            for tool_name, key, flag_value in (
+                    ("check_video", "video", "--selftest"),
+                    ("music_analyze", "audio", "--help")):
+                injected = client.request("tools/call", {
+                    "name": tool_name,
+                    "arguments": {"project_root": str(project), key: flag_value},
+                })
+                check("%s.%s 开关注入 → -32602" % (tool_name, key),
+                      injected["error"]["code"], -32602)
+
             # 8) music_analyze：缺文件应干净失败
             music = client.call_tool("music_analyze",
                                      {"project_root": str(project),
@@ -321,6 +361,19 @@ def main() -> int:
             parse_error = client.recv()
             check("坏 JSON -32700", parse_error["error"]["code"], -32700)
             check("坏 JSON id 为 null", parse_error.get("id"), None)
+
+            # 10b) R9-MCP-03 回归：通知带非对象 params 不得回响应
+            client.send_raw('{"jsonrpc":"2.0","method":"notifications/initialized",'
+                            '"params":[]}')
+            ping_after_notif = client.request("ping", {})
+            check("通知坏 params 不响应", ping_after_notif.get("result"), {})
+
+            # 10c) R9-MCP-04 回归：深嵌套 JSON 抛 RecursionError 不能打死服务
+            client.send_raw("[" * 4000 + "]" * 4000)
+            deep_error = client.recv()
+            check("深嵌套 JSON -32700", deep_error["error"]["code"], -32700)
+            ping_after_deep = client.request("ping", {})
+            check("深嵌套 JSON 后服务仍存活", ping_after_deep.get("result"), {})
         finally:
             try:
                 proc.terminate()
@@ -335,7 +388,8 @@ def main() -> int:
         return 1
     print("OK: MCP 集成测试通过（%d 项：initialize / 通知 / tools.list / "
           "audit_validate / publish_check（含 MP4 容器回归） / check_assets / "
-          "check_video / music_analyze / 错误码 / 带 id 通知 -32601 / 坏 JSON）" % checks)
+          "check_video（expect=WxH、位置参数开关注入拦截） / music_analyze / "
+          "错误码 / 带 id 通知 -32601 / 坏 JSON / 深嵌套 JSON）" % checks)
     return 0
 
 

@@ -318,6 +318,42 @@ def _seconds_value(value):
     return number, None
 
 
+#: 当文件名会出问题的字符：voice.lines[].id 会被拼成 audio-src/vo/<id>.mp3 这类路径，
+#: tts.py / mix.py / subtitles.py 都把它当文件名与缓存键用。
+_PATH_UNSAFE_CHARS = set('/\\:*?"<>|')
+_RESERVED_WIN_NAMES = ({"CON", "PRN", "AUX", "NUL"}
+                       | {"COM%d" % index for index in range(1, 10)}
+                       | {"LPT%d" % index for index in range(1, 10)})
+
+
+def _unsafe_filename_reason(name: str) -> str:
+    """返回 id 不能当文件名的原因；安全时返回空字符串。"""
+    if not name:
+        return "是空字符串"
+    if any(ch in _PATH_UNSAFE_CHARS or ord(ch) < 32 for ch in name):
+        return "含路径分隔符 / 冒号 / 引号 / 通配符 / 控制字符"
+    if name in (".", "..") or name.startswith(".") or name.endswith(".") or name.endswith(" "):
+        return "是 . / .. 或首尾是点 / 空格（写盘时会被系统静默改名或指向别处）"
+    if name.split(".")[0].upper() in _RESERVED_WIN_NAMES:
+        return "是 Windows 保留设备名（CON/PRN/AUX/NUL/COM1.. /LPT1..）"
+    return ""
+
+
+def _public_relative_problem(value: str, label: str) -> str:
+    """返回「必须是 public/ 下的相对路径」被违反的原因；合法时返回空字符串。
+
+    music.file 会被 mix.py 直接拼成 ``PROJECT_ROOT/public/<music.file>`` 写出，
+    brand.logo / fonts.json 的 roles.*.file 会被拼成 ``public/<路径>`` 读取：
+    含 ``..`` 或盘符就能读写到项目目录之外，闸门只查「文件存在」时会被静默放行。
+    """
+    if value.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", value):
+        return f"{label}=\"{value}\" 不能是绝对路径 / 盘符路径：必须是相对 public/ 的路径"
+    if ".." in value.replace("\\", "/").split("/"):
+        return (f"{label}=\"{value}\" 含 .. 段，会解析到 public/ 之外"
+                "（mix.py 会按这个路径写盘，Remotion 侧也拿不到文件）")
+    return ""
+
+
 # ===========================================================================
 # 1. 素材引用（staticFile / assetUrl / src="..."）
 # ===========================================================================
@@ -548,12 +584,16 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
     brand = _sub_dict(timing, "brand", report, item, "{name, url, logo, colors}")
     logo = str(brand.get("logo") or "").strip()
     if logo:
-        candidate = PROJECT_ROOT / "public" / logo.lstrip("/")
-        if not candidate.is_file():
-            problems.append(
-                f"timing.json 的 brand.logo=\"{logo}\" 指向 {_rel(candidate)}，但文件不存在"
-                "（场景里 staticFile(空文件) 会 404；不确定就先在 timing.json 里留空字符串）"
-            )
+        logo_unsafe = _public_relative_problem(logo, "brand.logo")
+        if logo_unsafe:
+            problems.append(logo_unsafe)
+        else:
+            candidate = PROJECT_ROOT / "public" / logo.lstrip("/")
+            if not candidate.is_file():
+                problems.append(
+                    f"timing.json 的 brand.logo=\"{logo}\" 指向 {_rel(candidate)}，但文件不存在"
+                    "（场景里 staticFile(空文件) 会 404；不确定就先在 timing.json 里留空字符串）"
+                )
 
     fonts_path = PROJECT_ROOT / "fonts.json"
     fonts_cfg, err = _read_json_file(fonts_path)
@@ -605,6 +645,10 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
         if not file_value:
             continue
         roles_checked += 1
+        file_unsafe = _public_relative_problem(file_value, f"fonts.json 的 roles.{role}.file")
+        if file_unsafe:
+            problems.append(file_unsafe)
+            continue
         candidate = PROJECT_ROOT / "public" / file_value.lstrip("/")
         if not candidate.is_file():
             problems.append(
@@ -628,6 +672,68 @@ def check_brand_and_font_files(report: Report, timing: dict) -> None:
             "timing.json 未设 brand.logo、fonts.json 未指定本地字体——两者都是可选项，"
             "模板靠系统字体栈出字",
         )
+
+
+#: TS 侧按这组键**无条件**读 brand（template/src/lib/timing.ts 的 ``brand: Brand`` 必填类型；
+#: Promo.tsx 读 brand.colors.bg、Cta.tsx 读 brand.logo.trim()/brand.name/brand.url、
+#: theme.ts 读 brand.colors）。所以它们是契约必填项，不是可选装饰。
+BRAND_STRING_KEYS = ("name", "url", "logo")
+BRAND_COLOR_KEYS = ("bg", "fg", "accent")
+
+
+def check_brand_fields(report: Report, timing: dict) -> None:
+    """brand 结构校验（R9-CA-02）：缺 brand / colors / logo 时闸门绿灯、渲染期 TypeError。"""
+    item = "品牌信息"
+    raw = timing.get("brand")
+    if raw is None:
+        report.fail(
+            item,
+            "timing.json 缺 brand：TS 侧 Timing 类型把 brand 标为必填（src/lib/timing.ts 的 "
+            "brand: Brand），Promo.tsx 读 TIMING.brand.colors.bg、Cta.tsx 读 brand.logo.trim()/"
+            "brand.name/brand.url、lib/theme.ts 读 brand.colors —— 缺了渲染期直接 "
+            "TypeError（Cannot read properties of undefined），而渲染前闸门 0 ERROR。"
+            "补上 {name, url, logo, colors:{bg,fg,accent}}",
+        )
+        return
+    if not isinstance(raw, dict):
+        # 类型错误已由 check_brand_and_font_files 的 _sub_dict 报过，这里不重复刷 ERROR。
+        return
+    problems = []
+    for key in BRAND_STRING_KEYS:
+        value = raw.get(key)
+        if not isinstance(value, str):
+            problems.append(
+                f"brand.{key} 必须是字符串（TS 侧必填；logo 没有就写空字符串），"
+                f"现在是 {type(value).__name__}：{value!r}"
+            )
+        elif key in ("name", "url") and not value.strip():
+            problems.append(
+                f"brand.{key} 不能是空字符串：CTA 场景会把它直接渲染到屏上"
+                "（空值等于 CTA 少一半信息，发布出去就是事故）"
+            )
+    colors = raw.get("colors")
+    if not isinstance(colors, dict):
+        problems.append(
+            "brand.colors 必须是对象（bg / fg / accent 三个颜色值），现在是 %s：%r"
+            " —— src/lib/theme.ts 直接把它当 BrandColors 用"
+            % (type(colors).__name__, colors)
+        )
+    else:
+        bad_colors = []
+        for key in BRAND_COLOR_KEYS:
+            value = colors.get(key)
+            if not isinstance(value, str) or not value.strip():
+                bad_colors.append("%s=%r" % (key, value))
+        if bad_colors:
+            problems.append(
+                "brand.colors 缺少合法颜色值：%s（必须是 CSS 颜色字符串，例如 #0B0B12）"
+                % ("、".join(bad_colors),)
+            )
+    if problems:
+        for text in problems:
+            report.fail(item, text)
+    else:
+        report.ok(item, "brand 的 name / url / logo / colors(bg,fg,accent) 结构齐全")
 
 
 # ===========================================================================
@@ -856,6 +962,21 @@ def check_music_fields(report: Report, timing: dict) -> None:
     # 其它消费点（check_audio 等）用 _obj 静默归一，避免同一个字段刷出多条。
     music = _sub_dict(timing, "music", report, item, "{file, source, offset, beat, bar, drop, gain}")
     problems = []
+    # R9-CA-04：music.file 必须是 public/ 下的相对路径。mix.py 直接把它拼成
+    # PROJECT_ROOT/public/<music.file> 写出（还会自动建父目录）：写 ../.. 就能写穿项目，
+    # 检查项以前只查「解析后的文件存在」，路径本身完全没查。
+    music_file = music.get("file")
+    if music_file not in (None, ""):
+        if not isinstance(music_file, str):
+            problems.append(
+                f"music.file 必须是字符串（相对 public/ 的路径，例如 audio/music.wav），"
+                f"现在是 {type(music_file).__name__}：{music_file!r}"
+            )
+        else:
+            file_unsafe = _public_relative_problem(music_file, "music.file")
+            if file_unsafe:
+                problems.append(file_unsafe)
+
     beat = bar = None
     for key in ("beat", "bar"):
         # R8-CA-01：严格数字。beats.ts 的 beatAt/barAt 用 beat/bar 做 Math.round 吸附，
@@ -1114,8 +1235,38 @@ def check_voice_lines(report: Report, timing: dict) -> None:
         if not line_id:
             report.fail(item, f"voice.lines[{index}] 的 id 是空的：audio-src/vo/<id>.mp3 无从对应")
             continue
+        # R9-CA-03：id 是 audio-src/vo/<id>.mp3 的文件名、tts.py 的缓存键与 report.json 的索引。
+        # 以前只查「非空」：id="../evil" 只要那个位置真有一份 mp3，闸门就放行 ——
+        # 配音文件读写会跑到项目目录外。
+        id_unsafe = _unsafe_filename_reason(line_id)
+        if id_unsafe:
+            report.fail(
+                item,
+                f"voice.lines[{index}] 的 id=\"{line_id}\" 不能当文件名：{id_unsafe}。"
+                "id 会拼成 audio-src/vo/<id>.mp3 并被 tts.py / mix.py 当路径用，"
+                "含分隔符 / .. / 盘符会读写到项目目录之外",
+            )
+            continue
         if not str(line.get("scene", "") or "").strip():
             report.fail(item, f"第 {line_id} 句的 scene 是空的")
+            continue
+        # R9-CA-01：text 是这一句的「唯一事实来源」——tts.py 拿它合成、subtitles.py 拿它
+        # 上屏、mix.py 拿它算人声窗口。以前只查 key 存在：text="" / text=123 / 全空白
+        # 都能 0 ERROR 通过，成片里那句变成静音 + 空字幕，而所有闸门绿灯。
+        text_raw = line.get("text")
+        if not isinstance(text_raw, str):
+            report.fail(
+                item,
+                f"第 {line_id} 句的 text 必须是字符串（旁白台词；数字/对象都不行），"
+                f"现在是 {type(text_raw).__name__}：{text_raw!r}",
+            )
+            continue
+        if not text_raw.strip():
+            report.fail(
+                item,
+                f"第 {line_id} 句的 text 是空的 / 只有空白：这句配音是静音、字幕是空行，"
+                "但混音 / 字幕 / 渲染全链路都不会报错",
+            )
             continue
         at_raw = line.get("at")
         # R8-CA-01：不再接受数字字符串。"at" 是 Caption.tsx 里 `line.at + Math.max(...)`
@@ -1883,6 +2034,19 @@ def _selftest() -> int:
         [{"id": "01", "scene": "s1", "at": 2.0, "text": "文案"},
          {"id": "01", "scene": "s1", "at": 4.0, "text": "另一句"}]) > 0, True)
 
+    # --- R9-CA-03/01：id 要能当文件名；text 必须是非空字符串（以前只查 key 存在）---
+    check("voice.lines text 空字符串 → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": 2.0, "text": ""}]) > 0, True)
+    check("voice.lines text 数字 → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": 2.0, "text": 123}]) > 0, True)
+    check("voice.lines text 全空白 → ERROR", _voice_errors(
+        [{"id": "01", "scene": "s1", "at": 2.0, "text": "  \n "}]) > 0, True)
+    for bad_id in ("../../evil", "a/b", "a\\b", "C:x", "..", ".hidden", "CON", "trail."):
+        check(f"voice.lines id={bad_id!r} 不能当文件名 → ERROR", _voice_errors(
+            [{"id": bad_id, "scene": "s1", "at": 2.0, "text": "文案"}]) > 0, True)
+    check("voice.lines id=01-5 合法 → 0 ERROR", _voice_errors(
+        [{"id": "01-5", "scene": "s1", "at": 2.0, "text": "文案"}]), 0)
+
     # --- 数值有限性（R6-CA-01）：NaN / Infinity 是坏配置，不许静默放行 ---
     for value, want in (("1.5", 1.5), (2, 2.0), (None, None), (True, None),
                         ("nan", None), (float("nan"), None),
@@ -1897,6 +2061,40 @@ def _selftest() -> int:
         "music": dict(base_music),
         "voice": {"lines": []},
     }
+
+    # --- R9-CA-02：brand 是 TS 侧必填契约（缺了渲染期 TypeError，闸门以前 0 ERROR）---
+    def _brand_errors(mutate) -> int:
+        timing_fixture = copy.deepcopy(base_timing)
+        timing_fixture["brand"] = {
+            "name": "小账本", "url": "x.app", "logo": "",
+            "colors": {"bg": "#000000", "fg": "#ffffff", "accent": "#33e1a1"},
+        }
+        mutate(timing_fixture)
+        return _collect_report_errors(
+            lambda report: check_brand_fields(report, timing_fixture))
+
+    check("brand 完整（logo 空串合法）→ 0 ERROR", _brand_errors(lambda t: None), 0)
+    check("timing 缺 brand → ERROR", _brand_errors(lambda t: t.pop("brand")) > 0, True)
+    check("brand 缺 colors → ERROR",
+          _brand_errors(lambda t: t["brand"].pop("colors")) > 0, True)
+    check("brand.logo 不是字符串 → ERROR",
+          _brand_errors(lambda t: t["brand"].__setitem__("logo", None)) > 0, True)
+    check("brand.name 全空白 → ERROR",
+          _brand_errors(lambda t: t["brand"].__setitem__("name", " ")) > 0, True)
+    check("brand.colors.accent 缺失 → ERROR",
+          _brand_errors(lambda t: t["brand"]["colors"].pop("accent")) > 0, True)
+
+    # --- R9-CA-04：music.file 必须是 public/ 下的相对路径（mix.py 按它写出并自动建目录）---
+    def _music_file_errors(value) -> int:
+        timing_fixture = {"music": dict(base_music, file=value)}
+        return _collect_report_errors(
+            lambda report: check_music_fields(report, timing_fixture))
+
+    check("music.file 正常相对路径 → 0 ERROR", _music_file_errors("audio/music.wav"), 0)
+    for bad_file in ("../../evil.wav", "/abs/evil.wav", "C:/evil.wav",
+                     "audio/../evil.wav", 123):
+        check(f"music.file={bad_file!r} 越界/坏类型 → ERROR",
+              _music_file_errors(bad_file) > 0, True)
 
     def _timing_structure_errors(mutate) -> int:
         # deepcopy：下面的夹具会改嵌套的 scenes/captions，浅拷贝会让改动串到下一个用例。
@@ -2192,6 +2390,7 @@ def _selftest() -> int:
         return 1
     print("OK: selftest — 注释剥离 / 素材字面量 / 本地窗口兜底 / json BOM / "
           "music.segments / music.offset / music.drop 必填 / voice.lines / id 唯一性 / "
+          "voice.text 非空 / voice.id 文件名安全 / music.file 路径 / brand 结构 / "
           "数值有限性 / 数字类型口径 / "
           "截断图片 / fps / 字幕位置 / 字幕容量字宽 / 旁白字数 / 决策账本 全部通过")
     return 0
@@ -2283,6 +2482,8 @@ def main(argv=None) -> int:
 
     check_asset_refs(report)
     check_brand_and_font_files(report, timing)
+    # R9-CA-02：brand 是 TS 侧必填契约（缺了渲染期 TypeError），单独一项校验。
+    check_brand_fields(report, timing)
     check_timing_structure(report, timing)
     check_music_fields(report, timing)
     check_voice_lines(report, timing)
